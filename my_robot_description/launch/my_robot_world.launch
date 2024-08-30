@@ -10,6 +10,6 @@
   <node name="gazebo_gui" pkg="gazebo_ros" type="gzclient" output="screen"/>
 
   <!-- Spawn the robot model -->
-  <node name="spawn_model" pkg="gazebo_ros" type="spawn_model" args="-file $(find my_robot_description)/models/my_robot.sdf -sdf -model my_robot -x 0.2206 -y 0.1208 -z 2.2 -Y -0.0053" />
+  <node name="spawn_model" pkg="gazebo_ros" type="spawn_model" args="-file $(find my_robot_description)/models/my_robot.sdf -sdf -model my_robot -x -5.3334 -y -0.3768 -z 2.2 -Y -0.0058" />
 
 </launch>
