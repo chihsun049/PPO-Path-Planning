@@ -737,10 +737,10 @@ class GazeboEnv:
 
         if linear_speed < 2.0:
             kp = 0.5
-            kd = 0.45
-        elif linear_speed < 2.5:
-            kp = 0.4
             kd = 0.35
+        elif linear_speed < 2.5:
+            kp = 0.7
+            kd = 0.5
         else:
             kp = 1.0
             kd = 0.65
