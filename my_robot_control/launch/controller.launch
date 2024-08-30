@@ -1,14 +1,10 @@
 <launch>
-  <!-- 使用仿真时间 -->
   <param name="use_sim_time" value="true"/>
 
-  <!-- 启动自定义控制节点 -->
   <node name="custom_controller" pkg="my_robot_control" type="custom_controller.py" output="screen"/>
 
-  <!-- 启动RL代理 -->
   <node name="rl_agent" pkg="my_robot_control" type="rl_agent.py" output="screen"/>
 
-  <!-- 静态转换 -->
   <node pkg="tf2_ros" type="static_transform_publisher" name="base_to_velodyne" args="0.5 0 0.9 0 0 0 my_robot/velodyne chassis"/>
   
 </launch>
