@@ -1,0 +1,15 @@
+<!-- launch_gazebo.launch -->
+<launch>
+  <!-- Use simulation time -->
+  <param name="use_sim_time" value="true"/>
+
+  <!-- Start Gazebo server -->
+  <node name="gazebo" pkg="gazebo_ros" type="gzserver" args="-s libgazebo_ros_api_plugin.so $(find my_robot_description)/worlds/1st_floor.world" output="screen"/>
+
+  <!-- Start Gazebo client -->
+  <node name="gazebo_gui" pkg="gazebo_ros" type="gzclient" output="screen"/>
+
+  <!-- Spawn the robot model -->
+  <node name="spawn_model" pkg="gazebo_ros" type="spawn_model" args="-file $(find my_robot_description)/models/my_robot.sdf -sdf -model my_robot -x 0.2206 -y 0.1208 -z 2.2 -Y -0.0053" />
+
+</launch>

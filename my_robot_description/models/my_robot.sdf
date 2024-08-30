@@ -1,0 +1,411 @@
+<?xml version="1.0" ?>
+
+<sdf version="1.5">
+  <model name="cart_front_steer">
+    <link name="chassis">
+      <pose>0 0 0.15 0 0 0</pose>
+      <inertial>
+        <pose>0.1 0 0 0 0 0</pose>
+        <mass>10</mass>
+        <inertia>
+          <ixx>0.21666666666666667</ixx>
+          <iyy>0.8416666666666667</iyy>
+          <izz>1.0416666666666667</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>1.0 0.5 0.1</size>
+          </box>
+        </geometry>
+        <surface>
+          <contact>
+            <ode>
+              <soft_cfm>0.0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e+13</kp>
+              <kd>1.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <box>
+            <size>1.0 0.5 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Grey</name>
+          </script>
+        </material>
+      </visual>
+
+      <plugin name="imu_plugin" filename="libgazebo_ros_imu.so">
+        <robotNamespace>/my_robot</robotNamespace>
+        <topicName>imu/data</topicName>
+        <updateRate>50.0</updateRate>
+        <bodyName>chassis</bodyName>
+      </plugin>
+
+      <plugin name="odom_plugin" filename="libgazebo_ros_p3d.so">
+        <robotNamespace>/my_robot</robotNamespace>
+        <frameName>odom</frameName>
+        <bodyName>chassis</bodyName>
+        <xyzOffsets>0 0 0</xyzOffsets>
+        <rpyOffsets>0 0 0</rpyOffsets>
+      </plugin>
+
+      <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
+        <robotNamespace>/my_robot</robotNamespace>
+      </plugin>
+
+      <!-- Adding LiDAR sensor -->
+      <sensor name="velodyne" type="ray">
+        <pose>0.5 0 0.9 0 0 0</pose>
+        <visualize>false</visualize>
+        <update_rate>20</update_rate>
+        <ray>
+          <scan>
+            <horizontal>
+              <samples>1200</samples>
+              <resolution>0.1</resolution>
+              <min_angle>-3.141592653589793</min_angle>
+              <max_angle>3.141592653589793</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>32</samples> <!-- VLP-16 有 16 个通道 -->
+              <resolution>2.0</resolution>
+              <min_angle>-0.2617993877991494</min_angle> <!-- -15度 -->
+              <max_angle>0.2617993877991494</max_angle> <!-- +15度 -->
+            </vertical>
+          </scan>
+          <range>
+            <min>0.1</min>
+            <max>30.0</max>
+            <resolution>0.01</resolution>
+          </range>
+        </ray>
+        <plugin name="gazebo_ros_velodyne_laser" filename="libgazebo_ros_velodyne_laser.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <topicName>/velodyne_points</topicName>
+          <frameName>velodyne</frameName>
+          <min_range>0.01</min_range> <!-- 明确设置最小范围 -->
+          <max_range>30.0</max_range> <!-- 明确设置最大范围 -->
+          <gaussianNoise>0.01</gaussianNoise> <!-- 添加噪声参数 -->
+          <organize_cloud>true</organize_cloud> <!-- 设置为有序输出 -->
+        </plugin>
+      </sensor>
+    </link>
+    
+    <!-- Existing links and joints -->
+    <link name="wheel_front_left">
+      <pose>0.35 0.298 0.15 -1.5707963267948966 -0.08726646259971647 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.0030791666666666667</ixx>
+          <iyy>0.0030791666666666667</iyy>
+          <izz>0.005625</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>500</mu> <!-- 主摩擦系数 -->
+              <mu2>500</mu2> <!-- 次摩擦系数 -->
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <soft_cfm>0.0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e+13</kp>
+              <kd>1.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Black</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+    
+    <joint name="wheel_front_left_steer_spin" type="universal">
+      <parent>chassis</parent>
+      <child>wheel_front_left</child>
+      <axis>
+        <xyz>0 -1 0</xyz>
+        <limit>
+          <lower>-0.6108652381980153</lower>
+          <upper>0.6108652381980153</upper>
+        </limit>
+        <dynamics>
+          <damping>0.1</damping> <!-- 增加阻尼 -->
+        </dynamics>
+      </axis>
+      <axis2>
+        <xyz>0 0 1</xyz>
+      </axis2>
+    </joint>
+    
+    <link name="wheel_front_right">
+      <pose>0.35 -0.298 0.15 -1.5707963267948966 -0.08726646259971647 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.0030791666666666667</ixx>
+          <iyy>0.0030791666666666667</iyy>
+          <izz>0.005625</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>500</mu> <!-- 主摩擦系数 -->
+              <mu2>500</mu2> <!-- 次摩擦系数 -->
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <soft_cfm>0.0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e+13</kp>
+              <kd>1.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Black</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+    
+    <joint name="wheel_front_right_steer_spin" type="universal">
+      <parent>chassis</parent>
+      <child>wheel_front_right</child>
+      <axis>
+        <xyz>0 -1 0</xyz>
+        <limit>
+          <lower>-0.6108652381980153</lower>
+          <upper>0.6108652381980153</upper>
+        </limit>
+        <dynamics>
+          <damping>0.1</damping> <!-- 增加阻尼 -->
+        </dynamics>
+      </axis>
+      <axis2>
+        <xyz>0 0 1</xyz>
+      </axis2>
+    </joint>
+    
+    <link name="wheel_rear_left">
+      <pose>-0.35 0.298 0.15 -1.5707963267948966 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.0030791666666666667</ixx>
+          <iyy>0.0030791666666666667</iyy>
+          <izz>0.005625</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>500</mu> <!-- 主摩擦系数 -->
+              <mu2>500</mu2> <!-- 次摩擦系数 -->
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <soft_cfm>0.0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e+13</kp>
+              <kd>1.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Black</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+    <joint name="wheel_rear_left_spin" type="revolute">
+      <parent>chassis</parent>
+      <child>wheel_rear_left</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <dynamics>
+          <damping>0.1</damping> <!-- 增加阻尼 -->
+        </dynamics>
+      </axis>
+    </joint>
+    
+    <link name="wheel_rear_right">
+      <pose>-0.35 -0.298 0.15 -1.5707963267948966 0 0</pose>
+      <inertial>
+        <mass>0.5</mass>
+        <inertia>
+          <ixx>0.0030791666666666667</ixx>
+          <iyy>0.0030791666666666667</iyy>
+          <izz>0.005625</izz>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <collision name="collision">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+      </collision>
+      <visual name="visual">
+        <geometry>
+          <cylinder>
+            <radius>0.15</radius>
+            <length>0.15</length>
+          </cylinder>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>500</mu> <!-- 主摩擦系数 -->
+              <mu2>500</mu2> <!-- 次摩擦系数 -->
+            </ode>
+          </friction>
+          <contact>
+            <ode>
+              <soft_cfm>0.0</soft_cfm>
+              <soft_erp>0.2</soft_erp>
+              <kp>1e+13</kp>
+              <kd>1.0</kd>
+              <max_vel>0.01</max_vel>
+              <min_depth>0.001</min_depth>
+            </ode>
+          </contact>
+        </surface>
+        <material>
+          <script>
+            <uri>file://media/materials/scripts/gazebo.material</uri>
+            <name>Gazebo/Black</name>
+          </script>
+        </material>
+      </visual>
+    </link>
+    <joint name="wheel_rear_right_spin" type="revolute">
+      <parent>chassis</parent>
+      <child>wheel_rear_right</child>
+      <axis>
+        <xyz>0 0 1</xyz>
+        <dynamics>
+          <damping>0.1</damping> <!-- 增加阻尼 -->
+        </dynamics>
+      </axis>
+    </joint>
+
+    <!-- Adding Transmission and Actuators -->
+    <transmission name="trans_wheel_front_left">
+      <type>pr2_mechanism_model/SimpleTransmission</type>
+      <actuator name="wheel_front_left_motor" />
+      <joint name="wheel_front_left_steer_spin" />
+    </transmission>
+
+    <transmission name="trans_wheel_front_right">
+      <type>pr2_mechanism_model/SimpleTransmission</type>
+      <actuator name="wheel_front_right_motor" />
+      <joint name="wheel_front_right_steer_spin" />
+    </transmission>
+
+    <transmission name="trans_wheel_rear_left">
+      <type>pr2_mechanism_model/SimpleTransmission</type>
+      <actuator name="wheel_rear_left_motor" />
+      <joint name="wheel_rear_left_spin" />
+    </transmission>
+
+    <transmission name="trans_wheel_rear_right">
+      <type>pr2_mechanism_model/SimpleTransmission</type>
+      <actuator name="wheel_rear_right_motor" />
+      <joint name="wheel_rear_right_spin" />
+    </transmission>
+  </model>
+</sdf>

@@ -1,0 +1,43 @@
+<launch>
+  <!-- Use simulated time -->
+  <param name="use_sim_time" value="true"/>
+
+  <!-- Start RTAB-Map node -->
+  <node name="rtabmap_node" pkg="rtabmap_ros" type="rtabmap" output="screen">
+    <!-- Remap the topics to match your sensor setup -->
+    <remap from="scan" to="/velodyne_points"/>  <!-- LiDAR data -->
+    <remap from="imu" to="/imu/data"/>          <!-- IMU data -->
+    <remap from="odom" to="/odom"/>             <!-- Odometry data -->
+
+    <!-- RTAB-Map parameters -->
+    <param name="frame_id" value="chassis"/>             <!-- Robot base frame -->
+    <param name="odom_frame_id" value="odom"/>           <!-- Odometry frame -->
+    <param name="subscribe_scan" value="true"/>          <!-- Enable LiDAR scan subscription -->
+    <param name="subscribe_imu" value="true"/>           <!-- Enable IMU subscription -->
+    <param name="subscribe_odom" value="true"/>          <!-- Enable odometry subscription -->
+    <param name="publish_tf" value="true"/>              <!-- Publish TF (transformations) -->
+    <param name="ground_truth_frame_id" value=""/>       <!-- If no ground truth, leave empty -->
+    <param name="wait_for_transform_duration" value="0.2"/>
+    <param name="Rtabmap/DetectionRate" value="1"/>
+    <param name="Rtabmap/CreateIntermediateNodes" value="true"/>
+    <param name="database_path" value="/home/chihsun/catkin_ws/src/my_robot_control/scripts/rtabmap.db" />
+  </node>
+
+  <!-- Start odometry node (if not provided by another source) -->
+  <node name="rgbd_odometry_node" pkg="rtabmap_ros" type="rgbd_odometry" output="screen">
+    <remap from="scan" to="/velodyne_points"/>
+    <remap from="imu" to="/imu/data"/>
+    <remap from="odom" to="/odom"/>
+    <param name="frame_id" value="chassis"/>
+    <param name="odom_frame_id" value="odom"/>
+  </node>
+
+  <!-- Manually specify rtabmap executable path -->
+  <node name="rtabmap_exec_node" pkg="rtabmap_ros" type="/opt/ros/noetic/bin/rtabmap" output="screen"/>
+
+  <!-- Manually specify rgbd_odometry executable path -->
+  <node name="rgbd_odometry_exec_node" pkg="rtabmap_ros" type="/opt/ros/noetic/lib/rtabmap_odom/rgbd_odometry" output="screen"/>
+
+  <!-- Static transform between base and LiDAR -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="base_to_velodyne" args="0 0 0.9 0 0 0 chassis velodyne_link"/>
+</launch>
