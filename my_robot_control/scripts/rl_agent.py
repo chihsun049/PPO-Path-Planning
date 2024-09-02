@@ -18,10 +18,11 @@ from tf.transformations import quaternion_from_euler
 import time
 from scipy.interpolate import make_interp_spline
 from torch.amp import GradScaler
+import wandb
 
 # Hyperparameters
 SCAN_MIN_DISTANCE = 0.2
-REFERENCE_DISTANCE_TOLERANCE = 0.5
+REFERENCE_DISTANCE_TOLERANCE = 0.65
 MEMORY_SIZE = 10000
 BATCH_SIZE = 1024
 GAMMA = 0.99
@@ -871,6 +872,20 @@ def main():
     else:
         print("Created new model.")
 
+    # 初始化 W&B
+    wandb.init(project="my_robot_workspace")
+
+    # Log hyperparameters
+    wandb.config = {
+        "learning_rate": LEARNING_RATE,
+        "batch_size": BATCH_SIZE,
+        "gamma": GAMMA,
+        "ppo_epochs": PPO_EPOCHS,
+        "clip_param": CLIP_PARAM,
+        "memory_size": MEMORY_SIZE,
+        "prediction_horizon": PREDICTION_HORIZON,
+        "control_horizon": CONTROL_HORIZON,
+    }
     num_episodes = 1000000
     best_test_reward = -np.inf
 
@@ -913,6 +928,8 @@ def main():
 
         print(f"Episode {e}, Total Reward: {total_reward}")
 
+        wandb.log({"episode": e, "total_reward": total_reward})
+
         if total_reward > best_test_reward:
             best_test_reward = total_reward
             torch.save(model.state_dict(), best_model_path)
@@ -931,6 +948,8 @@ def main():
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
+    # 结束 W&B 运行
+    wandb.finish()
 
 if __name__ == '__main__':
     main()
