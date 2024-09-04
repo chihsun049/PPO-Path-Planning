@@ -19,16 +19,11 @@ class ActorCritic(nn.Module):
         self._to_linear_size(observation_space)
         
         self.fc1 = nn.Linear(self._to_linear, 256)
-        self.dropout = nn.Dropout(p=0.5)
-        self.lstm = nn.LSTM(256, 256, num_layers=2, batch_first=True, bidirectional=True)
-
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 128)
+        self.lstm = nn.LSTM(256, 128, batch_first=True)
+        self.fc2 = nn.Linear(128, 128)
         
         self.actor = nn.Linear(128, action_space)
-        self.path_optimizer = nn.Linear(128, 3)
         self.critic = nn.Linear(128, 1)
-
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
 
         # Initialize weights
@@ -130,15 +125,15 @@ def generate_dynamic_occupancy_grid(pcd, current_wp, grid_size=0.05, map_size=10
 
 # 加载预训练模型
 model = ActorCritic((4, 64, 64), 2).to(device)
-model.load_state_dict(torch.load("/home/chihsun/catkin_ws/src/my_robot_workspace/my_robot_control/scripts/best_model.pth", map_location=device))
+model.load_state_dict(torch.load("/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth", map_location=device))
 model.eval()
 
 # 加载CSV数据
-input_csv_path = "/home/chihsun/shared_dir/0723/saved_waypoints.csv"
+input_csv_path = "/home/chihsun/shared_dir/0822-1floor/saved_waypoints.csv"
 waypoints = pd.read_csv(input_csv_path)
 
 # 加载点云文件
-pcd_path = "/home/chihsun/shared_dir/0723/autoware-240723.pcd"
+pcd_path = "/home/chihsun/shared_dir/0822-1floor/autoware-240822.pcd"
 pcd = o3d.io.read_point_cloud(pcd_path)
 
 # 优化路径
@@ -174,7 +169,7 @@ for _, row in waypoints.iterrows():
     optimized_waypoints.append(optimized_row)
 
 # 保存优化后的路径点
-output_csv_path = "/home/chihsun/shared_dir/0723/optimized_waypoints.csv"
+output_csv_path = "/home/chihsun/shared_dir/0822-1floor/optimized_waypoints.csv"
 optimized_df = pd.DataFrame(optimized_waypoints)
 optimized_df.to_csv(output_csv_path, index=False)
 

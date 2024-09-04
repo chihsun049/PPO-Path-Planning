@@ -16,7 +16,6 @@ import open3d as o3d
 import tf
 from tf.transformations import quaternion_from_euler
 import time
-from scipy.interpolate import make_interp_spline
 from torch.amp import GradScaler
 import wandb
 
@@ -124,9 +123,11 @@ class MPCController:
         predicted_trajectory = []
         state = current_state.clone()
         previous_action = None
+        hidden = None  # 初始化hidden状态
         
         for _ in range(self.prediction_horizon):
-            action = model.act(state, previous_action).cpu().data.numpy().flatten()
+            action, hidden = model.act(state, hidden)
+            action = action.cpu().data.numpy().flatten()
             next_state, _, _, _ = env.step(action)
             state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
             predicted_trajectory.append((state, action))
@@ -336,22 +337,26 @@ class GazeboEnv:
         ]
         return waypoints
     
+    def bezier_curve(self, points, num_points=100):
+        n = len(points) - 1
+        binomial_coeff = [1]
+        for i in range(1, n+1):
+            binomial_coeff.append(binomial_coeff[-1] * (n - i + 1) // i)
+        t_values = np.linspace(0, 1, num_points)
+        curve_points = []
+        for t in t_values:
+            point = np.zeros(2)
+            for i in range(n+1):
+                point += binomial_coeff[i] * (1 - t) ** (n - i) * t ** i * np.array(points[i])
+            curve_points.append(tuple(point))
+        return curve_points
+    
     def smooth_waypoints(self, waypoints):
-        x = [wp[0] for wp in waypoints]
-        y = [wp[1] for wp in waypoints]
-        t = np.linspace(0, 1, len(x))
-        
-        spl_x = make_interp_spline(t, x, k=3)
-        spl_y = make_interp_spline(t, y, k=3)
-        
-        smoothed_t = np.linspace(0, 1, 100)
-        smoothed_x = spl_x(smoothed_t)
-        smoothed_y = spl_y(smoothed_t)
-        
-        smoothed_waypoints = [(smoothed_x[i], smoothed_y[i], waypoints[i][2]) for i in range(len(smoothed_x))]
+        waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
+        smoothed_points = self.bezier_curve(waypoints_2d)
+        smoothed_waypoints = [(pt[0], pt[1], waypoints[i][2]) for i, pt in enumerate(smoothed_points)]
         
         self.current_waypoint_index = 0
-
         return smoothed_waypoints
 
     def is_point_near_obstacle(self, x, y, threshold=0.12):
@@ -365,26 +370,25 @@ class GazeboEnv:
 
     def generate_optimized_waypoints(self):
         optimized_waypoints = []
-
         for i in range(len(self.waypoints) - 1):
             current_wp = self.waypoints[i]
             next_wp = self.waypoints[i + 1]
 
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
-
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
             new_wp_yaw = direction
 
+            # 避开障碍物
             while self.is_point_near_obstacle(new_wp_x, new_wp_y):
-                new_wp_x += 0.05 * np.cos(direction)  
+                new_wp_x += 0.05 * np.cos(direction)
                 new_wp_y += 0.05 * np.sin(direction)
 
             optimized_waypoints.append((new_wp_x, new_wp_y, new_wp_yaw))
 
         optimized_waypoints.append(self.waypoints[-1])
 
-        self.waypoints = optimized_waypoints
+        self.waypoints = self.smooth_waypoints(optimized_waypoints)  # 使用新的贝塞尔曲线平滑化
         self.current_waypoint_index = 0
 
     def optimize_waypoints_with_heuristics(self):
@@ -638,7 +642,9 @@ class GazeboEnv:
         return self.state
 
     def calculate_reward(self, target_x, target_y):
-        robot_x, robot_y, _ = self.get_robot_position()
+        robot_x, robot_y, robot_yaw = self.get_robot_position()
+
+        distance_to_target = np.sqrt((target_x - robot_x)**2 + (target_y - robot_y)**2)
 
         min_distance_to_obstacle = float('inf')
         for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
@@ -646,41 +652,29 @@ class GazeboEnv:
             if distance > 0 and distance < min_distance_to_obstacle:
                 min_distance_to_obstacle = distance
 
-        reference_x, reference_y = self.waypoints[self.current_waypoint_index][:2]
-        distance_to_reference = np.sqrt((reference_x - robot_x)**2 + (reference_y - robot_y)**2)
-
-        reward = 0
-
-        if distance_to_reference < REFERENCE_DISTANCE_TOLERANCE:
-            reward += 15.0
-            self.current_waypoint_index += 1
-
-        if self.current_waypoint_index >= len(self.waypoints) - 1:
-            reward += 200.0
+        reward = -distance_to_target * 10
 
         if min_distance_to_obstacle > SCAN_MIN_DISTANCE:
-            obstacle_reward = (min_distance_to_obstacle - SCAN_MIN_DISTANCE) * 10
-            reward += obstacle_reward
-
-        if min_distance_to_obstacle < SCAN_MIN_DISTANCE:
+            reward += (min_distance_to_obstacle - SCAN_MIN_DISTANCE) * 10
+        else:
             reward -= 200.0
 
-        action_smoothness_penalty = 0
+        # 计算转向的一致性惩罚
         if self.current_waypoint_index > 0:
-            prev_waypoint = self.waypoints[self.current_waypoint_index - 1]
-            prev_direction = np.arctan2(reference_y - prev_waypoint[1], reference_x - prev_waypoint[0])
-            current_direction = np.arctan2(robot_y - reference_y, robot_x - reference_x)
+            prev_wp = self.waypoints[self.current_waypoint_index - 1]
+            prev_direction = np.arctan2(target_y - prev_wp[1], target_x - prev_wp[0])
+            current_direction = np.arctan2(robot_y - target_y, robot_x - target_x)
             curvature = np.abs(current_direction - prev_direction)
 
-            current_speed = np.sqrt(self.last_twist.linear.x**2 + self.last_twist.angular.z**2)
+            # 速度和方向一致性检查
+            speed_factor = max(0, 1 - np.abs(self.last_twist.linear.x - 2.5))  # 速度与期望速度的差异，期望速度为2.5
+            direction_factor = max(0, 1 - curvature)  # 方向的平滑性，值越小越不平滑
 
-            if curvature > 0.2:
-                action_smoothness_penalty = -curvature * 1.8 * (1 + current_speed)
+            consistency_penalty = -curvature * speed_factor * direction_factor * 2.0
+            reward += consistency_penalty
 
-            if curvature < 0.1 and np.abs(self.last_twist.angular.z) > 0.1:
-                action_smoothness_penalty -= 10.0
-
-            reward += action_smoothness_penalty
+        if np.abs(self.last_twist.angular.z) > 0.1:
+            reward -= 10.0
 
         reward *= 1.5
 
@@ -708,10 +702,13 @@ class GazeboEnv:
 
     def calculate_action_to_waypoint(self, waypoint_x, waypoint_y, waypoint_yaw):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
-
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
         preview_distance = 0.9
+        if linear_speed < 2.0:
+            preview_distance = 0.7
+        elif linear_speed > 2.5:
+            preview_distance = 1.2
 
         num_future_points = 7
         future_yaw_errors = []
@@ -734,7 +731,7 @@ class GazeboEnv:
         elif 0.1 < average_yaw_error <= 0.3:
             linear_speed = 2.0
         else:
-            linear_speed = max(3.0, linear_speed * 0.85)
+            linear_speed = max(3.0, linear_speed * 0.95)
 
         if linear_speed < 2.0:
             kp = 0.5
@@ -767,15 +764,11 @@ class ActorCritic(nn.Module):
         self._to_linear_size(observation_space)
         
         self.fc1 = nn.Linear(self._to_linear, 256)
-        self.dropout = nn.Dropout(p=0.5)
-
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 128)
+        self.lstm = nn.LSTM(256, 128, batch_first=True)
+        self.fc2 = nn.Linear(128, 128)
         
         self.actor = nn.Linear(128, action_space)
-        self.path_optimizer = nn.Linear(128, 3)
         self.critic = nn.Linear(128, 1)
-
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
 
     def _to_linear_size(self, observation_space):
@@ -784,36 +777,37 @@ class ActorCritic(nn.Module):
         x = torch.relu(self.conv2(x))
         self._to_linear = x.view(1, -1).size(1)
     
-    def forward(self, x):
-        if x.dim() == 5:
+    def forward(self, x, hidden=None):
+        if len(x.shape) == 5:
             x = x.squeeze(1)
+        
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
         x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = torch.relu(self.fc2(x))
-        x = torch.relu(self.fc3(x))
+        if hidden is None:
+            x, hidden = self.lstm(x.unsqueeze(0))
+        else:
+            if isinstance(hidden, tuple) and len(hidden) == 2 and isinstance(hidden[0], torch.Tensor) and isinstance(hidden[1], torch.Tensor):
+                x, hidden = self.lstm(x.unsqueeze(0), hidden)
+            else:
+                hidden = None
+                x, hidden = self.lstm(x.unsqueeze(0))
+        x = torch.relu(self.fc2(x.squeeze(0)))
         
         action_mean = self.actor(x)
         action_log_std = self.actor_log_std.expand_as(action_mean)
         action_std = torch.exp(action_log_std)
 
-        optimized_path = self.path_optimizer(x)
-
         value = self.critic(x)
 
-        return action_mean, action_std, value, optimized_path
+        return action_mean, action_std, value, hidden
 
-    def act(self, state, previous_action=None):
+    def act(self, state, hidden=None):
         with torch.amp.autocast('cuda'):
-            action_mean, action_std, _, _ = self(state)
+            action_mean, action_std, _, hidden = self(state, hidden)
         action = action_mean + action_std * torch.randn_like(action_std)
-
-        if previous_action is not None:
-            action = SMOOTHING_FACTOR * previous_action + (1 - SMOOTHING_FACTOR) * action.cpu().data.numpy()
-
-        return torch.tensor(action).to(device)
+        return action, hidden
 
     def evaluate(self, state, action):
         with torch.amp.autocast('cuda'):
@@ -872,10 +866,8 @@ def main():
     else:
         print("Created new model.")
 
-    # 初始化 W&B
     wandb.init(project="my_robot_workspace")
 
-    # Log hyperparameters
     wandb.config = {
         "learning_rate": LEARNING_RATE,
         "batch_size": BATCH_SIZE,
@@ -904,7 +896,8 @@ def main():
             if time_step < len(optimized_actions):
                 action = optimized_actions[time_step]
             else:
-                action = model.act(state, previous_action).cpu().data.numpy().flatten()
+                action, _ = model.act(state, previous_action)
+                action = action.cpu().data.numpy().flatten()
 
             next_state, reward, done, _ = env.step(action)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
@@ -948,7 +941,6 @@ def main():
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
-    # 结束 W&B 运行
     wandb.finish()
 
 if __name__ == '__main__':
