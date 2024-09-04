@@ -8,7 +8,7 @@ import os
 from geometry_msgs.msg import Twist, PointStamped
 from sensor_msgs.msg import PointCloud2, Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState
+from gazebo_msgs.msg import ModelState, ContactsState
 import sensor_msgs.point_cloud2 as pc2
 from collections import deque, namedtuple
 import cv2
@@ -156,6 +156,11 @@ class GazeboEnv:
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.pub_imu = rospy.Publisher('/imu/data', Imu, queue_size=10)
         self.sub_scan = rospy.Subscriber('/velodyne_points', PointCloud2, self.scan_callback)
+        self.sub_collision_chassis = rospy.Subscriber('/my_robot/bumper_data', ContactsState, self.collision_callback)
+        self.sub_collision_fl = rospy.Subscriber('/my_robot/front_left_bumper_data', ContactsState, self.collision_callback)
+        self.sub_collision_fr = rospy.Subscriber('/my_robot/front_right_bumper_data', ContactsState, self.collision_callback)
+        self.sub_collision_rl = rospy.Subscriber('/my_robot/rear_left_bumper_data', ContactsState, self.collision_callback)
+        self.sub_collision_rr = rospy.Subscriber('/my_robot/rear_right_bumper_data', ContactsState, self.collision_callback)
         self.set_model_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
         self.get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
         self.listener = tf.TransformListener()
@@ -172,6 +177,7 @@ class GazeboEnv:
         self.epsilon = 0.05
         self.score_buffer = deque(maxlen=MAX_SCORE_BUFFER)
         self.mpc_controller = MPCController(PREDICTION_HORIZON, CONTROL_HORIZON)
+        self.collision_detected = False
 
     def generate_waypoints(self):
         waypoints = [
@@ -409,6 +415,18 @@ class GazeboEnv:
         
         self.waypoints = adjusted_waypoints
         self.current_waypoint_index = 0
+    
+    def collision_callback(self, data):
+        """碰撞感測器的回調函數，用於檢測是否發生碰撞"""
+        if len(data.states) > 0:
+            self.collision_detected = True
+            rospy.loginfo("Collision detected!")
+        else:
+            self.collision_detected = False
+
+    def is_collision_detected(self):
+        """檢查是否發生碰撞"""
+        return self.collision_detected
 
     def generate_imu_data(self):
         imu_data = Imu()
@@ -540,30 +558,36 @@ class GazeboEnv:
         if self.current_waypoint_index >= len(self.waypoints) - 1:
             self.done = True
             return self.state, 100, self.done, {}
-        
-        if self.current_waypoint_index < len(self.waypoints) - 1:
-            robot_x, robot_y, _ = self.get_robot_position()
 
-            current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
-            distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x)**2 + (current_waypoint_y - robot_y)**2)
+        if self.is_collision_detected():
+            rospy.loginfo("Collision detected, resetting environment.")
+            reward = -200.0  # 碰撞懲罰
+            self.reset()  # 重置環境
+            return self.state, reward, True, {}  # 返回，並標記這次訓練不計入
+
+        robot_x, robot_y, _ = self.get_robot_position()
+        current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
+        distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x)**2 + (current_waypoint_y - robot_y)**2)
+
+        # 檢查機器人是否卡住：如果與目標的距離變化很小，則判斷為卡住
+        if np.abs(distance_to_current_waypoint - self.previous_distance_to_goal) < 0.01:
+            self.no_progress_steps += 1
         else:
-            robot_x, robot_y, _ = self.get_robot_position()
+            self.no_progress_steps = 0
+        self.previous_distance_to_goal = distance_to_current_waypoint
 
-            current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[len(self.waypoints) - 1]
-            distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x)**2 + (current_waypoint_y - robot_y)**2)
+        # 如果機器人卡住，重置環境
+        if self.no_progress_steps > self.max_no_progress_steps:
+            rospy.loginfo("Robot is stuck, resetting environment.")
+            reward = -100.0  # 卡住懲罰
+            self.reset()  # 重置環境
+            return self.state, reward, True, {}  # 返回，並標記這次訓練不計入
 
         if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
                 return self.state, 100, self.done, {}
-
-        if self.current_waypoint_index < len(self.waypoints) - 1:
-            next_waypoint_x, next_waypoint_y, next_waypoint_yaw = self.waypoints[self.current_waypoint_index + 1]
-            distance_to_next_waypoint = np.sqrt((next_waypoint_x - robot_x)**2 + (next_waypoint_y - robot_y)**2)
-            if distance_to_next_waypoint < distance_to_current_waypoint:
-                self.current_waypoint_index += 1
-                current_waypoint_x, current_waypoint_y, current_waypoint_yaw = next_waypoint_x, next_waypoint_y, next_waypoint_yaw
 
         if np.random.rand() > self.epsilon:
             action = self.calculate_action_to_waypoint(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
@@ -572,9 +596,6 @@ class GazeboEnv:
             exploration_noise = np.clip(exploration_noise, -0.05, 0.05)
             action = action + exploration_noise
             action = np.clip(action, [-1.0, -0.3], [1.0, 0.3])
-            
-            if np.any(np.isnan(action)) or np.any(np.isinf(action)):
-                action = np.zeros_like(action)
 
         linear_speed = np.clip(action[0], -3.0, 3.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
@@ -622,7 +643,7 @@ class GazeboEnv:
             rospy.logerr(f"Service call failed: {e}")
 
         rospy.sleep(0.5)
-        
+
         self.waypoints = self.generate_waypoints()
         self.current_waypoint_index = 0
         self.done = False
@@ -635,6 +656,8 @@ class GazeboEnv:
         
         self.last_twist = Twist()
         self.previous_yaw_error = 0
+        self.no_progress_steps = 0  # 重置卡住計數器
+        self.previous_distance_to_goal = float('inf')
 
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
@@ -645,19 +668,11 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
 
         distance_to_target = np.sqrt((target_x - robot_x)**2 + (target_y - robot_y)**2)
+        reward = -distance_to_target * 10  # 依據與目標的距離計算懲罰
 
-        min_distance_to_obstacle = float('inf')
-        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
-            distance = np.sqrt(point[0]**2 + point[1]**2)
-            if distance > 0 and distance < min_distance_to_obstacle:
-                min_distance_to_obstacle = distance
-
-        reward = -distance_to_target * 10
-
-        if min_distance_to_obstacle > SCAN_MIN_DISTANCE:
-            reward += (min_distance_to_obstacle - SCAN_MIN_DISTANCE) * 10
-        else:
-            reward -= 200.0
+        # 檢查碰撞情況
+        if self.is_collision_detected():
+            reward -= 200.0  # 如果發生碰撞，則添加懲罰
 
         # 计算转向的一致性惩罚
         if self.current_waypoint_index > 0:

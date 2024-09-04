@@ -49,6 +49,18 @@
         </material>
       </visual>
 
+      <!-- Collision sensor -->
+      <sensor name="contact_sensor_chassis" type="contact">
+        <update_rate>50</update_rate>
+        <contact>
+          <collision>chassis::collision</collision>
+        </contact>
+        <plugin name="gazebo_ros_contact" filename="libgazebo_ros_contact.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <bumperTopicName>bumper_data</bumperTopicName>
+        </plugin>
+      </sensor>
+
       <plugin name="imu_plugin" filename="libgazebo_ros_imu.so">
         <robotNamespace>/my_robot</robotNamespace>
         <topicName>imu/data</topicName>
@@ -128,6 +140,17 @@
           </cylinder>
         </geometry>
       </collision>
+      <!-- Front Left Wheel Contact Sensor -->
+      <sensor name="contact_sensor_fl" type="contact">
+        <update_rate>50</update_rate>
+        <contact>
+          <collision>wheel_front_left::collision</collision>
+        </contact>
+        <plugin name="gazebo_ros_contact" filename="libgazebo_ros_contact.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <bumperTopicName>front_left_bumper_data</bumperTopicName>
+        </plugin>
+      </sensor>
       <visual name="visual">
         <geometry>
           <cylinder>
@@ -201,6 +224,17 @@
           </cylinder>
         </geometry>
       </collision>
+      <!-- Front Right Wheel Contact Sensor -->
+      <sensor name="contact_sensor_fr" type="contact">
+        <update_rate>50</update_rate>
+        <contact>
+          <collision>wheel_front_right::collision</collision>
+        </contact>
+        <plugin name="gazebo_ros_contact" filename="libgazebo_ros_contact.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <bumperTopicName>front_right_bumper_data</bumperTopicName>
+        </plugin>
+      </sensor>
       <visual name="visual">
         <geometry>
           <cylinder>
@@ -274,6 +308,17 @@
           </cylinder>
         </geometry>
       </collision>
+      <!-- Rear Left Wheel Contact Sensor -->
+      <sensor name="contact_sensor_rl" type="contact">
+        <update_rate>50</update_rate>
+        <contact>
+          <collision>wheel_rear_left::collision</collision>
+        </contact>
+        <plugin name="gazebo_ros_contact" filename="libgazebo_ros_contact.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <bumperTopicName>rear_left_bumper_data</bumperTopicName>
+        </plugin>
+      </sensor>
       <visual name="visual">
         <geometry>
           <cylinder>
@@ -339,6 +384,17 @@
           </cylinder>
         </geometry>
       </collision>
+      <!-- Rear Right Wheel Contact Sensor -->
+      <sensor name="contact_sensor_rr" type="contact">
+        <update_rate>50</update_rate>
+        <contact>
+          <collision>wheel_rear_right::collision</collision>
+        </contact>
+        <plugin name="gazebo_ros_contact" filename="libgazebo_ros_contact.so">
+          <robotNamespace>/my_robot</robotNamespace>
+          <bumperTopicName>rear_right_bumper_data</bumperTopicName>
+        </plugin>
+      </sensor>
       <visual name="visual">
         <geometry>
           <cylinder>
