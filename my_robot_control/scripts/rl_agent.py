@@ -20,7 +20,6 @@ from torch.amp import GradScaler
 import wandb
 
 # Hyperparameters
-SCAN_MIN_DISTANCE = 0.2
 REFERENCE_DISTANCE_TOLERANCE = 0.65
 MEMORY_SIZE = 10000
 BATCH_SIZE = 1024
@@ -28,9 +27,6 @@ GAMMA = 0.99
 LEARNING_RATE = 0.0003
 PPO_EPOCHS = 5
 CLIP_PARAM = 0.2
-SMOOTHING_FACTOR = 0.9
-VOXEL_GRID_SIZE = 0.05
-MAX_SCORE_BUFFER = 50
 PREDICTION_HORIZON = 200  # MPC预测的时间步数
 CONTROL_HORIZON = 20  # MPC控制的时间步数
 
@@ -174,7 +170,6 @@ class GazeboEnv:
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
-        self.score_buffer = deque(maxlen=MAX_SCORE_BUFFER)
         self.mpc_controller = MPCController(PREDICTION_HORIZON, CONTROL_HORIZON)
         self.collision_detected = False
         self.max_no_progress_steps = 20  # 定義最大允許卡住的步數
