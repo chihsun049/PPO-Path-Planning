@@ -716,11 +716,11 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
-        preview_distance = 0.9
+        preview_distance = 0.7
         if linear_speed < 2.0:
-            preview_distance = 0.7
+            preview_distance = 0.5
         elif linear_speed > 2.5:
-            preview_distance = 1.2
+            preview_distance = 0.9
 
         num_future_points = 7
         future_yaw_errors = []
