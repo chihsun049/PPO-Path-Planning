@@ -122,16 +122,19 @@ class MPCController:
     def predict_future_trajectory(self, current_state, model, env):
         predicted_trajectory = []
         state = current_state.clone()
-        previous_action = None
-        hidden = None  # 初始化hidden状态
+        previous_action = None  # 初始化
+
+        hidden = None  # 初始化hidden狀態
         
         for _ in range(self.prediction_horizon):
-            action, hidden = model.act(state, hidden)
+            action, hidden = model.act(state, previous_action, hidden)  # 傳入 previous_action
             action = action.cpu().data.numpy().flatten()
             next_state, _, _, _ = env.step(action)
+            
             state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
             predicted_trajectory.append((state, action))
-            previous_action = action
+            
+            previous_action = action  # 更新 previous_action 為當前的 action
             
         return predicted_trajectory
 
@@ -157,10 +160,6 @@ class GazeboEnv:
         self.pub_imu = rospy.Publisher('/imu/data', Imu, queue_size=10)
         self.sub_scan = rospy.Subscriber('/velodyne_points', PointCloud2, self.scan_callback)
         self.sub_collision_chassis = rospy.Subscriber('/my_robot/bumper_data', ContactsState, self.collision_callback)
-        self.sub_collision_fl = rospy.Subscriber('/my_robot/front_left_bumper_data', ContactsState, self.collision_callback)
-        self.sub_collision_fr = rospy.Subscriber('/my_robot/front_right_bumper_data', ContactsState, self.collision_callback)
-        self.sub_collision_rl = rospy.Subscriber('/my_robot/rear_left_bumper_data', ContactsState, self.collision_callback)
-        self.sub_collision_rr = rospy.Subscriber('/my_robot/rear_right_bumper_data', ContactsState, self.collision_callback)
         self.set_model_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
         self.get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
         self.listener = tf.TransformListener()
@@ -178,6 +177,9 @@ class GazeboEnv:
         self.score_buffer = deque(maxlen=MAX_SCORE_BUFFER)
         self.mpc_controller = MPCController(PREDICTION_HORIZON, CONTROL_HORIZON)
         self.collision_detected = False
+        self.max_no_progress_steps = 20  # 定義最大允許卡住的步數
+        self.no_progress_steps = 0  # 初始化未前進的步數
+        self.previous_distance_to_goal = float('inf')  # 初始化上一次與目標的距離
 
     def generate_waypoints(self):
         waypoints = [
@@ -818,9 +820,14 @@ class ActorCritic(nn.Module):
 
         return action_mean, action_std, value, hidden
 
-    def act(self, state, hidden=None):
+    def act(self, state, previous_action=None, hidden=None):
         with torch.amp.autocast('cuda'):
             action_mean, action_std, _, hidden = self(state, hidden)
+        
+        # 將 previous_action 融合到動作計算中
+        if previous_action is not None:
+            action_mean = action_mean + 0.1 * torch.tensor(previous_action).to(device)  # 根據 previous_action 調整 action_mean
+        
         action = action_mean + action_std * torch.randn_like(action_std)
         return action, hidden
 
@@ -911,7 +918,7 @@ def main():
             if time_step < len(optimized_actions):
                 action = optimized_actions[time_step]
             else:
-                action, _ = model.act(state, previous_action)
+                action, _ = model.act(state, previous_action)  # 傳入 previous_action
                 action = action.cpu().data.numpy().flatten()
 
             next_state, reward, done, _ = env.step(action)
@@ -920,7 +927,7 @@ def main():
             memory.add(state.cpu().numpy(), action, reward, done, next_state.cpu().numpy())
 
             state = next_state
-            previous_action = action
+            previous_action = action  # 更新 previous_action
             total_reward += reward
 
             elapsed_time = time.time() - start_time
