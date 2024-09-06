@@ -644,24 +644,27 @@ class GazeboEnv:
 
         rospy.sleep(0.5)
 
+        # 重置路径点
         self.waypoints = self.generate_waypoints()
         self.current_waypoint_index = 0
         self.done = False
 
+        # 清空 LiDAR 数据
         empty_lidar_data = PointCloud2()
-
         current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
-            
         self.state = self.generate_occupancy_grid(empty_lidar_data, current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
-        
+
+        # 重置其他内部状态
         self.last_twist = Twist()
         self.previous_yaw_error = 0
-        self.no_progress_steps = 0  # 重置卡住計數器
+        self.no_progress_steps = 0
         self.previous_distance_to_goal = float('inf')
+        self.collision_detected = False  # 重置碰撞标志
 
+        # 生成初始 IMU 数据
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
-        
+
         return self.state
 
     def calculate_reward(self, target_x, target_y):
@@ -915,7 +918,7 @@ def main():
         "prediction_horizon": PREDICTION_HORIZON,
         "control_horizon": CONTROL_HORIZON,
     }
-    
+
     num_episodes = 1000000
     best_test_reward = -np.inf
 
