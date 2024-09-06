@@ -10,7 +10,7 @@ from sensor_msgs.msg import PointCloud2, Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
 from gazebo_msgs.msg import ModelState, ContactsState
 import sensor_msgs.point_cloud2 as pc2
-from collections import deque, namedtuple
+from collections import namedtuple
 import cv2
 import open3d as o3d
 import tf
@@ -27,8 +27,8 @@ GAMMA = 0.99
 LEARNING_RATE = 0.0003
 PPO_EPOCHS = 5
 CLIP_PARAM = 0.2
-PREDICTION_HORIZON = 200  # MPC预测的时间步数
-CONTROL_HORIZON = 20  # MPC控制的时间步数
+PREDICTION_HORIZON = 400  # MPC预测的时间步数
+CONTROL_HORIZON = 10  # MPC控制的时间步数
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
@@ -59,19 +59,19 @@ class PrioritizedMemory:
         self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size, beta=0.4):
-        if len([m for m in self.memory if m is not None]) == 0:
-            raise ValueError("Memory is empty, no samples to draw from.")
-
-        adjusted_batch_size = min(batch_size, len([m for m in self.memory if m is not None]))
-
+        # 首先檢查記憶庫中是否有足夠的樣本
+        if self.position == 0:
+            raise ValueError("No samples available in memory.")
+        
+        # 根據記憶庫是否填滿來選擇優先權
         if len(self.memory) == self.capacity:
             priorities = self.priorities
         else:
             priorities = self.priorities[:self.position]
-
+        
         if torch.isnan(priorities).any():
             priorities = torch.nan_to_num(priorities, nan=0.0)
-
+        
         probabilities = priorities ** self.alpha
         total = probabilities.sum()
 
@@ -80,9 +80,13 @@ class PrioritizedMemory:
         else:
             probabilities = torch.ones_like(probabilities) / len(probabilities)
 
-        indices = torch.multinomial(probabilities, adjusted_batch_size, replacement=False).cuda()
+        # 確保生成的 indices 變數
+        indices = torch.multinomial(probabilities, batch_size, replacement=False).cuda()
+        
+        # 從記憶庫中抽取樣本
         samples = [self.memory[idx] for idx in indices if self.memory[idx] is not None]
 
+        # 確保沒有空樣本
         if len(samples) == 0 or any(sample is None for sample in samples):
             raise ValueError("Sampled None from memory.")
 
@@ -91,12 +95,15 @@ class PrioritizedMemory:
 
         batch = list(zip(*samples))
         states, actions, rewards, dones, next_states = batch
+
         return (
             torch.stack(states).to(device),
             torch.stack(actions).to(device),
             torch.stack(rewards).to(device),
             torch.stack(dones).to(device),
-            torch.stack(next_states).to(device),indices,weights.to(device)
+            torch.stack(next_states).to(device),
+            indices,
+            weights.to(device)
         )
 
     def update_priorities(self, batch_indices, batch_priorities):
@@ -134,20 +141,26 @@ class MPCController:
             
         return predicted_trajectory
 
-    def optimize_control_sequence(self, predicted_trajectory, env):
+    def optimize_control_sequence(self, predicted_trajectory, model, env):
         optimized_actions = []
         
         for i in range(self.control_horizon):
             action = predicted_trajectory[i][1]
-            optimized_actions.append(action)
-        
+            
+            # 引入PPO策略進行優化
+            _, action_value, _ = model.evaluate(predicted_trajectory[i][0], action)
+            
+            if action_value > 0.5:  # 只採用PPO評估高的動作
+                optimized_actions.append(action)
+            else:
+                optimized_actions.append(self.mpc_fallback_action())  # 使用MPC回退策略
+            
         self.optimization_result = optimized_actions
         return optimized_actions
-
-    def get_optimized_action(self, step):
-        if step < len(self.optimization_result):
-            return self.optimization_result[step]
-        return None
+    
+    def mpc_fallback_action(self):
+        fallback_action = np.array([0.0, 0.0])  # 預設動作，例如停止或保持原動作
+        return fallback_action
 
 class GazeboEnv:
     def __init__(self):
@@ -560,31 +573,21 @@ class GazeboEnv:
             rospy.loginfo("Collision detected, resetting environment.")
             reward = -200.0  # 碰撞懲罰
             self.reset()  # 重置環境
-            return self.state, reward, True, {}  # 返回，並標記這次訓練不計入
+            return self.state, reward, True, {}
 
         robot_x, robot_y, _ = self.get_robot_position()
         current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
         distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x)**2 + (current_waypoint_y - robot_y)**2)
-
-        # 檢查機器人是否卡住：如果與目標的距離變化很小，則判斷為卡住
-        if np.abs(distance_to_current_waypoint - self.previous_distance_to_goal) < 0.01:
-            self.no_progress_steps += 1
-        else:
-            self.no_progress_steps = 0
-        self.previous_distance_to_goal = distance_to_current_waypoint
-
-        # 如果機器人卡住，重置環境
-        if self.no_progress_steps > self.max_no_progress_steps:
-            rospy.loginfo("Robot is stuck, resetting environment.")
-            reward = -100.0  # 卡住懲罰
-            self.reset()  # 重置環境
-            return self.state, reward, True, {}  # 返回，並標記這次訓練不計入
 
         if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
                 return self.state, 100, self.done, {}
+
+        # 確保 action 是一個陣列或張量
+        if isinstance(action, (int, float)):
+            action = np.array([action])
 
         if np.random.rand() > self.epsilon:
             action = self.calculate_action_to_waypoint(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
@@ -772,8 +775,8 @@ class ActorCritic(nn.Module):
         self.conv1 = nn.Conv2d(4, 32, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
         
-        self._to_linear = None
-        self._to_linear_size(observation_space)
+        # 手動計算卷積層輸出的尺寸
+        self._to_linear = self._get_conv_output_size(observation_space)
         
         self.fc1 = nn.Linear(self._to_linear, 256)
         self.lstm = nn.LSTM(256, 128, batch_first=True)
@@ -783,28 +786,28 @@ class ActorCritic(nn.Module):
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
 
-    def _to_linear_size(self, observation_space):
-        x = torch.zeros(1, *observation_space)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        self._to_linear = x.view(1, -1).size(1)
-    
+    def _get_conv_output_size(self, shape):
+        """計算卷積層輸出到全連接層的尺寸"""
+        x = torch.zeros(1, *shape)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return int(np.prod(x.size()))
+
     def forward(self, x, hidden=None):
         if len(x.shape) == 5:
             x = x.squeeze(1)
-        
+
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
-        x = x.view(x.size(0), -1)
+        x = x.view(x.size(0), -1)  # 平坦化
         x = torch.relu(self.fc1(x))
+
+        # LSTM處理
         if hidden is None:
             x, hidden = self.lstm(x.unsqueeze(0))
         else:
-            if isinstance(hidden, tuple) and len(hidden) == 2 and isinstance(hidden[0], torch.Tensor) and isinstance(hidden[1], torch.Tensor):
-                x, hidden = self.lstm(x.unsqueeze(0), hidden)
-            else:
-                hidden = None
-                x, hidden = self.lstm(x.unsqueeze(0))
+            x, hidden = self.lstm(x.unsqueeze(0), hidden)
+
         x = torch.relu(self.fc2(x.squeeze(0)))
         
         action_mean = self.actor(x)
@@ -818,24 +821,35 @@ class ActorCritic(nn.Module):
     def act(self, state, previous_action=None, hidden=None):
         with torch.amp.autocast('cuda'):
             action_mean, action_std, _, hidden = self(state, hidden)
-        
-        # 將 previous_action 融合到動作計算中
-        if previous_action is not None:
-            action_mean = action_mean + 0.1 * torch.tensor(previous_action).to(device)  # 根據 previous_action 調整 action_mean
-        
-        action = action_mean + action_std * torch.randn_like(action_std)
-        return action, hidden
 
+        if previous_action is not None:
+            action_mean += 0.1 * torch.tensor(previous_action).to(device)  # 將前一動作與當前動作結合
+
+        action = action_mean + action_std * torch.randn_like(action_std)  # 動作隨機探索
+        return action, hidden
+    
     def evaluate(self, state, action):
-        with torch.amp.autocast('cuda'):
-            action_mean, action_std, value, optimized_path = self(state)
-        action_log_probs = -((action - action_mean)**2) / (2 * action_std**2) - action_std.log() - 0.5 * np.log(2 * np.pi)
-        return action_log_probs.sum(1), value, optimized_path
+        action_mean, action_std, value, hidden = self(state)
+        
+        if action.dim() == 1:
+            action = action.unsqueeze(1)
+        
+        action = torch.tensor(action, dtype=torch.float32).to(action_mean.device)
+
+        action_log_probs = -((action - action_mean) ** 2) / (2 * action_std ** 2) - action_std.log() - 0.5 * torch.log(torch.tensor(2 * np.pi, device=action_mean.device))
+        action_log_probs = action_log_probs.sum(1)
+
+        return action_log_probs, value, hidden  # 返回第三個值 hidden
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
         
+        # 使用優先級權重動態調整學習率
+        adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = adjusted_lr
+            
         state_batch = torch.tensor(state_batch, dtype=torch.float32).to(device)
         action_batch = torch.tensor(action_batch, dtype=torch.float32).to(device)
         reward_batch = torch.tensor(reward_batch, dtype=torch.float32).view(-1, 1).to(device)
@@ -867,6 +881,12 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
             memory.update_priorities(indices, priorities)
 
+# Boltzmann探索策略
+def boltzmann_exploration(action_values, temperature=1.0):
+    probabilities = torch.exp(action_values / temperature)
+    probabilities /= probabilities.sum()
+    return torch.multinomial(probabilities, 1).item()
+
 def main():
     env = GazeboEnv()
     model = ActorCritic(env.observation_space, env.action_space).to(device)
@@ -895,6 +915,7 @@ def main():
         "prediction_horizon": PREDICTION_HORIZON,
         "control_horizon": CONTROL_HORIZON,
     }
+    
     num_episodes = 1000000
     best_test_reward = -np.inf
 
@@ -902,27 +923,21 @@ def main():
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         previous_action = None
+        hidden = None
         total_reward = 0
 
         start_time = time.time()
 
-        predicted_trajectory = env.mpc_controller.predict_future_trajectory(state, model, env)
-        optimized_actions = env.mpc_controller.optimize_control_sequence(predicted_trajectory, env)
-
         for time_step in range(1500):
-            if time_step < len(optimized_actions):
-                action = optimized_actions[time_step]
-            else:
-                action, _ = model.act(state, previous_action)  # 傳入 previous_action
-                action = action.cpu().data.numpy().flatten()
-
+            action_values, hidden = model.act(state, previous_action, hidden)  # 保留LSTM隱藏狀態
+            action = boltzmann_exploration(action_values)  # 使用Boltzmann探索策略
             next_state, reward, done, _ = env.step(action)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
             memory.add(state.cpu().numpy(), action, reward, done, next_state.cpu().numpy())
 
             state = next_state
-            previous_action = action  # 更新 previous_action
+            previous_action = action  # 更新previous_action
             total_reward += reward
 
             elapsed_time = time.time() - start_time
@@ -938,23 +953,16 @@ def main():
 
         print(f"Episode {e}, Total Reward: {total_reward}")
 
-        wandb.log({"episode": e, "total_reward": total_reward})
-
         if total_reward > best_test_reward:
             best_test_reward = total_reward
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with reward: {best_test_reward}")
 
-        if e > 0 and e % 20 == 0:
+        if e % 20 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved after {e} episodes.")
 
         rospy.sleep(1.0)
-
-        if e > 0 and e % 10 == 0:
-            env.generate_optimized_waypoints()
-            env.optimize_waypoints_with_heuristics()
-            env.waypoints = env.smooth_waypoints(env.waypoints)
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
