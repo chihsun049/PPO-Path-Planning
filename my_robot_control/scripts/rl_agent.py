@@ -371,7 +371,6 @@ class GazeboEnv:
         waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
         smoothed_points = self.bezier_curve(waypoints_2d)
         smoothed_waypoints = [(pt[0], pt[1], waypoints[i][2]) for i, pt in enumerate(smoothed_points)]
-        
         self.current_waypoint_index = 0
         return smoothed_waypoints
 
@@ -383,8 +382,25 @@ class GazeboEnv:
                 min_distance_to_obstacle = distance
 
         return min_distance_to_obstacle < threshold
+    
+    def adjust_current_waypoint(self):
+        current_wp = self.waypoints[self.current_waypoint_index]
+        next_wp = self.waypoints[self.current_waypoint_index + 1] if self.current_waypoint_index + 1 < len(self.waypoints) else None
+
+        if next_wp is not None:
+            direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
+            adjusted_wp_x = current_wp[0] + 0.1 * np.cos(direction)
+            adjusted_wp_y = current_wp[1] + 0.1 * np.sin(direction)
+
+            # 插入新的調整後的路徑點
+            self.waypoints.insert(self.current_waypoint_index + 1, (adjusted_wp_x, adjusted_wp_y, current_wp[2]))
+
+        # 跳過當前路徑點
+        self.current_waypoint_index += 1
 
     def generate_optimized_waypoints(self):
+        if not self.need_optimization():
+            return
         optimized_waypoints = []
         for i in range(len(self.waypoints) - 1):
             current_wp = self.waypoints[i]
@@ -395,7 +411,7 @@ class GazeboEnv:
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
             new_wp_yaw = direction
 
-            # 避开障碍物
+            # 避開障礙物
             while self.is_point_near_obstacle(new_wp_x, new_wp_y):
                 new_wp_x += 0.05 * np.cos(direction)
                 new_wp_y += 0.05 * np.sin(direction)
@@ -404,8 +420,17 @@ class GazeboEnv:
 
         optimized_waypoints.append(self.waypoints[-1])
 
-        self.waypoints = self.smooth_waypoints(optimized_waypoints)  # 使用新的贝塞尔曲线平滑化
+        self.waypoints = self.smooth_waypoints(optimized_waypoints)  # 使用贝塞尔曲线平滑化
         self.current_waypoint_index = 0
+    
+    def need_optimization(self):
+        # 依據當前的reward、碰撞等信息判斷是否需要再次優化
+        # 例如當前路徑是否經常導致碰撞
+        if self.collision_detected:
+            return True
+        if self.no_progress_steps > self.max_no_progress_steps:
+            return True
+        return False
 
     def optimize_waypoints_with_heuristics(self):
         adjusted_waypoints = []
@@ -565,53 +590,54 @@ class GazeboEnv:
         return occupancy_grid
 
     def step(self, action):
+        # 檢查當前是否到達最後一個路徑點
         if self.current_waypoint_index >= len(self.waypoints) - 1:
             self.done = True
             return self.state, 100, self.done, {}
 
+        # 檢測碰撞
         if self.is_collision_detected():
             rospy.loginfo("Collision detected, resetting environment.")
             reward = -200.0  # 碰撞懲罰
             self.reset()  # 重置環境
             return self.state, reward, True, {}
 
+        # 獲取機器人當前的位置
         robot_x, robot_y, _ = self.get_robot_position()
         current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
         distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x)**2 + (current_waypoint_y - robot_y)**2)
 
+        # 如果接近當前路徑點，移動到下一個
         if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
                 return self.state, 100, self.done, {}
 
-        # 確保 action 是一個陣列或張量
-        if isinstance(action, (int, float)):
-            action = np.array([action])
-
-        if np.random.rand() > self.epsilon:
-            action = self.calculate_action_to_waypoint(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
-        else:
-            exploration_noise = np.random.normal(0, 0.05, size=action.shape)
-            exploration_noise = np.clip(exploration_noise, -0.05, 0.05)
-            action = action + exploration_noise
-            action = np.clip(action, [-1.0, -0.3], [1.0, 0.3])
-
+        # 拆分動作：第一個是線速度，第二個是角速度，第三個是是否需要調整路徑點
         linear_speed = np.clip(action[0], -3.0, 3.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
+        adjust_waypoint = action[2] > 0.5  # 使用閾值來決定是否需要調整路徑點
 
+        # 如果需要調整路徑點
+        if adjust_waypoint:
+            self.adjust_current_waypoint()  # 調用路徑點調整函數
+
+        # 發送速度和方向指令給機器人
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
-
         self.last_twist = twist
         self.pub_cmd_vel.publish(twist)
 
+        # 發送 IMU 數據
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
+        # 暫停一下讓動作生效
         rospy.sleep(0.1)
 
+        # 計算當前的獎勵
         reward = self.calculate_reward(current_waypoint_x, current_waypoint_y)
 
         return self.state, reward, self.done, {}
@@ -669,32 +695,24 @@ class GazeboEnv:
 
     def calculate_reward(self, target_x, target_y):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
-
         distance_to_target = np.sqrt((target_x - robot_x)**2 + (target_y - robot_y)**2)
-        reward = -distance_to_target * 10  # 依據與目標的距離計算懲罰
 
-        # 檢查碰撞情況
-        if self.is_collision_detected():
-            reward -= 200.0  # 如果發生碰撞，則添加懲罰
+        # 距離獎勵：鼓勵靠近目標
+        reward = 100 - distance_to_target * 10
 
-        # 计算转向的一致性惩罚
-        if self.current_waypoint_index > 0:
-            prev_wp = self.waypoints[self.current_waypoint_index - 1]
-            prev_direction = np.arctan2(target_y - prev_wp[1], target_x - prev_wp[0])
-            current_direction = np.arctan2(robot_y - target_y, robot_x - target_x)
-            curvature = np.abs(current_direction - prev_direction)
+        # 安全獎勵：懲罰與障礙物過近
+        if self.is_point_near_obstacle(robot_x, robot_y):
+            reward -= 50  # 障礙物懲罰
 
-            # 速度和方向一致性检查
-            speed_factor = max(0, 1 - np.abs(self.last_twist.linear.x - 2.5))  # 速度与期望速度的差异，期望速度为2.5
-            direction_factor = max(0, 1 - curvature)  # 方向的平滑性，值越小越不平滑
-
-            consistency_penalty = -curvature * speed_factor * direction_factor * 2.0
-            reward += consistency_penalty
-
+        # 速度懲罰和方向一致性懲罰
         if np.abs(self.last_twist.angular.z) > 0.1:
-            reward -= 10.0
+            reward -= 10.0  # 過大轉向懲罰
+        if np.abs(self.last_twist.linear.x - 2.5) > 0.5:
+            reward -= 5.0  # 速度過快或過慢懲罰
 
-        reward *= 1.5
+        # 目標點獎勵：到達目標點給予大的正獎勵
+        if distance_to_target < REFERENCE_DISTANCE_TOLERANCE:
+            reward += 200  # 大獎勵
 
         return reward
 
@@ -720,55 +738,20 @@ class GazeboEnv:
 
     def calculate_action_to_waypoint(self, waypoint_x, waypoint_y, waypoint_yaw):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
-        linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-
-        preview_distance = 0.7
-        if linear_speed < 2.0:
-            preview_distance = 0.5
-        elif linear_speed > 2.5:
-            preview_distance = 0.9
-
-        num_future_points = 7
-        future_yaw_errors = []
-        for i in range(1, num_future_points + 1):
-            future_preview_distance = preview_distance * i
-            future_waypoint_x = waypoint_x + future_preview_distance * np.cos(waypoint_yaw)
-            future_waypoint_y = waypoint_y + future_preview_distance * np.sin(waypoint_yaw)
-
-            future_direction_to_waypoint = np.arctan2(future_waypoint_y - robot_y, future_waypoint_x - robot_x)
-            yaw_error = future_direction_to_waypoint - robot_yaw
-            yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
-
-            future_yaw_errors.append(yaw_error)
-
-        total_yaw_error = sum(future_yaw_errors)
-        average_yaw_error = total_yaw_error / num_future_points
-
-        if average_yaw_error > 0.3:
-            linear_speed = 1.5
-        elif 0.1 < average_yaw_error <= 0.3:
-            linear_speed = 2.0
-        else:
-            linear_speed = max(3.0, linear_speed * 0.95)
-
-        if linear_speed < 2.0:
-            kp = 0.5
-            kd = 0.35
-        elif linear_speed < 2.5:
-            kp = 0.8
-            kd = 0.5
-        else:
-            kp = 1.0
-            kd = 0.65
-
-        previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
-        current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
-
-        steer_angle = kp * future_yaw_errors[0] + kd * current_yaw_error_rate
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
-
-        self.previous_yaw_error = future_yaw_errors[0]
-
+        
+        # 計算與下個路徑點的角度偏差
+        direction_to_waypoint = np.arctan2(waypoint_y - robot_y, waypoint_x - robot_x)
+        yaw_error = direction_to_waypoint - robot_yaw
+        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
+        
+        # 根據角度偏差調整角速度
+        kp = 0.8  # 比例增益
+        steer_angle = np.clip(kp * yaw_error, -0.6, 0.6)
+        
+        # 根據距離調整線速度
+        distance_to_waypoint = np.sqrt((waypoint_x - robot_x) ** 2 + (waypoint_y - robot_y) ** 2)
+        linear_speed = np.clip(1.5 + (distance_to_waypoint - 1.0), 0, 3.0)
+        
         action = np.array([linear_speed, steer_angle])
         return action
 
@@ -778,16 +761,15 @@ class ActorCritic(nn.Module):
         self.conv1 = nn.Conv2d(4, 32, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
         
-        # 手動計算卷積層輸出的尺寸
         self._to_linear = self._get_conv_output_size(observation_space)
         
         self.fc1 = nn.Linear(self._to_linear, 256)
         self.lstm = nn.LSTM(256, 128, batch_first=True)
         self.fc2 = nn.Linear(128, 128)
         
-        self.actor = nn.Linear(128, action_space)
+        self.actor = nn.Linear(128, action_space + 1)  # 扩展动作空间，增加一个维度用于决定是否调整路径点
         self.critic = nn.Linear(128, 1)
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
+        self.actor_log_std = nn.Parameter(torch.zeros(1, action_space + 1))  # 扩展标准差的参数
 
     def _get_conv_output_size(self, shape):
         """計算卷積層輸出到全連接層的尺寸"""
@@ -834,11 +816,18 @@ class ActorCritic(nn.Module):
     def evaluate(self, state, action):
         action_mean, action_std, value, hidden = self(state)
         
+        # 將 action 轉換為 PyTorch tensor，如果它還不是
+        if isinstance(action, np.ndarray):
+            action = torch.tensor(action, dtype=torch.float32)
+
+        # 如果 action 是一維的，擴展為二維
         if action.dim() == 1:
             action = action.unsqueeze(1)
         
-        action = torch.tensor(action, dtype=torch.float32).to(action_mean.device)
+        # 確保 action 與 action_mean 使用相同的設備
+        action = action.to(action_mean.device)
 
+        # 計算 action 的 log 概率
         action_log_probs = -((action - action_mean) ** 2) / (2 * action_std ** 2) - action_std.log() - 0.5 * torch.log(torch.tensor(2 * np.pi, device=action_mean.device))
         action_log_probs = action_log_probs.sum(1)
 
@@ -847,8 +836,8 @@ class ActorCritic(nn.Module):
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
-        
-        # 使用優先級權重動態調整學習率
+
+        # 動作優化
         adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
@@ -865,30 +854,26 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
         old_log_probs = old_log_probs.detach()
 
         for _ in range(PPO_EPOCHS):
-            with torch.amp.autocast('cuda'):
-                log_probs, state_values, optimized_paths = model.evaluate(state_batch, action_batch)
-                advantages = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
+            log_probs, state_values, _ = model.evaluate(state_batch, action_batch)
+            lambda_advantage = 0.95  # GAE lambda for smoothing advantages
+            delta = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
+            advantages = delta + lambda_advantage * (1 - done_batch) * GAMMA * advantages.detach()
 
-                ratio = (log_probs - old_log_probs).exp()
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
+            ratio = (log_probs - old_log_probs).exp()
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
 
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
-                loss = actor_loss + 0.5 * critic_loss
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
+            loss = actor_loss + 0.5 * critic_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
+            # 更新優先級
             priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
             memory.update_priorities(indices, priorities)
-
-# Boltzmann探索策略
-def boltzmann_exploration(action_values, temperature=1.0):
-    probabilities = torch.exp(action_values / temperature)
-    probabilities /= probabilities.sum()
-    return torch.multinomial(probabilities, 1).item()
 
 def main():
     env = GazeboEnv()
@@ -922,7 +907,7 @@ def main():
     num_episodes = 1000000
     best_test_reward = -np.inf
 
-    for e in range(num_episodes):
+    for e in range(num_episodes):  # e 是當前 episode，num_episodes 是總 episode 數
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         previous_action = None
@@ -933,14 +918,17 @@ def main():
 
         for time_step in range(1500):
             action_values, hidden = model.act(state, previous_action, hidden)  # 保留LSTM隱藏狀態
-            action = boltzmann_exploration(action_values)  # 使用Boltzmann探索策略
+            
+            predicted_trajectory = env.mpc_controller.predict_future_trajectory(state, model, env)
+            action = env.mpc_controller.optimize_control_sequence(predicted_trajectory, model, env)
+            
             next_state, reward, done, _ = env.step(action)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
             memory.add(state.cpu().numpy(), action, reward, done, next_state.cpu().numpy())
 
             state = next_state
-            previous_action = action  # 更新previous_action
+            previous_action = action  # 更新 previous_action
             total_reward += reward
 
             elapsed_time = time.time() - start_time
@@ -954,6 +942,10 @@ def main():
         ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler)
         memory.clear()
 
+        if e % 10 == 0:  # 每10个回合进行一次路径优化
+            print(f"Optimizing waypoints at episode {e}")
+            env.generate_optimized_waypoints()  # 调用路径优化函数
+
         print(f"Episode {e}, Total Reward: {total_reward}")
 
         if total_reward > best_test_reward:
@@ -961,7 +953,7 @@ def main():
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with reward: {best_test_reward}")
 
-        if e % 20 == 0:
+        if e % 10 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved after {e} episodes.")
 
