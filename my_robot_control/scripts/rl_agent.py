@@ -877,6 +877,12 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
                 loss = actor_loss + 0.5 * critic_loss
 
+            wandb.log({
+                "actor_loss": actor_loss.item(),
+                "critic_loss": critic_loss.item(),
+                "total_loss": loss.item()
+            })
+
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -912,6 +918,13 @@ def main():
         "prediction_horizon": PREDICTION_HORIZON,
         "control_horizon": CONTROL_HORIZON,
     }
+
+    wandb.log({
+        "episode": e,
+        "total_reward": total_reward,
+        "best_test_reward": best_test_reward,
+        "elapsed_time": elapsed_time
+    })
 
     num_episodes = 1000000
     best_test_reward = -np.inf
