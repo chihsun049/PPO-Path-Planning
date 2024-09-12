@@ -919,13 +919,6 @@ def main():
         "control_horizon": CONTROL_HORIZON,
     }
 
-    wandb.log({
-        "episode": e,
-        "total_reward": total_reward,
-        "best_test_reward": best_test_reward,
-        "elapsed_time": elapsed_time
-    })
-
     num_episodes = 1000000
     best_test_reward = -np.inf
 
@@ -962,6 +955,14 @@ def main():
         memory.clear()
 
         print(f"Episode {e}, Total Reward: {total_reward}")
+
+        # 记录到 wandb
+        wandb.log({
+            "episode": e,
+            "total_reward": total_reward,
+            "best_test_reward": best_test_reward,
+            "elapsed_time": elapsed_time
+        })
 
         if total_reward > best_test_reward:
             best_test_reward = total_reward
