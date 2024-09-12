@@ -22,7 +22,7 @@ import wandb
 # Hyperparameters
 REFERENCE_DISTANCE_TOLERANCE = 0.65
 MEMORY_SIZE = 10000
-BATCH_SIZE = 1024
+BATCH_SIZE = 256
 GAMMA = 0.99
 LEARNING_RATE = 0.0003
 PPO_EPOCHS = 5
@@ -348,20 +348,6 @@ class GazeboEnv:
         ]
         return waypoints
     
-    def bezier_curve(self, points, num_points=100):
-        n = len(points) - 1
-        binomial_coeff = [1]
-        for i in range(1, n+1):
-            binomial_coeff.append(binomial_coeff[-1] * (n - i + 1) // i)
-        t_values = np.linspace(0, 1, num_points)
-        curve_points = []
-        for t in t_values:
-            point = np.zeros(2)
-            for i in range(n+1):
-                point += binomial_coeff[i] * (1 - t) ** (n - i) * t ** i * np.array(points[i])
-            curve_points.append(tuple(point))
-        return curve_points
-    
     def smooth_waypoints(self, waypoints):
         waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
         smoothed_points = self.bezier_curve(waypoints_2d)
@@ -379,47 +365,6 @@ class GazeboEnv:
 
         return min_distance_to_obstacle < threshold
 
-    def generate_optimized_waypoints(self):
-        optimized_waypoints = []
-        for i in range(len(self.waypoints) - 1):
-            current_wp = self.waypoints[i]
-            next_wp = self.waypoints[i + 1]
-
-            direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
-            new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
-            new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
-            new_wp_yaw = direction
-
-            while self.is_point_near_obstacle(new_wp_x, new_wp_y):
-                new_wp_x += 0.05 * np.cos(direction)
-                new_wp_y += 0.05 * np.sin(direction)
-
-            optimized_waypoints.append((new_wp_x, new_wp_y, new_wp_yaw))
-
-        optimized_waypoints.append(self.waypoints[-1])
-
-        self.waypoints = self.smooth_waypoints(optimized_waypoints)
-        self.current_waypoint_index = 0
-
-    def optimize_waypoints_with_heuristics(self):
-        adjusted_waypoints = []
-        for i, wp in enumerate(self.waypoints):
-            if i == 0 or i == len(self.waypoints) - 1:
-                adjusted_waypoints.append(wp)
-                continue
-
-            wp_x, wp_y, wp_yaw = wp
-
-            while self.is_point_near_obstacle(wp_x, wp_y):
-                direction = np.arctan2(self.target_y - wp_y, self.target_x - wp_x)
-                wp_x += 0.05 * np.cos(direction)
-                wp_y += 0.05 * np.sin(direction)
-
-            adjusted_waypoints.append((wp_x, wp_y, wp_yaw))
-        
-        self.waypoints = adjusted_waypoints
-        self.current_waypoint_index = 0
-    
     def collision_callback(self, data):
         if len(data.states) > 0:
             self.collision_detected = True
@@ -598,13 +543,7 @@ class GazeboEnv:
         if isinstance(action, (int, float)):
             action = np.array([action, 0.0])  # 如果只有線速度，補充角速度為 0
 
-        if np.random.rand() > self.epsilon:
-            action = self.calculate_action_to_waypoint(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
-        else:
-            exploration_noise = np.random.normal(0, 0.05, size=action.shape)
-            exploration_noise = np.clip(exploration_noise, -0.05, 0.05)
-            action = action + exploration_noise
-            action = np.clip(action, [-1.0, -0.3], [1.0, 0.3])
+        action = self.calculate_action_ucb(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
 
         # 提取線速度和角速度，並進行限制
         linear_speed = np.clip(action[0], -3.0, 3.0)
@@ -684,21 +623,19 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
 
-        # 方向奖励（角度差惩罚）
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
         reward -= yaw_diff * 10
 
+        distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
+        reward += (1.0 / (distance_to_goal + 1e-5)) * 10
+        
         if self.is_collision_detected():
             reward -= 200.0
 
-        # 路径平滑性奖励（曲率惩罚）
-        if self.current_waypoint_index > 0:
-            prev_wp = self.waypoints[self.current_waypoint_index - 1]
-            prev_direction = np.arctan2(target_y - prev_wp[1], target_x - prev_wp[0])
-            current_direction = np.arctan2(robot_y - target_y, robot_x - target_x)
-            curvature = np.abs(current_direction - prev_direction)
-            reward -= curvature * 10
+        # 如果距离障碍物非常近，给负奖励
+        if self.is_point_near_obstacle(robot_x, robot_y):
+            reward -= 100.0
 
         return reward
 
@@ -722,7 +659,7 @@ class GazeboEnv:
         yaw = np.arctan2(siny_cosp, cosy_cosp)
         return yaw
 
-    def calculate_action_to_waypoint(self, waypoint_x, waypoint_y, waypoint_yaw):
+    def calculate_action_ucb(self, waypoint_x, waypoint_y, waypoint_yaw):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
@@ -781,21 +718,27 @@ class ActorCritic(nn.Module):
         super(ActorCritic, self).__init__()
         self.conv1 = nn.Conv2d(4, 32, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)  # 增加一层卷积层
+
         self._to_linear = self._get_conv_output_size(observation_space)
         
         self.fc1 = nn.Linear(self._to_linear, 256)
-        self.lstm = nn.LSTM(256, 128, batch_first=True)
+        self.lstm = nn.LSTM(256, 128, num_layers=2, batch_first=True)  # 增加LSTM层数
         self.fc2 = nn.Linear(128, 128)
         
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
 
+        # Initialize UCB variables
+        self.visit_counts = {}  # Dictionary to store visit counts for each (state, action)
+        self.c = 2  # UCB exploration coefficient (can be adjusted)
+
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
         x = self.conv1(x)
         x = self.conv2(x)
+        x = self.conv3(x)  # 通过额外的卷积层
         return int(np.prod(x.size()))
 
     def forward(self, x, hidden=None):
@@ -804,6 +747,7 @@ class ActorCritic(nn.Module):
 
         x = torch.relu(self.conv1(x))
         x = torch.relu(self.conv2(x))
+        x = torch.relu(self.conv3(x))  # 通过额外的卷积层
         x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
 
@@ -826,10 +770,33 @@ class ActorCritic(nn.Module):
         with torch.amp.autocast('cuda'):
             action_mean, action_std, _, hidden = self(state, hidden)
 
-        if previous_action is not None:
-            action_mean += 0.1 * torch.tensor(previous_action).to(device)
+        # Upper Confidence Bound (UCB) for action selection
+        state_key = tuple(state.cpu().numpy().flatten())
+        
+        # Ensure the visit count is initialized to match the size of action_space, not action_mean
+        if state_key not in self.visit_counts:
+            # Initialize visit counts to match the action_space size, assuming action_space is a scalar
+            action_space_size = action_mean.shape[-1]  # Get the action space dimension
+            self.visit_counts[state_key] = torch.zeros(action_space_size, device=device)  # Ensure it's size of the action space
 
-        action = action_mean + action_std * torch.randn_like(action_std)
+        # Convert total_state_visits to Tensor
+        total_state_visits = self.visit_counts[state_key].sum()
+        total_state_visits = torch.tensor(total_state_visits).to(device)  # Ensure it's a Tensor
+        
+        if total_state_visits == 0:
+            total_state_visits = torch.tensor(1.0).to(device)  # avoid division by zero
+
+        # UCB adjustment
+        ucb_bonus = self.c * torch.sqrt(torch.log(total_state_visits) / (self.visit_counts[state_key] + 1e-5))
+        adjusted_action_mean = action_mean + ucb_bonus
+
+        # Choose action with added exploration from UCB
+        action = adjusted_action_mean + action_std * torch.randn_like(action_std)
+
+        # Update the visit counts for chosen action
+        chosen_action = action.argmax().item()  # Ensure chosen_action is an integer index
+        self.visit_counts[state_key][chosen_action] += 1  # Increment the visit count for the chosen action
+
         return action, hidden
     
     def evaluate(self, state, action):
@@ -877,15 +844,17 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
                 loss = actor_loss + 0.5 * critic_loss
 
+
             wandb.log({
                 "actor_loss": actor_loss.item(),
                 "critic_loss": critic_loss.item(),
                 "total_loss": loss.item()
             })
-
+            
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if _ % BATCH_SIZE == 0:
+                scaler.step(optimizer)
+                scaler.update()
 
             priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
             memory.update_priorities(indices, priorities)
