@@ -10,6 +10,7 @@ from sensor_msgs.msg import PointCloud2, Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
 from gazebo_msgs.msg import ModelState, ContactsState
 import sensor_msgs.point_cloud2 as pc2
+from scipy.special import comb
 from collections import namedtuple
 import cv2
 import open3d as o3d
@@ -179,10 +180,15 @@ class GazeboEnv:
         self.epsilon = 0.05
         self.mpc_controller = MPCController(PREDICTION_HORIZON, CONTROL_HORIZON)
         self.collision_detected = False
-        self.max_no_progress_steps = 20  # 允許最多無進展的步數
-        self.no_progress_steps = 0  # 初始化無進展步數計數器
-        self.previous_distance_to_goal = float('inf')  # 初始化為無限大
+        self.max_no_progress_steps = 20
+        self.no_progress_steps = 0
+        self.previous_distance_to_goal = float('inf')
 
+        # Initialize lidar data as None
+        self.lidar_data = None
+
+        # 调用优化后的路径生成方法
+        self.generate_optimized_waypoints()
 
     def generate_waypoints(self):
         waypoints = [
@@ -348,15 +354,85 @@ class GazeboEnv:
         ]
         return waypoints
     
+    def optimize_waypoints_with_heuristics(self):
+        adjusted_waypoints = []
+        for i, wp in enumerate(self.waypoints):
+            if i == 0 or i == len(self.waypoints) - 1:
+                adjusted_waypoints.append(wp)
+                continue
+
+            wp_x, wp_y, wp_yaw = wp
+
+            while self.is_point_near_obstacle(wp_x, wp_y):
+                direction = np.arctan2(self.target_y - wp_y, self.target_x - wp_x)
+                wp_x += 0.05 * np.cos(direction)
+                wp_y += 0.05 * np.sin(direction)
+
+            adjusted_waypoints.append((wp_x, wp_y, wp_yaw))
+        
+        self.waypoints = adjusted_waypoints
+        self.current_waypoint_index = 0
+
+    def generate_optimized_waypoints(self):
+        # 只有在有LiDAR數據的情況下進行優化
+        if self.lidar_data is None:
+            rospy.logwarn("LiDAR data not yet available, skipping optimization.")
+            return
+
+        optimized_waypoints = []
+        for i in range(len(self.waypoints) - 1):
+            current_wp = self.waypoints[i]
+            next_wp = self.waypoints[i + 1]
+
+            direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
+            new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
+            new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
+            new_wp_yaw = direction
+
+            # 檢查是否接近障礙物並調整路徑
+            while self.is_point_near_obstacle(new_wp_x, new_wp_y):
+                new_wp_x += 0.05 * np.cos(direction)
+                new_wp_y += 0.05 * np.sin(direction)
+
+            # 根據reward進行調整，例如避免接近障礙物，並且考慮加速訓練
+            if self.previous_distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
+                new_wp_x += np.random.uniform(-0.05, 0.05)
+                new_wp_y += np.random.uniform(-0.05, 0.05)
+
+            optimized_waypoints.append((new_wp_x, new_wp_y, new_wp_yaw))
+
+        optimized_waypoints.append(self.waypoints[-1])
+        self.waypoints = self.smooth_waypoints(optimized_waypoints)
+        self.current_waypoint_index = 0
+
     def smooth_waypoints(self, waypoints):
         waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
         smoothed_points = self.bezier_curve(waypoints_2d)
         smoothed_waypoints = [(pt[0], pt[1], waypoints[i][2]) for i, pt in enumerate(smoothed_points)]
-        
         self.current_waypoint_index = 0
         return smoothed_waypoints
+    
+    def bezier_curve(self, waypoints, n_points=100):
+        waypoints = np.array(waypoints)
+        n = len(waypoints) - 1
+
+        def bernstein_poly(i, n, t):
+            return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
+
+        t = np.linspace(0.0, 1.0, n_points)
+        curve = np.zeros((n_points, 2))
+
+        for i in range(n + 1):
+            curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
+
+        return curve
 
     def is_point_near_obstacle(self, x, y, threshold=0.12):
+        # Ensure LiDAR data is available before checking for obstacles
+        if self.lidar_data is None:
+            rospy.logwarn("LiDAR data is not available yet.")
+            return False
+
         min_distance_to_obstacle = float('inf')
         for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
             distance = np.sqrt((point[0] - x)**2 + (point[1] - y)**2)
@@ -623,19 +699,31 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
 
+        # 目標方向與當前朝向的差距，懲罰大的偏差，鼓勵平滑的方向變化
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward -= yaw_diff * 10
+        reward -= yaw_diff * 5  # 調整權重，懲罰過大的角度偏差
 
+        # 距離目標的獎勵，鼓勵靠近目標
         distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
-        reward += (1.0 / (distance_to_goal + 1e-5)) * 10
-        
+        reward += (1.0 / (distance_to_goal + 1e-5)) * 10  # 增加靠近目標的獎勵
+
+        # 安全性：遠離障礙物的獎勵
+        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
+            reward += 50  # 如果離障礙物足夠遠，給予額外獎勵
+        else:
+            reward -= 100  # 距離障礙物過近給予懲罰
+
+        # 碰撞懲罰
         if self.is_collision_detected():
             reward -= 200.0
 
-        # 如果距离障碍物非常近，给负奖励
-        if self.is_point_near_obstacle(robot_x, robot_y):
-            reward -= 100.0
+        linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
+
+        # 獎勵平滑行駛，根據上一個動作來計算加速度變化，避免突然加速或轉向
+        acceleration = np.abs(self.last_twist.linear.x - linear_speed)
+        if acceleration < 0.1:
+            reward += 10  # 獎勵平穩行駛
 
         return reward
 
@@ -693,14 +781,14 @@ class GazeboEnv:
             linear_speed = max(3.0, linear_speed * 0.95)
 
         if linear_speed < 2.0:
-            kp = 0.5
-            kd = 0.35
+            kp = 0.6
+            kd = 0.7
         elif linear_speed < 2.5:
-            kp = 0.8
+            kp = 0.4
             kd = 0.5
         else:
-            kp = 1.0
-            kd = 0.65
+            kp = 0.2
+            kd = 0.3
 
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
@@ -924,6 +1012,9 @@ def main():
         memory.clear()
 
         print(f"Episode {e}, Total Reward: {total_reward}")
+
+        # 優化路徑點
+        env.generate_optimized_waypoints()
 
         # 记录到 wandb
         wandb.log({
