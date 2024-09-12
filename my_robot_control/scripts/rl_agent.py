@@ -622,7 +622,7 @@ class GazeboEnv:
         action = self.calculate_action_ucb(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
 
         # 提取線速度和角速度，並進行限制
-        linear_speed = np.clip(action[0], -3.0, 3.0)
+        linear_speed = np.clip(action[0], -2.5, 2.5)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
         # 發布控制指令
@@ -752,9 +752,9 @@ class GazeboEnv:
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
         preview_distance = 0.7
-        if linear_speed < 2.0:
+        if linear_speed < 1.5:
             preview_distance = 0.5
-        elif linear_speed > 2.5:
+        elif linear_speed > 2.0:
             preview_distance = 0.9
 
         num_future_points = 7
@@ -773,28 +773,46 @@ class GazeboEnv:
         total_yaw_error = sum(future_yaw_errors)
         average_yaw_error = total_yaw_error / num_future_points
 
-        if average_yaw_error > 0.3:
-            linear_speed = 1.5
-        elif 0.1 < average_yaw_error <= 0.3:
-            linear_speed = 2.0
-        else:
-            linear_speed = max(3.0, linear_speed * 0.95)
+        # 如果机器人在同一方向上持续失败，则切换方向
+        failure_threshold = 10  # 允许机器人连续失败的步数
+        if not hasattr(self, 'failure_count'):
+            self.failure_count = 0
 
-        if linear_speed < 2.0:
+        if average_yaw_error > 0.3:
+            linear_speed = 1.0
+        elif 0.1 < average_yaw_error <= 0.3:
+            linear_speed = 1.5
+        else:
+            linear_speed = max(2.5, linear_speed * 0.9)
+
+        if linear_speed < 1.5:
             kp = 0.6
-            kd = 0.7
-        elif linear_speed < 2.5:
+            kd = 0.3
+        elif linear_speed < 2.0:
             kp = 0.4
             kd = 0.5
         else:
             kp = 0.2
-            kd = 0.3
+            kd = 0.7
 
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
 
         steer_angle = kp * future_yaw_errors[0] + kd * current_yaw_error_rate
         steer_angle = np.clip(steer_angle, -0.6, 0.6)
+
+        # 检查是否有进展（基于到路径点的距离）
+        distance_to_waypoint = np.sqrt((waypoint_x - robot_x) ** 2 + (waypoint_y - robot_y) ** 2)
+        if distance_to_waypoint < 0.1:  # 如果接近路径点，重置失败计数
+            self.failure_count = 0
+        else:
+            self.failure_count += 1  # 如果没有进展，增加失败计数
+
+        # 如果失败计数超过阈值，切换方向
+        if self.failure_count > failure_threshold:
+            rospy.loginfo("由于持续失败，切换方向")
+            steer_angle *= -1  # 切换方向
+            self.failure_count = 0  # 重置失败计数
 
         self.previous_yaw_error = future_yaw_errors[0]
 

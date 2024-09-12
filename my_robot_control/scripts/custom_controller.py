@@ -115,12 +115,12 @@ class CustomController:
     def calculate_slope_compensation(self):
         # 根据车辆的倾斜角度计算坡度补偿
         gravity = 9.81  # 地球重力加速度 (m/s^2)
-        slope_force = self.vehicle_mass * gravity * math.sin(self.pitch_angle)
+        slope_force = self.vehicle_mass * gravity * math.sin(self.pitch_angle) * 10
         
         # 根据坡度的正负，决定是增加还是减少动力
-        if self.pitch_angle > 1.5:  # 上坡时增加动力
+        if self.pitch_angle > 0.5:  # 上坡时增加动力
             return slope_force
-        elif self.pitch_angle < -1.5:  # 下坡时减少动力
+        elif self.pitch_angle < -0.5:  # 下坡时减少动力
             return -slope_force
         else:
             return 0.0  # 平地或无明显坡度时，无需补偿

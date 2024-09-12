@@ -195,7 +195,7 @@
           <upper>0.6108652381980153</upper>
         </limit>
         <dynamics>
-          <damping>0.1</damping> <!-- 增加阻尼 -->
+          <damping>0.3</damping> <!-- 增加阻尼 -->
         </dynamics>
       </axis>
       <axis2>
