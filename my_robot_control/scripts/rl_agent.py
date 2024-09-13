@@ -395,7 +395,7 @@ class GazeboEnv:
                 min_distance_to_obstacle = float('inf')
 
                 # 多方向檢查
-                for angle_offset in np.linspace(-np.pi, np.pi, num=12):  # 每 30 度檢查一次
+                for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
                     adjusted_direction = direction + angle_offset
                     temp_x = current_wp[0] + 0.2 * np.cos(adjusted_direction)
                     temp_y = current_wp[1] + 0.2 * np.sin(adjusted_direction)
@@ -446,8 +446,7 @@ class GazeboEnv:
 
         return curve
 
-    def is_point_near_obstacle(self, x, y, threshold=0.12):
-        # Ensure LiDAR data is available before checking for obstacles
+    def is_point_near_obstacle(self, x, y, threshold=0.25):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data is not available yet.")
             return False
@@ -641,7 +640,7 @@ class GazeboEnv:
         action = self.calculate_action_ucb(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
 
         # 提取線速度和角速度，並進行限制
-        linear_speed = np.clip(action[0], -2.5, 2.5)
+        linear_speed = np.clip(action[0], -2.0, 2.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
         # 發布控制指令
@@ -718,28 +717,35 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
 
-        # 目標方向與當前朝向的差距，懲罰大的偏差，鼓勵平滑的方向變化
+        # 目標方向與當前朝向的差距，鼓勵平滑的方向變化
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward -= yaw_diff * 5  # 調整權重，懲罰過大的角度偏差
+        reward += max(0, 5 - yaw_diff * 5)  # 鼓勵角度偏差越小獎勵越多
 
         # 距離目標的獎勵，鼓勵靠近目標
         distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
-        reward += (1.0 / (distance_to_goal + 1e-5)) * 10  # 增加靠近目標的獎勵
+        reward += (1.0 / (distance_to_goal + 1e-5)) * 10  # 獎勵越靠近目標越高
 
         # 安全性：遠離障礙物的獎勵
         if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
             reward += 50  # 如果離障礙物足夠遠，給予額外獎勵
-        else:
-            reward -= 100  # 距離障礙物過近給予懲罰
 
-        # 碰撞懲罰
-        if self.is_collision_detected():
-            reward -= 200.0
+        # 行徑方向與目標方向的差距，反向時不給任何獎勵
+        robot_velocity_x = self.last_twist.linear.x
+        robot_velocity_y = self.last_twist.linear.y
+        if robot_velocity_x != 0 or robot_velocity_y != 0:
+            movement_direction = np.arctan2(robot_velocity_y, robot_velocity_x)
+            movement_diff = np.abs(movement_direction - direction_to_target)
 
-        linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
+            # 如果角度差小於90度，給予獎勵
+            if movement_diff < np.pi / 2:  # 小於90度才給獎勵
+                if movement_diff < np.pi / 6:  # 30度內認為是朝向目標
+                    reward += 20  # 額外獎勵朝向目標行徑
+            else:
+                reward = 0  # 逆向時，所有獎勵歸零
 
         # 獎勵平滑行駛，根據上一個動作來計算加速度變化，避免突然加速或轉向
+        linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
         acceleration = np.abs(self.last_twist.linear.x - linear_speed)
         if acceleration < 0.1:
             reward += 10  # 獎勵平穩行駛
@@ -770,7 +776,7 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
-        preview_distance = 0.7  # 預覽距離
+        preview_distance = 1.2  # 預覽距離
         num_future_points = 7  # 預覽點的數量
         future_yaw_errors = []
         future_turn_detected = False
@@ -813,18 +819,18 @@ class GazeboEnv:
             elif 0.1 < average_yaw_error <= 0.3:
                 linear_speed = max(1.5, linear_speed * 0.9)
             else:
-                linear_speed = min(2.5, linear_speed * 1.1)  # 平直路徑上加速
+                linear_speed = min(2.0, linear_speed * 1.1)  # 平直路徑上加速
 
         # 調整控制參數 kp 和 kd
-        if linear_speed < 1.5:
-            kp = 0.6
-            kd = 0.3
-        elif linear_speed < 2.0:
+        if linear_speed < 1.0:
+            kp = 0.5
+            kd = 0.2
+        elif linear_speed < 1.5:
             kp = 0.4
-            kd = 0.5
+            kd = 0.3
         else:
-            kp = 0.2
-            kd = 0.7
+            kp = 0.3
+            kd = 0.4
 
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
@@ -970,11 +976,11 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
                 loss = actor_loss + 0.5 * critic_loss
 
 
-            wandb.log({
-                "actor_loss": actor_loss.item(),
-                "critic_loss": critic_loss.item(),
-                "total_loss": loss.item()
-            })
+            # wandb.log({
+            #     "actor_loss": actor_loss.item(),
+            #     "critic_loss": critic_loss.item(),
+            #     "total_loss": loss.item()
+            # })
             
             scaler.scale(loss).backward()
             if _ % BATCH_SIZE == 0:
@@ -1000,18 +1006,18 @@ def main():
     else:
         print("Created new model.")
 
-    wandb.init(project="my_robot_workspace")
+    # wandb.init(project="my_robot_workspace")
 
-    wandb.config = {
-        "learning_rate": LEARNING_RATE,
-        "batch_size": BATCH_SIZE,
-        "gamma": GAMMA,
-        "ppo_epochs": PPO_EPOCHS,
-        "clip_param": CLIP_PARAM,
-        "memory_size": MEMORY_SIZE,
-        "prediction_horizon": PREDICTION_HORIZON,
-        "control_horizon": CONTROL_HORIZON,
-    }
+    # wandb.config = {
+    #     "learning_rate": LEARNING_RATE,
+    #     "batch_size": BATCH_SIZE,
+    #     "gamma": GAMMA,
+    #     "ppo_epochs": PPO_EPOCHS,
+    #     "clip_param": CLIP_PARAM,
+    #     "memory_size": MEMORY_SIZE,
+    #     "prediction_horizon": PREDICTION_HORIZON,
+    #     "control_horizon": CONTROL_HORIZON,
+    # }
 
     num_episodes = 1000000
     best_test_reward = -np.inf
@@ -1036,6 +1042,7 @@ def main():
             state = next_state
             previous_action = action
             total_reward += reward
+            # print("reward++")
 
             elapsed_time = time.time() - start_time
 
@@ -1053,13 +1060,13 @@ def main():
         # 優化路徑點
         env.generate_optimized_waypoints()
 
-        # 记录到 wandb
-        wandb.log({
-            "episode": e,
-            "total_reward": total_reward,
-            "best_test_reward": best_test_reward,
-            "elapsed_time": elapsed_time
-        })
+        # # 记录到 wandb
+        # wandb.log({
+        #     "episode": e,
+        #     "total_reward": total_reward,
+        #     "best_test_reward": best_test_reward,
+        #     "elapsed_time": elapsed_time
+        # })
 
         if total_reward > best_test_reward:
             best_test_reward = total_reward
@@ -1074,7 +1081,7 @@ def main():
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
-    wandb.finish()
+    # wandb.finish()
 
 if __name__ == '__main__':
     main()
