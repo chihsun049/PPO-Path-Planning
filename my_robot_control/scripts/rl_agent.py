@@ -389,21 +389,40 @@ class GazeboEnv:
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
             new_wp_yaw = direction
 
-            # 檢查是否接近障礙物並調整路徑
-            while self.is_point_near_obstacle(new_wp_x, new_wp_y):
-                new_wp_x += 0.05 * np.cos(direction)
-                new_wp_y += 0.05 * np.sin(direction)
+            # 如果障礙物靠近，開始進行多方向檢查
+            if self.is_point_near_obstacle(new_wp_x, new_wp_y):
+                best_x, best_y = new_wp_x, new_wp_y
+                min_distance_to_obstacle = float('inf')
 
-            # 根據reward進行調整，例如避免接近障礙物，並且考慮加速訓練
-            if self.previous_distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
-                new_wp_x += np.random.uniform(-0.05, 0.05)
-                new_wp_y += np.random.uniform(-0.05, 0.05)
+                # 多方向檢查
+                for angle_offset in np.linspace(-np.pi, np.pi, num=12):  # 每 30 度檢查一次
+                    adjusted_direction = direction + angle_offset
+                    temp_x = current_wp[0] + 0.2 * np.cos(adjusted_direction)
+                    temp_y = current_wp[1] + 0.2 * np.sin(adjusted_direction)
+
+                    # 檢查新的點是否遠離障礙物
+                    if not self.is_point_near_obstacle(temp_x, temp_y):
+                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+                        if distance_to_obstacle > min_distance_to_obstacle:
+                            best_x, best_y = temp_x, temp_y
+                            min_distance_to_obstacle = distance_to_obstacle
+
+                new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y, new_wp_yaw))
 
         optimized_waypoints.append(self.waypoints[-1])
         self.waypoints = self.smooth_waypoints(optimized_waypoints)
         self.current_waypoint_index = 0
+
+    # 用於計算當前點與最近障礙物之間的距離
+    def calculate_distance_to_nearest_obstacle(self, x, y):
+        min_distance = float('inf')
+        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
+            distance = np.sqrt((point[0] - x) ** 2 + (point[1] - y) ** 2)
+            if distance < min_distance:
+                min_distance = distance
+        return min_distance
 
     def smooth_waypoints(self, waypoints):
         waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
@@ -751,14 +770,21 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
 
-        preview_distance = 0.7
-        if linear_speed < 1.5:
-            preview_distance = 0.5
-        elif linear_speed > 2.0:
-            preview_distance = 0.9
-
-        num_future_points = 7
+        preview_distance = 0.7  # 預覽距離
+        num_future_points = 7  # 預覽點的數量
         future_yaw_errors = []
+        future_turn_detected = False
+
+        # 檢查是否已經超過當前路徑點，並切換到下一個
+        distance_to_current_waypoint = np.sqrt((waypoint_x - robot_x) ** 2 + (waypoint_y - robot_y) ** 2)
+        if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
+            self.current_waypoint_index += 1  # 切換到下一個路徑點
+            if self.current_waypoint_index >= len(self.waypoints):
+                rospy.loginfo("已經到達最後一個路徑點")
+                self.done = True
+                return np.array([0.0, 0.0])  # 到達最後一個路徑點，停止動作
+            waypoint_x, waypoint_y, waypoint_yaw = self.waypoints[self.current_waypoint_index]
+        
         for i in range(1, num_future_points + 1):
             future_preview_distance = preview_distance * i
             future_waypoint_x = waypoint_x + future_preview_distance * np.cos(waypoint_yaw)
@@ -770,21 +796,26 @@ class GazeboEnv:
 
             future_yaw_errors.append(yaw_error)
 
+            # 如果未來某點的 yaw 誤差超過閾值，標記為即將轉彎
+            if np.abs(yaw_error) > 0.3:  # 假設 0.3 為轉彎的閾值
+                future_turn_detected = True
+
         total_yaw_error = sum(future_yaw_errors)
         average_yaw_error = total_yaw_error / num_future_points
 
-        # 如果机器人在同一方向上持续失败，则切换方向
-        failure_threshold = 10  # 允许机器人连续失败的步数
-        if not hasattr(self, 'failure_count'):
-            self.failure_count = 0
-
-        if average_yaw_error > 0.3:
-            linear_speed = 1.0
-        elif 0.1 < average_yaw_error <= 0.3:
-            linear_speed = 1.5
+        # 如果即將轉彎，提前降低速度
+        if future_turn_detected:
+            linear_speed = max(0.5, linear_speed * 0.5)  # 提前減速到過彎速度
         else:
-            linear_speed = max(2.5, linear_speed * 0.9)
+            # 沒有轉彎時，正常調整速度
+            if average_yaw_error > 0.3:
+                linear_speed = max(1.0, linear_speed * 0.7)
+            elif 0.1 < average_yaw_error <= 0.3:
+                linear_speed = max(1.5, linear_speed * 0.9)
+            else:
+                linear_speed = min(2.5, linear_speed * 1.1)  # 平直路徑上加速
 
+        # 調整控制參數 kp 和 kd
         if linear_speed < 1.5:
             kp = 0.6
             kd = 0.3
@@ -798,21 +829,9 @@ class GazeboEnv:
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
 
+        # 計算方向盤角度
         steer_angle = kp * future_yaw_errors[0] + kd * current_yaw_error_rate
         steer_angle = np.clip(steer_angle, -0.6, 0.6)
-
-        # 检查是否有进展（基于到路径点的距离）
-        distance_to_waypoint = np.sqrt((waypoint_x - robot_x) ** 2 + (waypoint_y - robot_y) ** 2)
-        if distance_to_waypoint < 0.1:  # 如果接近路径点，重置失败计数
-            self.failure_count = 0
-        else:
-            self.failure_count += 1  # 如果没有进展，增加失败计数
-
-        # 如果失败计数超过阈值，切换方向
-        if self.failure_count > failure_threshold:
-            rospy.loginfo("由于持续失败，切换方向")
-            steer_angle *= -1  # 切换方向
-            self.failure_count = 0  # 重置失败计数
 
         self.previous_yaw_error = future_yaw_errors[0]
 
