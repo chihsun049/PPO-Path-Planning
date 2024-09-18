@@ -18,9 +18,8 @@ import tf
 from tf.transformations import quaternion_from_euler
 import time
 from torch.amp import GradScaler
-import wandb
 
-# Hyperparameters
+# 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
 MEMORY_SIZE = 10000
 BATCH_SIZE = 256
@@ -28,8 +27,8 @@ GAMMA = 0.99
 LEARNING_RATE = 0.0003
 PPO_EPOCHS = 5
 CLIP_PARAM = 0.2
-PREDICTION_HORIZON = 400  # MPC预测的时间步数
-CONTROL_HORIZON = 10  # MPC控制的时间步数
+PREDICTION_HORIZON = 400
+CONTROL_HORIZON = 10
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
@@ -103,59 +102,17 @@ class PrioritizedMemory:
         )
 
     def update_priorities(self, batch_indices, batch_priorities):
-        batch_priorities = torch.tensor(batch_priorities, dtype=torch.float32).cuda()
+        # 確保每個 priority 是單一標量
         for idx, priority in zip(batch_indices, batch_priorities):
-            self.priorities[idx] = priority + self.epsilon
+            # 如果 priority 是 numpy 陣列，檢查其 size
+            if priority.size > 1:
+                priority = priority[0]
+            self.priorities[idx] = priority.item() + self.epsilon
 
     def clear(self):
         self.position = 0
         self.memory = [None] * self.capacity
         self.priorities = torch.zeros((self.capacity,), dtype=torch.float32).cuda()
-
-class MPCController:
-    def __init__(self, prediction_horizon, control_horizon):
-        self.prediction_horizon = prediction_horizon
-        self.control_horizon = control_horizon
-        self.optimization_result = []
-
-    def predict_future_trajectory(self, current_state, model, env):
-        predicted_trajectory = []
-        state = current_state.clone()
-        previous_action = None
-
-        hidden = None
-        
-        for _ in range(self.prediction_horizon):
-            action, hidden = model.act(state, previous_action, hidden)
-            action = action.cpu().data.numpy().flatten()
-            next_state, _, _, _ = env.step(action)
-            
-            state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
-            predicted_trajectory.append((state, action))
-            
-            previous_action = action
-            
-        return predicted_trajectory
-
-    def optimize_control_sequence(self, predicted_trajectory, model, env):
-        optimized_actions = []
-        
-        for i in range(self.control_horizon):
-            action = predicted_trajectory[i][1]
-            
-            _, action_value, _ = model.evaluate(predicted_trajectory[i][0], action)
-            
-            if action_value > 0.5:
-                optimized_actions.append(action)
-            else:
-                optimized_actions.append(self.mpc_fallback_action())
-            
-        self.optimization_result = optimized_actions
-        return optimized_actions
-    
-    def mpc_fallback_action(self):
-        fallback_action = np.array([0.0, 0.0])
-        return fallback_action
 
 class GazeboEnv:
     def __init__(self):
@@ -168,189 +125,185 @@ class GazeboEnv:
         self.get_model_state = rospy.ServiceProxy('/gazebo/get_model_state', GetModelState)
         self.listener = tf.TransformListener()
         self.action_space = 2
-        self.observation_space = (4, 64, 64)
+        self.observation_space = (3, 64, 64)
         self.state = np.zeros(self.observation_space)
         self.done = False
         self.target_x = -5.3334
         self.target_y = -0.3768
-        self.target_yaw = -0.0058
         self.waypoints = self.generate_waypoints()
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
-        self.mpc_controller = MPCController(PREDICTION_HORIZON, CONTROL_HORIZON)
         self.collision_detected = False
-        self.max_no_progress_steps = 20
+
+        self.lidar_data = None  # 初始化 lidar_data，避免 AttributeError
+
+        self.max_no_progress_steps = 10
         self.no_progress_steps = 0
-        self.previous_distance_to_goal = float('inf')
 
-        # Initialize lidar data as None
-        self.lidar_data = None
-
-        # 调用优化后的路径生成方法
         self.generate_optimized_waypoints()
 
     def generate_waypoints(self):
         waypoints = [
-            (0.2206, 0.1208, -0.0053),
-            (1.2812, 0.0748, -0.0212),
-            (2.3472, 0.1292, -0.0327),
-            (3.4053, 0.1631, -0.0474),
-            (4.4468, 0.1421, -0.0347),
-            (5.5032, 0.1996, -0.0198),
-            (6.5372, 0.2315, -0.0122),
-            (7.5948, 0.2499, -0.0177),
-            (8.6607, 0.3331, -0.0262),
-            (9.6811, 0.3973, -0.0256),
-            (10.6847, 0.4349, -0.0277),
-            (11.719, 0.4814, -0.0429),
-            (12.7995, 0.5223, -0.0264),
-            (13.8983, 0.515, -0.0076),
-            (14.9534, 0.6193, -0.0149),
-            (15.9899, 0.7217, -0.0278),
-            (17.0138, 0.7653, -0.0315),
-            (18.0751, 0.8058, -0.012),
-            (19.0799, 0.864, -0.0036),
-            (20.1383, 0.936, -0.0091),
-            (21.1929, 0.9923, -0.0271),
-            (22.2351, 1.0279, -0.0041),
-            (23.3374, 1.1122, -0.0091),
-            (24.4096, 1.1694, -0.0037),
-            (25.4817, 1.2437, 0.0065),
-            (26.5643, 1.3221, -0.006),
-            (27.6337, 1.4294, -0.0201),
-            (28.6643, 1.4471, -0.024),
-            (29.6839, 1.4987, -0.0068),
-            (30.7, 1.58, 0.0019),
-            (31.7796, 1.6339, 0.012),
-            (32.8068, 1.7283, 0.0191),
-            (33.8596, 1.8004, 0.0008),
-            (34.9469, 1.9665, -0.0204),
-            (35.9883, 1.9812, -0.0164),
-            (37.0816, 2.0237, 0.0132),
-            (38.1077, 2.1291, -0.0006),
-            (39.1405, 2.1418, -0.0163),
-            (40.1536, 2.2273, -0.0327),
-            (41.1599, 2.2473, -0.0421),
-            (42.2476, 2.2927, -0.0086),
-            (43.3042, 2.341, -0.0229),
-            (44.4049, 2.39, -0.0256),
-            (45.5091, 2.4284, -0.0391),
-            (46.579, 2.5288, -0.0324),
-            (47.651, 2.4926, -0.0035),
-            (48.6688, 2.6072, -0.0159),
-            (49.7786, 2.6338, -0.0224),
-            (50.7942, 2.6644, 0.0142),
-            (51.868, 2.7625, 0.0131),
-            (52.9149, 2.8676, -0.0019),
-            (54.0346, 2.9602, -0.017),
-            (55.0855, 2.9847, 0.0511),
-            (56.1474, 3.1212, 0.08),
-            (57.2397, 3.2988, 0.1531),
-            (58.2972, 3.5508, 0.5749),
-            (59.1103, 4.1404, 1.0891),
-            (59.6059, 5.1039, 1.5337),
-            (59.6032, 6.2015, 1.6305),
-            (59.4278, 7.212, 1.5512),
-            (59.3781, 8.2782, 1.5008),
-            (59.4323, 9.2866, 1.5307),
-            (59.3985, 10.304, 1.5229),
-            (59.3676, 11.3302, 1.5092),
-            (59.3193, 12.3833, 1.493),
-            (59.359, 13.4472, 1.4758),
-            (59.3432, 14.4652, 1.5391),
-            (59.3123, 15.479, 1.6848),
-            (59.1214, 16.4917, 1.9472),
-            (58.7223, 17.4568, 2.4068),
-            (57.8609, 18.1061, 2.9224),
-            (56.8366, 18.3103, -3.0502),
-            (55.7809, 18.0938, -2.9053),
-            (54.7916, 17.707, -2.9996),
-            (53.7144, 17.5087, -2.9996),
-            (52.6274, 17.3683, -3.0205),
-            (51.6087, 17.1364, -3.0781),
-            (50.5924, 17.0295, -3.0762),
-            (49.5263, 16.9058, -3.0919),
-            (48.4514, 16.7769, -3.1014),
-            (47.3883, 16.6701, -3.0868),
-            (46.3186, 16.5403, -3.0794),
-            (45.3093, 16.4615, -3.0892),
-            (44.263, 16.299, -3.0817),
-            (43.2137, 16.1486, -3.0878),
-            (42.171, 16.0501, -3.1048),
-            (41.1264, 16.0245, -3.132),
-            (40.171, 16.7172, 2.9319),
-            (39.1264, 16.8428, 2.9626),
-            (38.1122, 17.019, -2.7588),
-            (37.2234, 16.5322, -2.1481),
-            (36.6845, 15.6798, -2.104),
-            (36.3607, 14.7064, -2.4919),
-            (35.5578, 13.9947, -2.9643),
-            (34.5764, 13.7466, -3.0707),
-            (33.5137, 13.6068, -3.0838),
-            (32.4975, 13.5031, -3.0695),
-            (31.5029, 13.3368, -3.0904),
-            (30.4162, 13.1925, -3.1037),
-            (29.3894, 13.067, -3.123),
-            (28.3181, 12.9541, -3.1333),
-            (27.3195, 12.8721, 3.1318),
-            (26.2852, 12.8035, 3.1391),
-            (25.241, 12.6952, -3.1389),
-            (24.1598, 12.6435, 3.1131),
-            (23.0712, 12.5947, 3.1247),
-            (21.9718, 12.5297, 3.1398),
-            (20.9141, 12.4492, 3.1287),
-            (19.8964, 12.3878, 3.1154),
-            (18.7163, 12.32, 3.1105),
-            (17.6221, 12.2928, 3.1383),
-            (16.5457, 12.2855, -3.1134),
-            (15.5503, 12.1534, -3.0989),
-            (14.4794, 12.0462, -3.1104),
-            (13.4643, 11.9637, -3.1217),
-            (12.3466, 11.7943, 3.1156),
-            (11.2276, 11.6071, 2.6767),
-            (10.2529, 12.0711, 2.1262),
-            (9.7942, 13.0066, 1.9467),
-            (9.398, 13.9699, 2.2779),
-            (8.6017, 14.7268, 2.9106),
-            (7.4856, 14.8902, -2.8568),
-            (6.5116, 14.4724, -2.864),
-            (5.4626, 14.1256, -3.0697),
-            (4.3911, 13.9535, -3.1087),
-            (3.3139, 13.8013, 3.1244),
-            (2.2967, 13.7577, 3.1353),
-            (1.2165, 13.7116, 3.1319),
-            (0.1864, 13.6054, -3.1129),
-            (-0.9592, 13.4747, -3.132),
-            (-2.0086, 13.352, 3.1106),
-            (-3.0267, 13.3358, 2.8815),
-            (-4.0117, 13.5304, 2.8523),
-            (-5.0541, 13.8047, 2.956),
-            (-6.0953, 13.9034, 3.0928),
-            (-7.1116, 13.8871, 3.1398),
-            (-8.152, 13.8062, 3.1392),
-            (-9.195, 13.7043, 3.1361),
-            (-10.2548, 13.6152, -2.8696),
-            (-11.234, 13.3289, -2.4547),
-            (-11.9937, 12.6211, -2.0136),
-            (-12.3488, 11.6585, -1.7069),
-            (-12.4231, 10.6268, -1.56),
-            (-12.3353, 9.5915, -1.558),
-            (-12.2405, 8.5597, -1.568),
-            (-12.1454, 7.4974, -1.5839),
-            (-12.0596, 6.4487, -1.5981),
-            (-12.0537, 5.3613, -1.5922),
-            (-12.0269, 4.2741, -1.6054),
-            (-11.999, 3.2125, -1.6172),
-            (-11.9454, 2.2009, -1.4409),
-            (-11.7614, 1.1884, -1.1411),
-            (-11.2675, 0.2385, -0.8377),
-            (-10.5404, -0.58, -0.3517),
-            (-9.4494, -0.8399, -0.0687),
-            (-8.3965, -0.8367, 0.0701),
-            (-7.3912, -0.6242, 0.0671),
-            (-6.3592, -0.463, 0.0508),
-            (self.target_x, self.target_y, self.target_yaw)
+            (0.2206, 0.1208),
+            (1.2812, 0.0748),
+            (2.3472, 0.129),
+            (3.4053, 0.1631),
+            (4.4468, 0.1421),
+            (5.5032, 0.1996),
+            (6.5372, 0.2315),
+            (7.5948, 0.2499),
+            (8.6607, 0.3331),
+            (9.6811, 0.3973),
+            (10.6847, 0.4349),
+            (11.719, 0.4814),
+            (12.7995, 0.5223),
+            (13.8983, 0.515),
+            (14.9534, 0.6193),
+            (15.9899, 0.7217),
+            (17.0138, 0.7653),
+            (18.0751, 0.8058),
+            (19.0799, 0.864),
+            (20.1383, 0.936),
+            (21.1929, 0.9923),
+            (22.2351, 1.0279),
+            (23.3374, 1.1122),
+            (24.4096, 1.1694),
+            (25.4817, 1.2437),
+            (26.5643, 1.3221),
+            (27.6337, 1.4294),
+            (28.6643, 1.4471),
+            (29.6839, 1.4987),
+            (30.7, 1.58),
+            (31.7796, 1.6339),
+            (32.8068, 1.7283),
+            (33.8596, 1.8004),
+            (34.9469, 1.9665),
+            (35.9883, 1.9812),
+            (37.0816, 2.0237),
+            (38.1077, 2.1291),
+            (39.1405, 2.1418),
+            (40.1536, 2.2273),
+            (41.1599, 2.2473),
+            (42.2476, 2.2927),
+            (43.3042, 2.341),
+            (44.4049, 2.39),
+            (45.5091, 2.4284),
+            (46.579, 2.5288),
+            (47.651, 2.4926),
+            (48.6688, 2.6072),
+            (49.7786, 2.6338),
+            (50.7942, 2.6644),
+            (51.868, 2.7625),
+            (52.9149, 2.8676),
+            (54.0346, 2.9602),
+            (55.0855, 2.9847),
+            (56.1474, 3.1212),
+            (57.2397, 3.2988),
+            (58.2972, 3.5508),
+            (59.1103, 4.1404),
+            (59.6059, 5.1039),
+            (59.6032, 6.2015),
+            (59.4278, 7.212),
+            (59.3781, 8.2782),
+            (59.4323, 9.2866),
+            (59.3985, 10.304),
+            (59.3676, 11.3302),
+            (59.3193, 12.3833),
+            (59.359, 13.4472),
+            (59.3432, 14.4652),
+            (59.3123, 15.479),
+            (59.1214, 16.4917),
+            (58.7223, 17.4568),
+            (57.8609, 18.1061),
+            (56.8366, 18.3103),
+            (55.7809, 18.0938),
+            (54.7916, 17.707),
+            (53.7144, 17.5087),
+            (52.6274, 17.3683),
+            (51.6087, 17.1364),
+            (50.5924, 17.0295),
+            (49.5263, 16.9058),
+            (48.4514, 16.7769),
+            (47.3883, 16.6701),
+            (46.3186, 16.5403),
+            (45.3093, 16.4615),
+            (44.263, 16.299),
+            (43.2137, 16.1486),
+            (42.171, 16.0501),
+            (41.1264, 16.0245),
+            (40.171, 16.7172),
+            (39.1264, 16.8428),
+            (38.1122, 17.019),
+            (37.2234, 16.5322),
+            (36.6845, 15.6798),
+            (36.3607, 14.7064),
+            (35.5578, 13.9947),
+            (34.5764, 13.7466),
+            (33.5137, 13.6068),
+            (32.4975, 13.5031),
+            (31.5029, 13.3368),
+            (30.4162, 13.1925),
+            (29.3894, 13.067),
+            (28.3181, 12.9541),
+            (27.3195, 12.8721),
+            (26.2852, 12.8035),
+            (25.241, 12.6952),
+            (24.1598, 12.6435),
+            (23.0712, 12.5947),
+            (21.9718, 12.5297),
+            (20.9141, 12.4492),
+            (19.8964, 12.3878),
+            (18.7163, 12.32),
+            (17.6221, 12.2928),
+            (16.5457, 12.2855),
+            (15.5503, 12.1534),
+            (14.4794, 12.0462),
+            (13.4643, 11.9637),
+            (12.3466, 11.7943),
+            (11.2276, 11.6071),
+            (10.2529, 12.0711),
+            (9.7942, 13.0066),
+            (9.398, 13.9699),
+            (8.6017, 14.7268),
+            (7.4856, 14.8902),
+            (6.5116, 14.4724),
+            (5.4626, 14.1256),
+            (4.3911, 13.9535),
+            (3.3139, 13.8013),
+            (2.2967, 13.7577),
+            (1.2165, 13.7116),
+            (0.1864, 13.6054),
+            (-0.9592, 13.4747),
+            (-2.0086, 13.352),
+            (-3.0267, 13.3358),
+            (-4.0117, 13.5304),
+            (-5.0541, 13.8047),
+            (-6.0953, 13.9034),
+            (-7.1116, 13.8871),
+            (-8.152, 13.8062),
+            (-9.195, 13.7043),
+            (-10.2548, 13.6152),
+            (-11.234, 13.3289),
+            (-11.9937, 12.6211),
+            (-12.3488, 11.6585),
+            (-12.4231, 10.6268),
+            (-12.3353, 9.5915),
+            (-12.2405, 8.5597),
+            (-12.1454, 7.4974),
+            (-12.0596, 6.4487),
+            (-12.0537, 5.3613),
+            (-12.0269, 4.2741),
+            (-11.999, 3.2125),
+            (-11.9454, 2.2009),
+            (-11.7614, 1.1884),
+            (-11.2675, 0.2385),
+            (-10.5404, -0.58),
+            (-9.4494, -0.8399),
+            (-8.3965, -0.8367),
+            (-7.3912, -0.6242),
+            (-6.3592, -0.463),
+            (self.target_x, self.target_y)
         ]
         return waypoints
     
@@ -374,7 +327,6 @@ class GazeboEnv:
         self.current_waypoint_index = 0
 
     def generate_optimized_waypoints(self):
-        # 只有在有LiDAR數據的情況下進行優化
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -387,20 +339,16 @@ class GazeboEnv:
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
-            new_wp_yaw = direction
 
-            # 如果障礙物靠近，開始進行多方向檢查
             if self.is_point_near_obstacle(new_wp_x, new_wp_y):
                 best_x, best_y = new_wp_x, new_wp_y
                 min_distance_to_obstacle = float('inf')
 
-                # 多方向檢查
                 for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
                     adjusted_direction = direction + angle_offset
                     temp_x = current_wp[0] + 0.2 * np.cos(adjusted_direction)
                     temp_y = current_wp[1] + 0.2 * np.sin(adjusted_direction)
 
-                    # 檢查新的點是否遠離障礙物
                     if not self.is_point_near_obstacle(temp_x, temp_y):
                         distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
                         if distance_to_obstacle > min_distance_to_obstacle:
@@ -409,7 +357,7 @@ class GazeboEnv:
 
                 new_wp_x, new_wp_y = best_x, best_y
 
-            optimized_waypoints.append((new_wp_x, new_wp_y, new_wp_yaw))
+            optimized_waypoints.append((new_wp_x, new_wp_y))
 
         optimized_waypoints.append(self.waypoints[-1])
         self.waypoints = self.smooth_waypoints(optimized_waypoints)
@@ -425,9 +373,9 @@ class GazeboEnv:
         return min_distance
 
     def smooth_waypoints(self, waypoints):
-        waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]
+        waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]  # Only keep x and y coordinates
         smoothed_points = self.bezier_curve(waypoints_2d)
-        smoothed_waypoints = [(pt[0], pt[1], waypoints[i][2]) for i, pt in enumerate(smoothed_points)]
+        smoothed_waypoints = [(pt[0], pt[1]) for pt in smoothed_points]  # No yaw involved
         self.current_waypoint_index = 0
         return smoothed_waypoints
     
@@ -492,6 +440,7 @@ class GazeboEnv:
         return imu_data
 
     def scan_callback(self, data):
+        # 确保数据有效
         if data is not None and self.is_valid_data(data):
             self.lidar_data = data
             combined_pcl_data = self.accumulate_lidar_data([data])
@@ -500,8 +449,12 @@ class GazeboEnv:
                 rospy.logwarn("current_waypoint_index out of range, resetting to last valid index.")
                 self.current_waypoint_index = len(self.waypoints) - 1
 
-            current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
-            self.state = self.generate_occupancy_grid(combined_pcl_data, current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
+            current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
+
+            self.state = self.generate_occupancy_grid(combined_pcl_data, current_waypoint_x, current_waypoint_y)
+
+            self.future_waypoints = self.waypoints[self.current_waypoint_index+1 : min(self.current_waypoint_index+1+7, len(self.waypoints))]
+
         else:
             rospy.logwarn("Received invalid or empty LiDAR data")
 
@@ -557,7 +510,7 @@ class GazeboEnv:
         points = np.asarray(cloud.points)
         return pc2.create_cloud_xyz32(header, points)
 
-    def generate_occupancy_grid(self, lidar_data, waypoint_x, waypoint_y, waypoint_yaw, grid_size=0.05, map_size=100):
+    def generate_occupancy_grid(self, lidar_data, waypoint_x, waypoint_y, grid_size=0.05, map_size=100):
         if lidar_data is None or not isinstance(lidar_data, PointCloud2):
             rospy.logwarn("No LiDAR data available, returning empty occupancy grid.")
             return np.zeros((4, 64, 64))
@@ -586,10 +539,9 @@ class GazeboEnv:
 
         grid = cv2.resize(grid, (64, 64), interpolation=cv2.INTER_LINEAR)
 
-        waypoint_grid = np.zeros((3, 64, 64))
+        waypoint_grid = np.zeros((2, 64, 64))
         waypoint_grid[0, :, :] = waypoint_x
         waypoint_grid[1, :, :] = waypoint_y
-        waypoint_grid[2, :, :] = waypoint_yaw
 
         occupancy_grid = np.vstack([grid[np.newaxis, :, :], waypoint_grid])
 
@@ -607,51 +559,45 @@ class GazeboEnv:
             return self.state, reward, True, {}
 
         robot_x, robot_y, _ = self.get_robot_position()
-        current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
+        current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
         
-        # 計算與當前目標的距離
-        distance_to_current_waypoint = np.sqrt((current_waypoint_x - robot_x) ** 2 + (current_waypoint_y - robot_y) ** 2)
-
-        # 如果距離與上一步差異很小，增加無進展計數器
-        if np.abs(distance_to_current_waypoint - self.previous_distance_to_goal) < 0.01:
-            self.no_progress_steps += 1
-        else:
-            self.no_progress_steps = 0  # 如果有進展，重置計數器
-
-        self.previous_distance_to_goal = distance_to_current_waypoint
+        # 計算距離進展
+        distance_to_goal = np.linalg.norm([current_waypoint_x - robot_x, current_waypoint_y - robot_y])
         
-        # 如果無進展的步數超過限制，重置環境
-        if self.no_progress_steps >= self.max_no_progress_steps:
-            rospy.loginfo("Robot stuck for too long, resetting environment.")
-            self.reset()
-            return self.state, -100.0, True, {}  # 給予懲罰並重置
-
-        # 檢查是否接近當前路徑點
-        if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
+        if distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
+            self.no_progress_steps = 0  # 有進展則重置
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
                 return self.state, 100, self.done, {}
+        else:
+            # 新增進展判斷：如果距離在減少，則重置no_progress_steps
+            if self.previous_distance_to_goal is None or distance_to_goal < self.previous_distance_to_goal:
+                self.no_progress_steps = 0  # 有進展則重置
+            else:
+                self.no_progress_steps += 1
+                if self.no_progress_steps >= self.max_no_progress_steps:
+                    rospy.loginfo("No progress detected, resetting environment.")
+                    reward = -100.0  # 無進展懲罰
+                    self.reset()
+                    return self.state, reward, True, {}
+        # 更新previous_distance_to_goal
+        self.previous_distance_to_goal = distance_to_goal
 
-        # 確保 action 是一個數組或張量，並包含至少兩個元素（線速度和角速度）
-        if isinstance(action, (int, float)):
-            action = np.array([action, 0.0])  # 如果只有線速度，補充角速度為 0
+        # 使用 pure_pursuit 計算新的動作
+        action = self.calculate_action_pure_pursuit()
 
-        action = self.calculate_action_ucb(current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
-
-        # 提取線速度和角速度，並進行限制
+        # 動作處理
         linear_speed = np.clip(action[0], -2.0, 2.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
-        # 發布控制指令
+        # 發送控制命令
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
-
-        self.last_twist = twist
         self.pub_cmd_vel.publish(twist)
 
-        # 發布 IMU 數據
+        # 發送IMU數據
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
@@ -695,8 +641,8 @@ class GazeboEnv:
         self.done = False
 
         empty_lidar_data = PointCloud2()
-        current_waypoint_x, current_waypoint_y, current_waypoint_yaw = self.waypoints[self.current_waypoint_index]
-        self.state = self.generate_occupancy_grid(empty_lidar_data, current_waypoint_x, current_waypoint_y, current_waypoint_yaw)
+        current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
+        self.state = self.generate_occupancy_grid(empty_lidar_data, current_waypoint_x, current_waypoint_y)
 
         # 停止机器人运动
         self.last_twist = Twist()
@@ -708,7 +654,7 @@ class GazeboEnv:
 
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
-        self.previous_distance_to_goal = float('inf')
+        self.previous_distance_to_goal = None  # 重置 previous_distance_to_goal
         self.collision_detected = False  # 重置碰撞标志
 
         return self.state
@@ -772,176 +718,133 @@ class GazeboEnv:
         yaw = np.arctan2(siny_cosp, cosy_cosp)
         return yaw
 
-    def calculate_action_ucb(self, waypoint_x, waypoint_y, waypoint_yaw):
+    def calculate_action_pure_pursuit(self):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
+
+        # 根據機器人的速度動態調整look_ahead_distance
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
+        base_look_ahead_distance = 2  # 基本的預測距離
+        lookahead_ratio = 1.2 + linear_speed * 0.3  # 根據速度進行動態調整的比例
+        look_ahead_distance = base_look_ahead_distance * lookahead_ratio  # 最終的前視距離
 
-        preview_distance = 1.2  # 預覽距離
-        num_future_points = 7  # 預覽點的數量
-        future_yaw_errors = []
-        future_turn_detected = False
+        future_points_count = 10  # 使用未來10個路徑點
+        future_waypoints = []
 
-        # 檢查是否已經超過當前路徑點，並切換到下一個
-        distance_to_current_waypoint = np.sqrt((waypoint_x - robot_x) ** 2 + (waypoint_y - robot_y) ** 2)
-        if distance_to_current_waypoint < REFERENCE_DISTANCE_TOLERANCE:
-            self.current_waypoint_index += 1  # 切換到下一個路徑點
-            if self.current_waypoint_index >= len(self.waypoints):
-                rospy.loginfo("已經到達最後一個路徑點")
-                self.done = True
-                return np.array([0.0, 0.0])  # 到達最後一個路徑點，停止動作
-            waypoint_x, waypoint_y, waypoint_yaw = self.waypoints[self.current_waypoint_index]
-        
-        for i in range(1, num_future_points + 1):
-            future_preview_distance = preview_distance * i
-            future_waypoint_x = waypoint_x + future_preview_distance * np.cos(waypoint_yaw)
-            future_waypoint_y = waypoint_y + future_preview_distance * np.sin(waypoint_yaw)
+        # 收集未來的路徑點，直到累計距離達到look_ahead_distance
+        cumulative_distance = 0.0
+        for i in range(self.current_waypoint_index, min(self.current_waypoint_index + future_points_count, len(self.waypoints))):
+            wp_x1, wp_y1 = self.waypoints[i]
+            future_waypoints.append((wp_x1, wp_y1))
+            if i < len(self.waypoints) - 1:
+                wp_x2, wp_y2 = self.waypoints[i + 1]
+                cumulative_distance += np.hypot(wp_x2 - wp_x1, wp_y2 - wp_y1)
+            if cumulative_distance >= look_ahead_distance:
+                break
 
-            future_direction_to_waypoint = np.arctan2(future_waypoint_y - robot_y, future_waypoint_x - robot_x)
-            yaw_error = future_direction_to_waypoint - robot_yaw
-            yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
+        # 計算未來路徑點的平均位置，作為目標方向
+        avg_look_ahead_x = np.mean([wp[0] for wp in future_waypoints])
+        avg_look_ahead_y = np.mean([wp[1] for wp in future_waypoints])
 
-            future_yaw_errors.append(yaw_error)
+        # 計算朝向這些未來路徑點的角度
+        direction_to_look_ahead = np.arctan2(avg_look_ahead_y - robot_y, avg_look_ahead_x - robot_x)
+        yaw_error = direction_to_look_ahead - robot_yaw
+        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
 
-            # 如果未來某點的 yaw 誤差超過閾值，標記為即將轉彎
-            if np.abs(yaw_error) > 0.3:  # 假設 0.3 為轉彎的閾值
-                future_turn_detected = True
-
-        total_yaw_error = sum(future_yaw_errors)
-        average_yaw_error = total_yaw_error / num_future_points
-
-        # 如果即將轉彎，提前降低速度
-        if future_turn_detected:
-            linear_speed = max(0.5, linear_speed * 0.5)  # 提前減速到過彎速度
+        # 根據偏差調整線速度
+        if np.abs(yaw_error) > 0.3:
+            linear_speed = 0.5
+        elif np.abs(yaw_error) > 0.1:
+            linear_speed = 1.0
         else:
-            # 沒有轉彎時，正常調整速度
-            if average_yaw_error > 0.3:
-                linear_speed = max(1.0, linear_speed * 0.7)
-            elif 0.1 < average_yaw_error <= 0.3:
-                linear_speed = max(1.5, linear_speed * 0.9)
-            else:
-                linear_speed = min(2.0, linear_speed * 1.1)  # 平直路徑上加速
+            linear_speed = 1.5
 
-        # 調整控制參數 kp 和 kd
-        if linear_speed < 1.0:
+        # 設定 PID 控制器參數
+        kp, kd = self.adjust_control_params(linear_speed)
+        previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
+        current_yaw_error_rate = yaw_error - previous_yaw_error
+        steer_angle = kp * yaw_error + kd * current_yaw_error_rate
+        steer_angle = np.clip(steer_angle, -0.6, 0.6)
+
+        self.previous_yaw_error = yaw_error
+
+        return np.array([linear_speed, steer_angle])
+    
+    def adjust_control_params(self, linear_speed):
+        if linear_speed <= 0.5:
             kp = 0.5
             kd = 0.2
-        elif linear_speed < 1.5:
+        elif linear_speed <= 1.0:
             kp = 0.4
             kd = 0.3
         else:
             kp = 0.3
             kd = 0.4
-
-        previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
-        current_yaw_error_rate = future_yaw_errors[0] - previous_yaw_error
-
-        # 計算方向盤角度
-        steer_angle = kp * future_yaw_errors[0] + kd * current_yaw_error_rate
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
-
-        self.previous_yaw_error = future_yaw_errors[0]
-
-        action = np.array([linear_speed, steer_angle])
-        return action
+        return kp, kd
 
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
         super(ActorCritic, self).__init__()
-        self.conv1 = nn.Conv2d(4, 32, kernel_size=5, stride=2)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2)
+        self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)  # 增加一层卷积层
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
+        self.bn3 = nn.BatchNorm2d(128)
 
         self._to_linear = self._get_conv_output_size(observation_space)
-        
+
         self.fc1 = nn.Linear(self._to_linear, 256)
-        self.lstm = nn.LSTM(256, 128, num_layers=2, batch_first=True)  # 增加LSTM层数
-        self.fc2 = nn.Linear(128, 128)
-        
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc2 = nn.Linear(256, 128)
+
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
 
-        # Initialize UCB variables
-        self.visit_counts = {}  # Dictionary to store visit counts for each (state, action)
-        self.c = 2  # UCB exploration coefficient (can be adjusted)
-
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
-        x = self.conv1(x)
-        x = self.conv2(x)
-        x = self.conv3(x)  # 通过额外的卷积层
-        return int(np.prod(x.size()))
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = x.view(1, -1)
+        return x.size(1)
 
-    def forward(self, x, hidden=None):
+    def forward(self, x):
         if len(x.shape) == 5:
             x = x.squeeze(1)
 
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.relu(self.conv3(x))  # 通过额外的卷积层
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
         x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
 
-        if hidden is None:
-            x, hidden = self.lstm(x.unsqueeze(0))
-        else:
-            x, hidden = self.lstm(x.unsqueeze(0), hidden)
-
-        x = torch.relu(self.fc2(x.squeeze(0)))
-        
         action_mean = self.actor(x)
         action_log_std = self.actor_log_std.expand_as(action_mean)
         action_std = torch.exp(action_log_std)
 
         value = self.critic(x)
 
-        return action_mean, action_std, value, hidden
+        return action_mean, action_std, value
 
-    def act(self, state, previous_action=None, hidden=None):
-        with torch.amp.autocast('cuda'):
-            action_mean, action_std, _, hidden = self(state, hidden)
+    def act(self, state):
+        action_mean, action_std, _ = self(state)
+        action = action_mean + action_std * torch.randn_like(action_std)
+        action = torch.tanh(action)
+        max_action = torch.tensor([2.0, 0.6], device=action.device)
+        min_action = torch.tensor([-2.0, -0.6], device=action.device)
+        action = min_action + (action + 1) * (max_action - min_action) / 2
+        return action.detach()
 
-        # Upper Confidence Bound (UCB) for action selection
-        state_key = tuple(state.cpu().numpy().flatten())
-        
-        # Ensure the visit count is initialized to match the size of action_space, not action_mean
-        if state_key not in self.visit_counts:
-            # Initialize visit counts to match the action_space size, assuming action_space is a scalar
-            action_space_size = action_mean.shape[-1]  # Get the action space dimension
-            self.visit_counts[state_key] = torch.zeros(action_space_size, device=device)  # Ensure it's size of the action space
-
-        # Convert total_state_visits to Tensor
-        total_state_visits = self.visit_counts[state_key].sum()
-        total_state_visits = torch.tensor(total_state_visits).to(device)  # Ensure it's a Tensor
-        
-        if total_state_visits == 0:
-            total_state_visits = torch.tensor(1.0).to(device)  # avoid division by zero
-
-        # UCB adjustment
-        ucb_bonus = self.c * torch.sqrt(torch.log(total_state_visits) / (self.visit_counts[state_key] + 1e-5))
-        adjusted_action_mean = action_mean + ucb_bonus
-
-        # Choose action with added exploration from UCB
-        action = adjusted_action_mean + action_std * torch.randn_like(action_std)
-
-        # Update the visit counts for chosen action
-        chosen_action = action.argmax().item()  # Ensure chosen_action is an integer index
-        self.visit_counts[state_key][chosen_action] += 1  # Increment the visit count for the chosen action
-
-        return action, hidden
-    
     def evaluate(self, state, action):
-        action_mean, action_std, value, hidden = self(state)
-        
-        if action.dim() == 1:
-            action = action.unsqueeze(1)
-        
-        action = torch.tensor(action, dtype=torch.float32).to(action_mean.device)
-
-        action_log_probs = -((action - action_mean) ** 2) / (2 * action_std ** 2) - action_std.log() - 0.5 * torch.log(torch.tensor(2 * np.pi, device=action_mean.device))
-        action_log_probs = action_log_probs.sum(1)
-
-        return action_log_probs, value, hidden
+        action_mean, action_std, value = self(state)
+        dist = torch.distributions.Normal(action_mean, action_std)
+        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
+        return action_log_probs, value, dist_entropy
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
@@ -950,21 +853,14 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
         adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
-            
-        state_batch = torch.tensor(state_batch, dtype=torch.float32).to(device)
-        action_batch = torch.tensor(action_batch, dtype=torch.float32).to(device)
-        reward_batch = torch.tensor(reward_batch, dtype=torch.float32).view(-1, 1).to(device)
-        done_batch = torch.tensor(done_batch, dtype=torch.float32).view(-1, 1).to(device)
-        next_state_batch = torch.tensor(next_state_batch, dtype=torch.float32).to(device)
-        weights = torch.tensor(weights, dtype=torch.float32).view(-1, 1).to(device)
-        
+
         with torch.no_grad():
             old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
         old_log_probs = old_log_probs.detach()
 
         for _ in range(PPO_EPOCHS):
             with torch.amp.autocast('cuda'):
-                log_probs, state_values, optimized_paths = model.evaluate(state_batch, action_batch)
+                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
                 advantages = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
 
                 ratio = (log_probs - old_log_probs).exp()
@@ -973,19 +869,12 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
-                loss = actor_loss + 0.5 * critic_loss
+                entropy_loss = -0.01 * dist_entropy.mean()  # 添加熵正则项
+                loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
-
-            # wandb.log({
-            #     "actor_loss": actor_loss.item(),
-            #     "critic_loss": critic_loss.item(),
-            #     "total_loss": loss.item()
-            # })
-            
             scaler.scale(loss).backward()
-            if _ % BATCH_SIZE == 0:
-                scaler.step(optimizer)
-                scaler.update()
+            scaler.step(optimizer)
+            scaler.update()
 
             priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
             memory.update_priorities(indices, priorities)
@@ -1006,43 +895,28 @@ def main():
     else:
         print("Created new model.")
 
-    # wandb.init(project="my_robot_workspace")
-
-    # wandb.config = {
-    #     "learning_rate": LEARNING_RATE,
-    #     "batch_size": BATCH_SIZE,
-    #     "gamma": GAMMA,
-    #     "ppo_epochs": PPO_EPOCHS,
-    #     "clip_param": CLIP_PARAM,
-    #     "memory_size": MEMORY_SIZE,
-    #     "prediction_horizon": PREDICTION_HORIZON,
-    #     "control_horizon": CONTROL_HORIZON,
-    # }
-
     num_episodes = 1000000
     best_test_reward = -np.inf
 
     for e in range(num_episodes):
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        previous_action = None
-        hidden = None
         total_reward = 0
 
         start_time = time.time()
 
         for time_step in range(1500):
-            action_values, hidden = model.act(state, previous_action, hidden)
-            action = action_values.argmax().item()
-            next_state, reward, done, _ = env.step(action)
+            action = model.act(state)
+            # Detach action before converting to NumPy
+            action_np = action.detach().cpu().numpy()
+            next_state, reward, done, _ = env.step(action_np)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
-            memory.add(state.cpu().numpy(), action, reward, done, next_state.cpu().numpy())
+            # Detach action before adding to memory
+            memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
 
             state = next_state
-            previous_action = action
             total_reward += reward
-            # print("reward++")
 
             elapsed_time = time.time() - start_time
 
@@ -1057,16 +931,8 @@ def main():
 
         print(f"Episode {e}, Total Reward: {total_reward}")
 
-        # 優化路徑點
+        # Optimize waypoints
         env.generate_optimized_waypoints()
-
-        # # 记录到 wandb
-        # wandb.log({
-        #     "episode": e,
-        #     "total_reward": total_reward,
-        #     "best_test_reward": best_test_reward,
-        #     "elapsed_time": elapsed_time
-        # })
 
         if total_reward > best_test_reward:
             best_test_reward = total_reward
@@ -1081,7 +947,6 @@ def main():
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
-    # wandb.finish()
 
 if __name__ == '__main__':
     main()
