@@ -135,6 +135,8 @@ class GazeboEnv:
         self.last_twist = Twist()
         self.epsilon = 0.05
         self.collision_detected = False
+        self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
+        self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
 
         self.lidar_data = None  # 初始化 lidar_data，避免 AttributeError
 
@@ -558,12 +560,20 @@ class GazeboEnv:
             self.reset()  # 重置環境
             return self.state, reward, True, {}
 
+        # 取得當前機器人的位置
         robot_x, robot_y, _ = self.get_robot_position()
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
         
-        # 計算距離進展
+        # 計算與目標路徑點的距離
         distance_to_goal = np.linalg.norm([current_waypoint_x - robot_x, current_waypoint_y - robot_y])
         
+        # 計算當前位置與上一個位置的移動距離
+        if self.previous_robot_position is not None:
+            distance_moved = np.linalg.norm([robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]])
+        else:
+            distance_moved = 0  # 初次執行時設定為0
+
+        # 判斷是否接近當前路徑點
         if distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
             self.no_progress_steps = 0  # 有進展則重置
             self.current_waypoint_index += 1
@@ -571,39 +581,40 @@ class GazeboEnv:
                 self.done = True
                 return self.state, 100, self.done, {}
         else:
-            # 新增進展判斷：如果距離在減少，則重置no_progress_steps
-            if self.previous_distance_to_goal is None or distance_to_goal < self.previous_distance_to_goal:
-                self.no_progress_steps = 0  # 有進展則重置
-            else:
+            # 如果移動距離非常小，才累積無進展計數器
+            if distance_moved < 0.01:  # 可根據實際情況調整閾值
                 self.no_progress_steps += 1
                 if self.no_progress_steps >= self.max_no_progress_steps:
                     rospy.loginfo("No progress detected, resetting environment.")
                     reward = -100.0  # 無進展懲罰
                     self.reset()
                     return self.state, reward, True, {}
-        # 更新previous_distance_to_goal
+            else:
+                self.no_progress_steps = 0  # 有移動則重置計數器
+
+        # 更新 previous_robot_position 和 previous_distance_to_goal
+        self.previous_robot_position = (robot_x, robot_y)
         self.previous_distance_to_goal = distance_to_goal
 
-        # 使用 pure_pursuit 計算新的動作
+        # 計算新的動作
         action = self.calculate_action_pure_pursuit()
 
-        # 動作處理
+        # 發送控制指令
         linear_speed = np.clip(action[0], -2.0, 2.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
-        # 發送控制命令
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
         self.pub_cmd_vel.publish(twist)
 
-        # 發送IMU數據
+        # 發送 IMU 數據
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
         rospy.sleep(0.1)
 
-        # 計算獎勵
+        # 計算並返回獎勵
         reward = self.calculate_reward(current_waypoint_x, current_waypoint_y)
 
         return self.state, reward, self.done, {}
