@@ -550,9 +550,14 @@ class GazeboEnv:
         return occupancy_grid
 
     def step(self, action):
-        if self.current_waypoint_index >= len(self.waypoints) - 1:
+        # 取得當前機器人的位置
+        robot_x, robot_y, _ = self.get_robot_position()
+        current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
+
+        if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
             self.done = True
-            return self.state, 100, self.done, {}
+            rospy.loginfo("Collision detected, resetting environment.")
+            reward += 1000  # 給予較高的獎勵表示成功到達終點
 
         if self.is_collision_detected():
             rospy.loginfo("Collision detected, resetting environment.")
@@ -560,13 +565,19 @@ class GazeboEnv:
             self.reset()  # 重置環境
             return self.state, reward, True, {}
 
-        # 取得當前機器人的位置
-        robot_x, robot_y, _ = self.get_robot_position()
-        current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
-        
         # 計算與目標路徑點的距離
         distance_to_goal = np.linalg.norm([current_waypoint_x - robot_x, current_waypoint_y - robot_y])
-        
+
+        # 如果距離太大，將當前路徑點視為完成
+        max_waypoint_distance = 5.0  # 你可以根據需要調整此閾值
+        if distance_to_goal > max_waypoint_distance:
+            rospy.logwarn("Missed waypoint, skipping to next.")
+            self.current_waypoint_index += 1
+            if self.current_waypoint_index >= len(self.waypoints):
+                self.done = True
+                return self.state, 100, self.done, {}
+            return self.state, 0, False, {}
+
         # 計算當前位置與上一個位置的移動距離
         if self.previous_robot_position is not None:
             distance_moved = np.linalg.norm([robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]])
@@ -674,38 +685,18 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
 
-        # 目標方向與當前朝向的差距，鼓勵平滑的方向變化
+        # 1. 根據方向誤差計算獎勵
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward += max(0, 5 - yaw_diff * 5)  # 鼓勵角度偏差越小獎勵越多
+        reward += max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越高
 
-        # 距離目標的獎勵，鼓勵靠近目標
+        # 2. 距離目標的獎勵，鼓勵靠近目標
         distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
         reward += (1.0 / (distance_to_goal + 1e-5)) * 10  # 獎勵越靠近目標越高
 
-        # 安全性：遠離障礙物的獎勵
+        # 3. 安全性：遠離障礙物的獎勵
         if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
             reward += 50  # 如果離障礙物足夠遠，給予額外獎勵
-
-        # 行徑方向與目標方向的差距，反向時不給任何獎勵
-        robot_velocity_x = self.last_twist.linear.x
-        robot_velocity_y = self.last_twist.linear.y
-        if robot_velocity_x != 0 or robot_velocity_y != 0:
-            movement_direction = np.arctan2(robot_velocity_y, robot_velocity_x)
-            movement_diff = np.abs(movement_direction - direction_to_target)
-
-            # 如果角度差小於90度，給予獎勵
-            if movement_diff < np.pi / 2:  # 小於90度才給獎勵
-                if movement_diff < np.pi / 6:  # 30度內認為是朝向目標
-                    reward += 20  # 額外獎勵朝向目標行徑
-            else:
-                reward = 0  # 逆向時，所有獎勵歸零
-
-        # 獎勵平滑行駛，根據上一個動作來計算加速度變化，避免突然加速或轉向
-        linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        acceleration = np.abs(self.last_twist.linear.x - linear_speed)
-        if acceleration < 0.1:
-            reward += 10  # 獎勵平穩行駛
 
         return reward
 
@@ -732,36 +723,33 @@ class GazeboEnv:
     def calculate_action_pure_pursuit(self):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
 
-        # 根據機器人的速度動態調整look_ahead_distance
+        # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        base_look_ahead_distance = 2  # 基本的預測距離
-        lookahead_ratio = 1.2 + linear_speed * 0.3  # 根據速度進行動態調整的比例
-        look_ahead_distance = base_look_ahead_distance * lookahead_ratio  # 最終的前視距離
+        lookahead_distance = 2.0 + 0.5 * linear_speed  # 根據速度調整前視距離
 
-        future_points_count = 10  # 使用未來10個路徑點
-        future_waypoints = []
+        # 找到距離當前最近的路徑點
+        closest_index = self.find_closest_waypoint(robot_x, robot_y)
+        target_index = closest_index
 
-        # 收集未來的路徑點，直到累計距離達到look_ahead_distance
+        # 根據前視距離選擇參考的路徑點
         cumulative_distance = 0.0
-        for i in range(self.current_waypoint_index, min(self.current_waypoint_index + future_points_count, len(self.waypoints))):
-            wp_x1, wp_y1 = self.waypoints[i]
-            future_waypoints.append((wp_x1, wp_y1))
-            if i < len(self.waypoints) - 1:
-                wp_x2, wp_y2 = self.waypoints[i + 1]
-                cumulative_distance += np.hypot(wp_x2 - wp_x1, wp_y2 - wp_y1)
-            if cumulative_distance >= look_ahead_distance:
+        for i in range(closest_index, len(self.waypoints)):
+            wp_x, wp_y = self.waypoints[i]
+            dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
+            cumulative_distance += dist_to_wp
+            if cumulative_distance >= lookahead_distance:
+                target_index = i
                 break
 
-        # 計算未來路徑點的平均位置，作為目標方向
-        avg_look_ahead_x = np.mean([wp[0] for wp in future_waypoints])
-        avg_look_ahead_y = np.mean([wp[1] for wp in future_waypoints])
+        # 獲取前視點座標
+        target_x, target_y = self.waypoints[target_index]
 
-        # 計算朝向這些未來路徑點的角度
-        direction_to_look_ahead = np.arctan2(avg_look_ahead_y - robot_y, avg_look_ahead_x - robot_x)
-        yaw_error = direction_to_look_ahead - robot_yaw
+        # 計算前視點的方向
+        direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
+        yaw_error = direction_to_target - robot_yaw
         yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
 
-        # 根據偏差調整線速度
+        # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
             linear_speed = 0.5
         elif np.abs(yaw_error) > 0.1:
@@ -769,7 +757,7 @@ class GazeboEnv:
         else:
             linear_speed = 1.5
 
-        # 設定 PID 控制器參數
+        # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = yaw_error - previous_yaw_error
@@ -779,6 +767,17 @@ class GazeboEnv:
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
+
+    def find_closest_waypoint(self, x, y):
+        # 找到與當前位置最接近的路徑點
+        min_distance = float('inf')
+        closest_index = 0
+        for i, (wp_x, wp_y) in enumerate(self.waypoints):
+            dist = np.linalg.norm([wp_x - x, wp_y - y])
+            if dist < min_distance:
+                min_distance = dist
+                closest_index = i
+        return closest_index
     
     def adjust_control_params(self, linear_speed):
         if linear_speed <= 0.5:
