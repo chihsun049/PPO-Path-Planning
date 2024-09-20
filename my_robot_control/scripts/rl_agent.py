@@ -625,7 +625,6 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        # 計算獎勵
         reward = self.calculate_reward(current_waypoint_x, current_waypoint_y)
 
         # 檢查障礙物並增加獎勵/懲罰
