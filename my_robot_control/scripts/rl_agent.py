@@ -572,7 +572,7 @@ class GazeboEnv:
         # 如果距離太大，將當前路徑點視為完成
         max_waypoint_distance = 5.0  # 你可以根據需要調整此閾值
         if distance_to_goal > max_waypoint_distance:
-            rospy.logwarn("Missed waypoint, skipping to next.")
+            # rospy.logwarn("Missed waypoint, skipping to next.")
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
