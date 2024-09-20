@@ -555,10 +555,12 @@ class GazeboEnv:
         robot_x, robot_y, _ = self.get_robot_position()
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
 
+        # 判斷是否到達最終目標點
         if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
             self.done = True
             reward += 1000  # 給予較高的獎勵表示成功到達終點
 
+        # 檢查是否發生碰撞
         if self.is_collision_detected():
             rospy.loginfo("Collision detected, resetting environment.")
             reward = -200.0  # 碰撞懲罰
@@ -568,10 +570,9 @@ class GazeboEnv:
         # 計算與目標路徑點的距離
         distance_to_goal = np.linalg.norm([current_waypoint_x - robot_x, current_waypoint_y - robot_y])
 
-        # 如果距離太大，將當前路徑點視為完成
+        # 如果距離當前路徑點太遠，則跳到下一個路徑點
         max_waypoint_distance = 5.0  # 你可以根據需要調整此閾值
         if distance_to_goal > max_waypoint_distance:
-            # rospy.logwarn("Missed waypoint, skipping to next.")
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
                 self.done = True
@@ -592,8 +593,8 @@ class GazeboEnv:
                 self.done = True
                 return self.state, 100, self.done, {}
         else:
-            # 如果移動距離非常小，才累積無進展計數器
-            if distance_moved < 0.01:  # 可根據實際情況調整閾值
+            # 如果移動距離非常小，則累積無進展計數器
+            if distance_moved < 0.01:
                 self.no_progress_steps += 1
                 if self.no_progress_steps >= self.max_no_progress_steps:
                     rospy.loginfo("No progress detected, resetting environment.")
@@ -603,11 +604,10 @@ class GazeboEnv:
             else:
                 self.no_progress_steps = 0  # 有移動則重置計數器
 
-        # 更新 previous_robot_position 和 previous_distance_to_goal
+        # 更新 previous_robot_position
         self.previous_robot_position = (robot_x, robot_y)
-        self.previous_distance_to_goal = distance_to_goal
 
-        # 計算新的動作
+        # 計算局部行動 - 使用純跟蹤演算法
         action = self.calculate_action_pure_pursuit()
 
         # 發送控制指令
@@ -625,8 +625,14 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        # 計算並返回獎勵
+        # 計算獎勵
         reward = self.calculate_reward(current_waypoint_x, current_waypoint_y)
+
+        # 檢查障礙物並增加獎勵/懲罰
+        if self.is_point_near_obstacle(robot_x, robot_y):
+            reward -= 50  # 增加懲罰以鼓勵避開障礙物
+        else:
+            reward += 50  # 如果遠離障礙物，給予額外的獎勵
 
         return self.state, reward, self.done, {}
 
