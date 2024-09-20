@@ -550,6 +550,7 @@ class GazeboEnv:
         return occupancy_grid
 
     def step(self, action):
+        reward = 0  # 初始化 reward
         # 取得當前機器人的位置
         robot_x, robot_y, _ = self.get_robot_position()
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
