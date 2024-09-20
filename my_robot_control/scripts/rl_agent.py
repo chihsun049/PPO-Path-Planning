@@ -557,7 +557,6 @@ class GazeboEnv:
 
         if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
             self.done = True
-            rospy.loginfo("Collision detected, resetting environment.")
             reward += 1000  # 給予較高的獎勵表示成功到達終點
 
         if self.is_collision_detected():
