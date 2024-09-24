@@ -94,7 +94,7 @@
               <max_angle>3.141592653589793</max_angle>
             </horizontal>
             <vertical>
-              <samples>16</samples> <!-- VLP-16 有 16 个通道 -->
+              <samples>32</samples> <!-- VLP-16 有 16 个通道 -->
               <resolution>0.5</resolution>
               <min_angle>-0.2617993877991494</min_angle> <!-- -15度 -->
               <max_angle>0.2617993877991494</max_angle> <!-- +15度 -->
@@ -113,6 +113,7 @@
           <min_range>0.05</min_range> <!-- 明确设置最小范围 -->
           <max_range>30.0</max_range> <!-- 明确设置最大范围 -->
           <gaussianNoise>0.02</gaussianNoise> <!-- 添加噪声参数 -->
+          <min_intensity>0.1</min_intensity>
           <organize_cloud>true</organize_cloud> <!-- 设置为有序输出 -->
         </plugin>
       </sensor>

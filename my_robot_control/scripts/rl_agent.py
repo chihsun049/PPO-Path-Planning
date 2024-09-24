@@ -329,6 +329,9 @@ class GazeboEnv:
         self.current_waypoint_index = 0
 
     def generate_optimized_waypoints(self):
+        """
+        使用 LiDAR 資料檢查盲區與障礙物，生成更安全且平滑的路徑點
+        """
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -338,32 +341,49 @@ class GazeboEnv:
             current_wp = self.waypoints[i]
             next_wp = self.waypoints[i + 1]
 
+            # 計算路徑點間的方向
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
-            if self.is_point_near_obstacle(new_wp_x, new_wp_y):
+            # 檢查新路徑點是否進入盲區或靠近障礙物
+            if self.is_point_near_obstacle(new_wp_x, new_wp_y) or self.is_in_blind_spot(new_wp_x, new_wp_y):
                 best_x, best_y = new_wp_x, new_wp_y
                 min_distance_to_obstacle = float('inf')
 
+                # 調整路徑點以遠離盲區和障礙物
                 for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
                     adjusted_direction = direction + angle_offset
                     temp_x = current_wp[0] + 0.2 * np.cos(adjusted_direction)
                     temp_y = current_wp[1] + 0.2 * np.sin(adjusted_direction)
 
-                    if not self.is_point_near_obstacle(temp_x, temp_y):
+                    if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
                         distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
                         if distance_to_obstacle > min_distance_to_obstacle:
                             best_x, best_y = temp_x, temp_y
                             min_distance_to_obstacle = distance_to_obstacle
 
+                # 更新路徑點為最優位置
                 new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
 
+        # 添加最終目標點
         optimized_waypoints.append(self.waypoints[-1])
+        
+        # 使用貝茲曲線平滑化路徑
         self.waypoints = self.smooth_waypoints(optimized_waypoints)
         self.current_waypoint_index = 0
+
+    def is_in_blind_spot(self, x, y, blind_spot_length=3.36):
+        """
+        檢查給定的點是否位於車輛的盲區內
+        """
+        blind_spot_edges = self.calculate_blind_spot_edge_distances()
+        min_distance_to_edges = min(blind_spot_edges)
+
+        # 如果距離小於盲區長度，則該點在盲區內
+        return min_distance_to_edges < blind_spot_length
 
     # 用於計算當前點與最近障礙物之間的距離
     def calculate_distance_to_nearest_obstacle(self, x, y):
@@ -408,6 +428,26 @@ class GazeboEnv:
                 min_distance_to_obstacle = distance
 
         return min_distance_to_obstacle < threshold
+    
+    def calculate_blind_spot_edge_distances(self):
+        # 计算车辆的边缘距离，同时考虑盲区
+        blind_spot_length = 3.36  # 根据上面的计算结果，盲区长度为 3.36 米
+        vehicle_edges = [
+            (1.0, 0),    # 前方边缘
+            (-1.0, 0),   # 后方边缘
+            (0, 0.5),    # 左侧边缘
+            (0, -0.5)    # 右侧边缘
+        ]
+        
+        edge_distances = []
+        for edge in vehicle_edges:
+            edge_x, edge_y = edge
+            distance = self.calculate_distance_to_nearest_obstacle(edge_x, edge_y)
+            if distance < blind_spot_length:
+                distance = blind_spot_length  # 如果障碍物在盲区内，设定为盲区距离
+            edge_distances.append(distance)
+        
+        return edge_distances
 
     def collision_callback(self, data):
         if len(data.states) > 0:
@@ -552,7 +592,7 @@ class GazeboEnv:
     def step(self, action):
         reward = 0  # 初始化 reward
         # 取得當前機器人的位置
-        robot_x, robot_y, _ = self.get_robot_position()
+        robot_x, robot_y, robot_yaw = self.get_robot_position()
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
 
         # 判斷是否到達最終目標點
@@ -607,7 +647,7 @@ class GazeboEnv:
         # 更新 previous_robot_position
         self.previous_robot_position = (robot_x, robot_y)
 
-        # 計算局部行動 - 使用純跟蹤演算法
+        # 使用純追蹤演算法來調整行動
         action = self.calculate_action_pure_pursuit()
 
         # 發送控制指令
@@ -625,13 +665,7 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        reward = self.calculate_reward(current_waypoint_x, current_waypoint_y)
-
-        # 檢查障礙物並增加獎勵/懲罰
-        if self.is_point_near_obstacle(robot_x, robot_y):
-            reward -= 50  # 增加懲罰以鼓勵避開障礙物
-        else:
-            reward += 50  # 如果遠離障礙物，給予額外的獎勵
+        reward, _ = self.calculate_reward(current_waypoint_x, current_waypoint_y)
 
         return self.state, reward, self.done, {}
 
@@ -689,21 +723,33 @@ class GazeboEnv:
     def calculate_reward(self, target_x, target_y):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
+        done = False
 
-        # 1. 根據方向誤差計算獎勵
+        # 1. 根据方向误差计算奖励
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward += max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越高
+        reward += max(0, 5 - yaw_diff * 5)  # 误差越小，奖励越高
 
-        # 2. 距離目標的獎勵，鼓勵靠近目標
+        # 2. 距离目标的奖励
         distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
-        reward += (1.0 / (distance_to_goal + 1e-5)) * 10  # 獎勵越靠近目標越高
+        reward += (1.0 / (distance_to_goal + 1e-5)) * 10
 
-        # 3. 安全性：遠離障礙物的獎勵
+        # 3. 安全性奖励，远离障碍物时奖励
         if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
-            reward += 50  # 如果離障礙物足夠遠，給予額外獎勵
+            reward += 50  # 如果距离障碍物足够远，增加奖励
 
-        return reward
+        # 4. 盲区检测并施加惩罚
+        blind_spot_distances = self.calculate_blind_spot_edge_distances()
+        for distance in blind_spot_distances:
+            if distance < 0.5:  # 根据车辆盲区设置距离
+                reward -= 50  # 处于盲区内增加惩罚
+
+        # 5. 是否到达最终目标点
+        if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
+            reward += 1000
+            done = True
+
+        return reward, done
 
     def get_robot_position(self):
         try:
@@ -924,6 +970,8 @@ def main():
             action = model.act(state)
             # Detach action before converting to NumPy
             action_np = action.detach().cpu().numpy()
+            
+            # `reward` 應該只是一個數值，而非元組
             next_state, reward, done, _ = env.step(action_np)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -931,7 +979,7 @@ def main():
             memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
 
             state = next_state
-            total_reward += reward
+            total_reward += reward  # 確保 `reward` 是數值
 
             elapsed_time = time.time() - start_time
 
