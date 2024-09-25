@@ -162,8 +162,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>500</mu> <!-- 主摩擦系数 -->
-              <mu2>500</mu2> <!-- 次摩擦系数 -->
+              <mu>1000</mu> <!-- 主摩擦系数 -->
+              <mu2>1000</mu2> <!-- 次摩擦系数 -->
             </ode>
           </friction>
           <contact>
@@ -246,8 +246,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>500</mu> <!-- 主摩擦系数 -->
-              <mu2>500</mu2> <!-- 次摩擦系数 -->
+              <mu>1000</mu> <!-- 主摩擦系数 -->
+              <mu2>1000</mu2> <!-- 次摩擦系数 -->
             </ode>
           </friction>
           <contact>
@@ -330,8 +330,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>500</mu> <!-- 主摩擦系数 -->
-              <mu2>500</mu2> <!-- 次摩擦系数 -->
+              <mu>1000</mu> <!-- 主摩擦系数 -->
+              <mu2>1000</mu2> <!-- 次摩擦系数 -->
             </ode>
           </friction>
           <contact>
@@ -406,8 +406,8 @@
         <surface>
           <friction>
             <ode>
-              <mu>500</mu> <!-- 主摩擦系数 -->
-              <mu2>500</mu2> <!-- 次摩擦系数 -->
+              <mu>1000</mu> <!-- 主摩擦系数 -->
+              <mu2>1000</mu2> <!-- 次摩擦系数 -->
             </ode>
           </friction>
           <contact>
