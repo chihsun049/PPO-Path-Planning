@@ -861,6 +861,9 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
+        
+        # 新增一個分支來輸出 yaw 值
+        self.yaw_head = nn.Linear(128, 1)
 
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
@@ -889,23 +892,28 @@ class ActorCritic(nn.Module):
 
         value = self.critic(x)
 
-        return action_mean, action_std, value
+        # 增加 yaw 值的輸出
+        yaw = self.yaw_head(x)
+
+        return action_mean, action_std, value, yaw
 
     def act(self, state):
-        action_mean, action_std, _ = self(state)
+        action_mean, action_std, _, yaw = self(state)  # 同時輸出 yaw
         action = action_mean + action_std * torch.randn_like(action_std)
         action = torch.tanh(action)
         max_action = torch.tensor([2.0, 0.6], device=action.device)
         min_action = torch.tensor([-2.0, -0.6], device=action.device)
         action = min_action + (action + 1) * (max_action - min_action) / 2
-        return action.detach()
 
+        # 輸出行為（action）和 yaw
+        return action.detach(), yaw.detach()
+    
     def evaluate(self, state, action):
-        action_mean, action_std, value = self(state)
+        action_mean, action_std, value, yaw = self(state)  # 同時計算 yaw
         dist = torch.distributions.Normal(action_mean, action_std)
         action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
         dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        return action_log_probs, value, dist_entropy
+        return action_log_probs, value, dist_entropy, yaw
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
@@ -916,12 +924,12 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             param_group['lr'] = adjusted_lr
 
         with torch.no_grad():
-            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
+            old_log_probs, _, _, _ = model.evaluate(state_batch, action_batch)
         old_log_probs = old_log_probs.detach()
 
         for _ in range(PPO_EPOCHS):
             with torch.amp.autocast('cuda'):
-                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
+                log_probs, state_values, dist_entropy, _ = model.evaluate(state_batch, action_batch)
                 advantages = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
 
                 ratio = (log_probs - old_log_probs).exp()
@@ -967,11 +975,10 @@ def main():
         start_time = time.time()
 
         for time_step in range(1500):
-            action = model.act(state)
-            # Detach action before converting to NumPy
+            action, yaw = model.act(state)  # 同時取得 action 和 yaw 值
             action_np = action.detach().cpu().numpy()
-            
-            # `reward` 應該只是一個數值，而非元組
+            yaw_np = yaw.detach().cpu().numpy()  # 把 yaw 轉換成 numpy 格式
+
             next_state, reward, done, _ = env.step(action_np)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
