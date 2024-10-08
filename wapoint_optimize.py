@@ -5,7 +5,7 @@ import rosbag
 import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2, PointField
 import torch.nn as nn
-from open3d import io as o3d_io
+import open3d as o3d
 import numpy as np
 import threading
 import tf
@@ -86,7 +86,7 @@ class ActorCritic(nn.Module):
         return action_log_probs, value, dist_entropy, yaw
 
 # 载入模型
-model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
+model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
 observation_space = (3, 64, 64)
 action_space = 2
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,31 +122,56 @@ def create_empty_pointcloud2():
     
     return pointcloud2_msg
 
-# 读取 LiDAR 数据的函数
+def filter_pointcloud(pointcloud_msg, voxel_size=0.1, ground_threshold=-1.5):
+    points = []
+    for point in pc2.read_points(pointcloud_msg, field_names=("x", "y", "z"), skip_nans=True):
+        if point[2] > ground_threshold:  # 過濾地面點
+            points.append([point[0], point[1], point[2]])
+    
+    # 使用 Open3D 將數據轉換為點雲物件
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    
+    # 應用體素網格濾波器進行下采樣
+    pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+    return pcd
+
 def load_lidar_from_bag(bag_file, topic="/points_raw"):
-    bag = rosbag.Bag(bag_file)
+    try:
+        bag = rosbag.Bag(bag_file)
+    except Exception as e:
+        rospy.logerr(f"Failed to open bag file: {e}")
+        return []
+
     lidar_data_list = []
     for topic_name, msg, t in bag.read_messages(topics=[topic]):
+        rospy.loginfo(f"Reading message from topic {topic_name}")
         if isinstance(msg, PointCloud2):
-            print(f"LiDAR data found at time {t.to_sec()} on topic {topic_name}")
-            lidar_data_list.append(msg)
+            rospy.loginfo(f"Found PointCloud2 data at time {t.to_sec()}")
+            filtered_pcd = filter_pointcloud(msg)  # 對數據進行濾波
+            lidar_data_list.append(filtered_pcd)
     bag.close()
 
+    rospy.loginfo(f"Collected {len(lidar_data_list)} filtered LiDAR data messages from {topic}")
+    
     if not lidar_data_list:
-        print(f"Warning: No LiDAR data found in the bag file on topic {topic}. Using empty PointCloud2.")
-        lidar_data_list.append(create_empty_pointcloud2())  # 使用虛擬的空數據
+        rospy.logwarn(f"No LiDAR data found in the bag file on topic {topic}. Using empty PointCloud2.")
+        lidar_data_list.append(create_empty_pointcloud2())
 
     return lidar_data_list
 
-# 从 PCD 文件加载障碍物点云
+def save_lidar_to_pcd(points, filename="output.pcd"):
+    point_cloud = o3d.geometry.PointCloud()
+    point_cloud.points = o3d.utility.Vector3dVector(points)
+    o3d.io.write_point_cloud(filename, point_cloud)
+    print(f"Point cloud saved to {filename}")
+
 def load_obstacles_from_pcd(pcd_file):
-    point_cloud = o3d_io.read_point_cloud(pcd_file)
+    point_cloud = o3d.io.read_point_cloud(pcd_file)
     print(f"Loaded obstacle point cloud with {len(point_cloud.points)} points.")
     return point_cloud
 
-# 优化路径点
-# 优化路径点，包含 yaw
-def generate_optimized_waypoints(model, initial_waypoints, lidar_data_list, obstacle_map):
+def generate_optimized_waypoints(model, initial_waypoints, lidar_data_list, obstacle_map, threshold=0.5):
     optimized_waypoints = []
     state = initial_waypoints
     for waypoint in initial_waypoints:
@@ -170,61 +195,49 @@ def generate_optimized_waypoints(model, initial_waypoints, lidar_data_list, obst
 
             next_waypoint = [new_x, new_y, new_yaw]
 
-            # 处理多个 LiDAR 数据，假设只取最后一个 LiDAR 数据进行判断
             lidar_data = lidar_data_list[-1]  # 根据需求选择要使用的点云数据
-            if is_safe(next_waypoint, lidar_data, obstacle_map):
+            if is_safe(next_waypoint, lidar_data, obstacle_map, threshold):
                 optimized_waypoints.append(next_waypoint)
             else:
-                # 如果不安全，保留原始的路径点
                 optimized_waypoints.append(waypoint)
             state = next_waypoint
     return optimized_waypoints
 
-# 判断路径点是否安全
 def is_safe(waypoint, lidar_data, obstacle_map, threshold=0.5):
     x, y = waypoint[:2]
     min_distance = float('inf')
-    # 确保 lidar_data 是单个 PointCloud2 消息
-    if isinstance(lidar_data, PointCloud2):
-        # 遍历 LiDAR 数据点，判断是否靠近障碍物
-        for point in pc2.read_points(lidar_data, field_names=("x", "y", "z"), skip_nans=True):
+    if isinstance(lidar_data, o3d.geometry.PointCloud):
+        for point in np.asarray(lidar_data.points):
             distance = np.linalg.norm([point[0] - x, point[1] - y])
             if distance < min_distance:
                 min_distance = distance
-    # 判断路径点是否靠近障碍物
     return min_distance > threshold
 
-# 从CSV文件读取初始路径点，包括标头和其他列数据
 def load_csv_waypoints(csv_file):
     waypoints = []
     other_columns = []
     with open(csv_file, 'r') as file:
         reader = csv.reader(file)
-        header = next(reader)  # 读取并保留标头
+        header = next(reader)
         for row in reader:
             if len(row) >= 3:
-                x, y, yaw = map(float, row[:3])  # 提取x, y, yaw
+                x, y, yaw = map(float, row[:3])
                 waypoints.append([x, y, yaw])
-                other_columns.append(row[3:])  # 其余列数据保留在other_columns
+                other_columns.append(row[3:])
             else:
                 rospy.logwarn(f"Skipping invalid row: {row}")
     return header, waypoints, other_columns
 
-# 保存优化后的路径点到CSV，保留原始未修改的路径和其他列数据
 def save_to_csv(original_waypoints, optimized_waypoints, other_columns, header, output_csv):
     with open(output_csv, 'w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(header)  # 写入标头
-
+        writer.writerow(header)
         for original, optimized, other_data in zip(original_waypoints, optimized_waypoints, other_columns):
-            writer.writerow(optimized + other_data)  # 将优化后的x, y, yaw与其他列数据结合写入
-
-        # 如果原始路径点多于优化路径点，继续写入剩下的原始路径点
+            writer.writerow(optimized + other_data)
         if len(original_waypoints) > len(optimized_waypoints):
             for remaining, other_data in zip(original_waypoints[len(optimized_waypoints):], other_columns[len(optimized_waypoints):]):
                 writer.writerow(remaining + other_data)
 
-# TF 變換發佈器
 def publish_tf():
     br = tf.TransformBroadcaster()
     rate = rospy.Rate(10)
@@ -235,34 +248,27 @@ def publish_tf():
         rate.sleep()
 
 def main():
-    rospy.init_node('waypoint_optimizer')
-
-    # 开始 TF 变换的发布线程
+    rospy.init_node('waypoint_optimizer', anonymous=True)
     rospy.loginfo("Starting TF broadcaster...")
     tf_thread = threading.Thread(target=publish_tf)
+    tf_thread.daemon = True
     tf_thread.start()
 
-    # 从 bag 文件读取 LiDAR 数据
     bag_file = "/home/chihsun/shared_dir/0822-1floor/autoware-20240822064852.bag"
     lidar_data = load_lidar_from_bag(bag_file, topic="/points_raw")
 
-    # 从 PCD 文件加载障碍物点云
     pcd_file = "/home/chihsun/shared_dir/0822-1floor/autoware-240822.pcd"
     obstacle_map = load_obstacles_from_pcd(pcd_file)
 
-    # 载入初始的路径点CSV文件和标头
     csv_file = '/home/chihsun/shared_dir/0822-1floor/saved_waypoints.csv'
     header, waypoints, other_columns = load_csv_waypoints(csv_file)
 
-    # 生成优化后的路径点
-    optimized_waypoints = generate_optimized_waypoints(model, waypoints, lidar_data, obstacle_map)
+    optimized_waypoints = generate_optimized_waypoints(model, waypoints, lidar_data, obstacle_map, threshold=0.5)
 
-    # 保存优化后的路径点到CSV，保留原始未修改的路径点和标头
     output_csv = '/home/chihsun/shared_dir/0822-1floor/optimized_waypoints.csv'
     save_to_csv(waypoints, optimized_waypoints, other_columns, header, output_csv)
     print(f"Optimized waypoints saved to {output_csv}")
 
-    # 停止 TF 發布线程
     tf_thread.join()
 
 if __name__ == "__main__":
