@@ -25,7 +25,7 @@ MEMORY_SIZE = 10000
 BATCH_SIZE = 256
 GAMMA = 0.99
 LEARNING_RATE = 0.0003
-PPO_EPOCHS = 5
+PPO_EPOCHS = 10
 CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
@@ -938,7 +938,7 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
-                entropy_loss = -0.01 * dist_entropy.mean()  # 添加熵正则项
+                entropy_loss = -0.02 * dist_entropy.mean()  # 添加熵正则项
                 loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
             scaler.scale(loss).backward()

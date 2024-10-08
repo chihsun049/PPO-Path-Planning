@@ -5,10 +5,8 @@ import rosbag
 import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2, PointField
 import torch.nn as nn
-import torch.nn.functional as F
 from open3d import io as o3d_io
 import numpy as np
-import open3d as o3d
 import threading
 import tf
 import std_msgs.msg
@@ -33,6 +31,9 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
+        
+        # 新增一個分支來輸出 yaw 值
+        self.yaw_head = nn.Linear(128, 1)
 
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
@@ -61,23 +62,28 @@ class ActorCritic(nn.Module):
 
         value = self.critic(x)
 
-        return action_mean, action_std, value
+        # 增加 yaw 值的輸出
+        yaw = self.yaw_head(x)
+
+        return action_mean, action_std, value, yaw
 
     def act(self, state):
-        action_mean, action_std, _ = self(state)
+        action_mean, action_std, _, yaw = self(state)  # 同時輸出 yaw
         action = action_mean + action_std * torch.randn_like(action_std)
         action = torch.tanh(action)
         max_action = torch.tensor([2.0, 0.6], device=action.device)
         min_action = torch.tensor([-2.0, -0.6], device=action.device)
         action = min_action + (action + 1) * (max_action - min_action) / 2
-        return action.detach()
 
+        # 輸出行為（action）和 yaw
+        return action.detach(), yaw.detach()
+    
     def evaluate(self, state, action):
-        action_mean, action_std, value = self(state)
+        action_mean, action_std, value, yaw = self(state)  # 同時計算 yaw
         dist = torch.distributions.Normal(action_mean, action_std)
         action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
         dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        return action_log_probs, value, dist_entropy
+        return action_log_probs, value, dist_entropy, yaw
 
 # 载入模型
 model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
@@ -139,6 +145,7 @@ def load_obstacles_from_pcd(pcd_file):
     return point_cloud
 
 # 优化路径点
+# 优化路径点，包含 yaw
 def generate_optimized_waypoints(model, initial_waypoints, lidar_data_list, obstacle_map):
     optimized_waypoints = []
     state = initial_waypoints
@@ -152,13 +159,19 @@ def generate_optimized_waypoints(model, initial_waypoints, lidar_data_list, obst
             state_tensor = state_tensor.repeat(1, 3, 1, 1)
             state_tensor = torch.nn.functional.interpolate(state_tensor, size=(64, 64))
 
-            action = model.act(state_tensor)
+            action, yaw = model.act(state_tensor)  # 同时获取 action 和 yaw
             action = action.cpu().numpy().squeeze()
+            yaw = yaw.cpu().numpy().squeeze()
 
-            next_waypoint = [waypoint[0] + action[0], waypoint[1] + action[1], waypoint[2]]
+            # 更新 x, y 和 yaw 坐标
+            new_x = waypoint[0] + action[0]
+            new_y = waypoint[1] + action[1]
+            new_yaw = waypoint[2] + yaw  # 根据模型输出更新 yaw
+
+            next_waypoint = [new_x, new_y, new_yaw]
 
             # 处理多个 LiDAR 数据，假设只取最后一个 LiDAR 数据进行判断
-            lidar_data = lidar_data_list[-1]  # 你可以根据需求选择要使用的点云数据
+            lidar_data = lidar_data_list[-1]  # 根据需求选择要使用的点云数据
             if is_safe(next_waypoint, lidar_data, obstacle_map):
                 optimized_waypoints.append(next_waypoint)
             else:
@@ -181,33 +194,35 @@ def is_safe(waypoint, lidar_data, obstacle_map, threshold=0.5):
     # 判断路径点是否靠近障碍物
     return min_distance > threshold
 
-# 从CSV文件读取初始路径点，包括标头
+# 从CSV文件读取初始路径点，包括标头和其他列数据
 def load_csv_waypoints(csv_file):
     waypoints = []
+    other_columns = []
     with open(csv_file, 'r') as file:
         reader = csv.reader(file)
         header = next(reader)  # 读取并保留标头
         for row in reader:
             if len(row) >= 3:
-                x, y, yaw = map(float, row[:3])
+                x, y, yaw = map(float, row[:3])  # 提取x, y, yaw
                 waypoints.append([x, y, yaw])
+                other_columns.append(row[3:])  # 其余列数据保留在other_columns
             else:
                 rospy.logwarn(f"Skipping invalid row: {row}")
-    return header, waypoints
+    return header, waypoints, other_columns
 
-# 保存优化后的路径点到CSV，保留未修改的路径和原始标头
-def save_to_csv(original_waypoints, optimized_waypoints, header, output_csv):
+# 保存优化后的路径点到CSV，保留原始未修改的路径和其他列数据
+def save_to_csv(original_waypoints, optimized_waypoints, other_columns, header, output_csv):
     with open(output_csv, 'w', newline='') as file:
         writer = csv.writer(file)
         writer.writerow(header)  # 写入标头
 
-        for original, optimized in zip(original_waypoints, optimized_waypoints):
-            writer.writerow(optimized)  # 无论是否修改，都写入优化后的路径点
+        for original, optimized, other_data in zip(original_waypoints, optimized_waypoints, other_columns):
+            writer.writerow(optimized + other_data)  # 将优化后的x, y, yaw与其他列数据结合写入
 
         # 如果原始路径点多于优化路径点，继续写入剩下的原始路径点
         if len(original_waypoints) > len(optimized_waypoints):
-            for remaining in original_waypoints[len(optimized_waypoints):]:
-                writer.writerow(remaining)
+            for remaining, other_data in zip(original_waypoints[len(optimized_waypoints):], other_columns[len(optimized_waypoints):]):
+                writer.writerow(remaining + other_data)
 
 # TF 變換發佈器
 def publish_tf():
@@ -219,7 +234,6 @@ def publish_tf():
         br.sendTransform(translation, rotation, rospy.Time.now(), "velodyne", "map")
         rate.sleep()
 
-# 主函数修改
 def main():
     rospy.init_node('waypoint_optimizer')
 
@@ -238,14 +252,14 @@ def main():
 
     # 载入初始的路径点CSV文件和标头
     csv_file = '/home/chihsun/shared_dir/0822-1floor/saved_waypoints.csv'
-    header, waypoints = load_csv_waypoints(csv_file)
+    header, waypoints, other_columns = load_csv_waypoints(csv_file)
 
     # 生成优化后的路径点
     optimized_waypoints = generate_optimized_waypoints(model, waypoints, lidar_data, obstacle_map)
 
     # 保存优化后的路径点到CSV，保留原始未修改的路径点和标头
     output_csv = '/home/chihsun/shared_dir/0822-1floor/optimized_waypoints.csv'
-    save_to_csv(waypoints, optimized_waypoints, header, output_csv)
+    save_to_csv(waypoints, optimized_waypoints, other_columns, header, output_csv)
     print(f"Optimized waypoints saved to {output_csv}")
 
     # 停止 TF 發布线程
