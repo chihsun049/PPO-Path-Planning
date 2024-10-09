@@ -336,33 +336,38 @@ class GazeboEnv:
         for i in range(len(self.waypoints) - 1):
             current_wp = self.waypoints[i]
             next_wp = self.waypoints[i + 1]
+
+            # 計算方向和法線向量
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
+            normal_direction = direction + np.pi / 2  # 法線向量方向（垂直於路徑方向）
+            
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
+            # 檢查新路徑點是否進入盲區或靠近障礙物
             if self.is_point_near_obstacle(new_wp_x, new_wp_y) or self.is_in_blind_spot(new_wp_x, new_wp_y):
                 best_x, best_y = new_wp_x, new_wp_y
-                max_distance_to_obstacle = float('-inf')
+                min_distance_to_obstacle = float('inf')
 
-                # 試不同的偏移距離和方向
-                for radius_offset in np.linspace(0.2, 0.5, num=4):
-                    for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
-                        adjusted_direction = direction + angle_offset
-                        temp_x = current_wp[0] + radius_offset * np.cos(adjusted_direction)
-                        temp_y = current_wp[1] + radius_offset * np.sin(adjusted_direction)
+                # 沿著法線方向調整路徑點，避開障礙物
+                for offset in [0.1, 0.2, 0.3]:  # 可以調整偏移量
+                    temp_x = new_wp_x + offset * np.cos(normal_direction)
+                    temp_y = new_wp_y + offset * np.sin(normal_direction)
 
-                        if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
-                            distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
-                            if distance_to_obstacle > max_distance_to_obstacle:
-                                best_x, best_y = temp_x, temp_y
-                                max_distance_to_obstacle = distance_to_obstacle
+                    if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
+                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+                        if distance_to_obstacle > min_distance_to_obstacle:
+                            best_x, best_y = temp_x, temp_y
+                            min_distance_to_obstacle = distance_to_obstacle
 
-                # 更新為找到的最佳位置
+                # 更新路徑點為最優位置
                 new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
 
+        # 添加最終目標點
         optimized_waypoints.append(self.waypoints[-1])
+        # 使用貝茲曲線平滑化路徑
         self.waypoints = self.smooth_waypoints(optimized_waypoints)
         self.current_waypoint_index = 0
 
@@ -418,7 +423,9 @@ class GazeboEnv:
             if distance < min_distance_to_obstacle:
                 min_distance_to_obstacle = distance
 
-        return min_distance_to_obstacle < threshold
+        # 如果靠近的障礙物在盲區範圍內，也將其視為接近障礙
+        is_near_obstacle = min_distance_to_obstacle < threshold
+        return is_near_obstacle or self.is_in_blind_spot(x, y)
     
     def calculate_blind_spot_edge_distances(self):
         # 计算车辆的边缘距离，同时考虑盲区
