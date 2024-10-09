@@ -142,8 +142,7 @@ class GazeboEnv:
 
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
-
-        self.generate_optimized_waypoints()
+        self.optimized_waypoints = []
 
     def generate_waypoints(self):
         waypoints = [
@@ -329,9 +328,6 @@ class GazeboEnv:
         self.current_waypoint_index = 0
 
     def generate_optimized_waypoints(self):
-        """
-        使用 LiDAR 資料檢查盲區與障礙物，生成更安全且平滑的路徑點
-        """
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -340,38 +336,33 @@ class GazeboEnv:
         for i in range(len(self.waypoints) - 1):
             current_wp = self.waypoints[i]
             next_wp = self.waypoints[i + 1]
-
-            # 計算路徑點間的方向
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
-            # 檢查新路徑點是否進入盲區或靠近障礙物
             if self.is_point_near_obstacle(new_wp_x, new_wp_y) or self.is_in_blind_spot(new_wp_x, new_wp_y):
                 best_x, best_y = new_wp_x, new_wp_y
-                min_distance_to_obstacle = float('inf')
+                max_distance_to_obstacle = float('-inf')
 
-                # 調整路徑點以遠離盲區和障礙物
-                for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
-                    adjusted_direction = direction + angle_offset
-                    temp_x = current_wp[0] + 0.2 * np.cos(adjusted_direction)
-                    temp_y = current_wp[1] + 0.2 * np.sin(adjusted_direction)
+                # 試不同的偏移距離和方向
+                for radius_offset in np.linspace(0.2, 0.5, num=4):
+                    for angle_offset in np.linspace(-np.pi/2, np.pi/2, num=18):
+                        adjusted_direction = direction + angle_offset
+                        temp_x = current_wp[0] + radius_offset * np.cos(adjusted_direction)
+                        temp_y = current_wp[1] + radius_offset * np.sin(adjusted_direction)
 
-                    if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
-                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
-                        if distance_to_obstacle > min_distance_to_obstacle:
-                            best_x, best_y = temp_x, temp_y
-                            min_distance_to_obstacle = distance_to_obstacle
+                        if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
+                            distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+                            if distance_to_obstacle > max_distance_to_obstacle:
+                                best_x, best_y = temp_x, temp_y
+                                max_distance_to_obstacle = distance_to_obstacle
 
-                # 更新路徑點為最優位置
+                # 更新為找到的最佳位置
                 new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
 
-        # 添加最終目標點
         optimized_waypoints.append(self.waypoints[-1])
-        
-        # 使用貝茲曲線平滑化路徑
         self.waypoints = self.smooth_waypoints(optimized_waypoints)
         self.current_waypoint_index = 0
 
@@ -416,7 +407,7 @@ class GazeboEnv:
 
         return curve
 
-    def is_point_near_obstacle(self, x, y, threshold=0.25):
+    def is_point_near_obstacle(self, x, y, threshold=0.5):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data is not available yet.")
             return False
@@ -697,7 +688,12 @@ class GazeboEnv:
 
         rospy.sleep(0.5)
 
-        self.waypoints = self.generate_waypoints()
+        # 若有優化過的路徑點，則使用它們
+        if hasattr(self, 'optimized_waypoints') and self.optimized_waypoints:
+            self.waypoints = self.optimized_waypoints
+        else:
+            self.waypoints = self.generate_waypoints()
+
         self.current_waypoint_index = 0
         self.done = False
 
@@ -705,18 +701,16 @@ class GazeboEnv:
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
         self.state = self.generate_occupancy_grid(empty_lidar_data, current_waypoint_x, current_waypoint_y)
 
-        # 停止机器人运动
         self.last_twist = Twist()
-        self.pub_cmd_vel.publish(self.last_twist)  # 停止机器人
+        self.pub_cmd_vel.publish(self.last_twist)
 
-        # 重置IMU数据
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
-        self.previous_distance_to_goal = None  # 重置 previous_distance_to_goal
-        self.collision_detected = False  # 重置碰撞标志
+        self.previous_distance_to_goal = None
+        self.collision_detected = False
 
         return self.state
 
@@ -971,23 +965,19 @@ def main():
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         total_reward = 0
-
         start_time = time.time()
 
         for time_step in range(1500):
-            action, yaw = model.act(state)  # 同時取得 action 和 yaw 值
+            action, yaw = model.act(state)
             action_np = action.detach().cpu().numpy()
-            yaw_np = yaw.detach().cpu().numpy()  # 把 yaw 轉換成 numpy 格式
-
+            yaw_np = yaw.detach().cpu().numpy()
+            
             next_state, reward, done, _ = env.step(action_np)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
 
-            # Detach action before adding to memory
             memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-
             state = next_state
-            total_reward += reward  # 確保 `reward` 是數值
-
+            total_reward += reward
             elapsed_time = time.time() - start_time
 
             if done or elapsed_time > 240:
@@ -996,12 +986,13 @@ def main():
                     print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
                 break
 
+        # 每圈結束後進行 PPO 更新
         ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler)
         memory.clear()
 
         print(f"Episode {e}, Total Reward: {total_reward}")
 
-        # Optimize waypoints
+        # 在每圈結束後進行路徑優化
         env.generate_optimized_waypoints()
 
         if total_reward > best_test_reward:
