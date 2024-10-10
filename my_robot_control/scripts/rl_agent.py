@@ -327,7 +327,7 @@ class GazeboEnv:
         self.waypoints = adjusted_waypoints
         self.current_waypoint_index = 0
 
-    def generate_optimized_waypoints(self):
+    def generate_optimized_waypoints(self, optimization_interval=10, safety_distance=1.0):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -339,37 +339,57 @@ class GazeboEnv:
 
             # 計算方向和法線向量
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
-            normal_direction = direction + np.pi / 2  # 法線向量方向（垂直於路徑方向）
-            
+            normal_direction = direction + np.pi / 2  # 法線向量方向
+
+            # 初始新路徑點沿著方向前進
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
-            # 檢查新路徑點是否進入盲區或靠近障礙物
-            if self.is_point_near_obstacle(new_wp_x, new_wp_y) or self.is_in_blind_spot(new_wp_x, new_wp_y):
+            # 加入優化間隔控制
+            if i % optimization_interval == 0 or self.is_point_near_obstacle(new_wp_x, new_wp_y, safety_distance):
                 best_x, best_y = new_wp_x, new_wp_y
-                min_distance_to_obstacle = float('inf')
+                max_distance_to_obstacle = 0
 
-                # 沿著法線方向調整路徑點，避開障礙物
-                for offset in [0.1, 0.2, 0.3]:  # 可以調整偏移量
-                    temp_x = new_wp_x + offset * np.cos(normal_direction)
-                    temp_y = new_wp_y + offset * np.sin(normal_direction)
+                # 沿著法線方向偏移並嘗試最佳化
+                for angle_offset in [-np.pi / 4, 0, np.pi / 4]:  # 左、中、右三方向
+                    adjusted_direction = normal_direction + angle_offset
+                    for offset_distance in [0.1, 0.2, 0.3]:
+                        temp_x = new_wp_x + offset_distance * np.cos(adjusted_direction)
+                        temp_y = new_wp_y + offset_distance * np.sin(adjusted_direction)
 
-                    if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
-                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
-                        if distance_to_obstacle > min_distance_to_obstacle:
-                            best_x, best_y = temp_x, temp_y
-                            min_distance_to_obstacle = distance_to_obstacle
+                        # 避免盲區及檢查安全距離
+                        if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
+                            distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+                            if distance_to_obstacle > max_distance_to_obstacle:
+                                best_x, best_y = temp_x, temp_y
+                                max_distance_to_obstacle = distance_to_obstacle
 
-                # 更新路徑點為最優位置
+                # 使用最佳點作為新的路徑點
                 new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
 
         # 添加最終目標點
         optimized_waypoints.append(self.waypoints[-1])
-        # 使用貝茲曲線平滑化路徑
-        self.waypoints = self.smooth_waypoints(optimized_waypoints)
-        self.current_waypoint_index = 0
+        self.waypoints = self.smooth_waypoints(optimized_waypoints)  # 平滑路徑
+        self.current_waypoint_index = 0  # 重置路徑索引
+
+    def is_point_near_obstacle(self, x, y, threshold=1.2):
+        """
+        確保安全距離，檢查是否靠近障礙物
+        """
+        if self.lidar_data is None:
+            rospy.logwarn("LiDAR data is not available yet.")
+            return False
+
+        min_distance_to_obstacle = float('inf')
+        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
+            distance = np.sqrt((point[0] - x) ** 2 + (point[1] - y) ** 2)
+            if distance < min_distance_to_obstacle:
+                min_distance_to_obstacle = distance
+
+        # 判斷是否在安全閾值內
+        return min_distance_to_obstacle < threshold or self.is_in_blind_spot(x, y)
 
     def is_in_blind_spot(self, x, y, blind_spot_length=3.36):
         """
@@ -411,21 +431,6 @@ class GazeboEnv:
             curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
 
         return curve
-
-    def is_point_near_obstacle(self, x, y, threshold=0.5):
-        if self.lidar_data is None:
-            rospy.logwarn("LiDAR data is not available yet.")
-            return False
-
-        min_distance_to_obstacle = float('inf')
-        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
-            distance = np.sqrt((point[0] - x)**2 + (point[1] - y)**2)
-            if distance < min_distance_to_obstacle:
-                min_distance_to_obstacle = distance
-
-        # 如果靠近的障礙物在盲區範圍內，也將其視為接近障礙
-        is_near_obstacle = min_distance_to_obstacle < threshold
-        return is_near_obstacle or self.is_in_blind_spot(x, y)
     
     def calculate_blind_spot_edge_distances(self):
         # 计算车辆的边缘距离，同时考虑盲区
@@ -668,6 +673,7 @@ class GazeboEnv:
         return self.state, reward, self.done, {}
 
     def reset(self):
+        # Existing setup code
         yaw = -0.0053
         quaternion = quaternion_from_euler(0.0, 0.0, yaw)
         state_msg = ModelState()
@@ -695,12 +701,13 @@ class GazeboEnv:
 
         rospy.sleep(0.5)
 
-        # 若有優化過的路徑點，則使用它們
+        # 優先使用優化過的路徑點，否則使用生成的原始路徑點
         if hasattr(self, 'optimized_waypoints') and self.optimized_waypoints:
             self.waypoints = self.optimized_waypoints
         else:
             self.waypoints = self.generate_waypoints()
 
+        # Reset other attributes
         self.current_waypoint_index = 0
         self.done = False
 
@@ -736,7 +743,7 @@ class GazeboEnv:
         reward += (1.0 / (distance_to_goal + 1e-5)) * 10
 
         # 3. 安全性奖励，远离障碍物时奖励
-        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
+        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.5):
             reward += 50  # 如果距离障碍物足够远，增加奖励
 
         # 4. 盲区检测并施加惩罚
