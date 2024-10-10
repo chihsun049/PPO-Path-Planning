@@ -307,25 +307,6 @@ class GazeboEnv:
             (self.target_x, self.target_y)
         ]
         return waypoints
-    
-    def optimize_waypoints_with_heuristics(self):
-        adjusted_waypoints = []
-        for i, wp in enumerate(self.waypoints):
-            if i == 0 or i == len(self.waypoints) - 1:
-                adjusted_waypoints.append(wp)
-                continue
-
-            wp_x, wp_y, wp_yaw = wp
-
-            while self.is_point_near_obstacle(wp_x, wp_y):
-                direction = np.arctan2(self.target_y - wp_y, self.target_x - wp_x)
-                wp_x += 0.05 * np.cos(direction)
-                wp_y += 0.05 * np.sin(direction)
-
-            adjusted_waypoints.append((wp_x, wp_y, wp_yaw))
-        
-        self.waypoints = adjusted_waypoints
-        self.current_waypoint_index = 0
 
     def generate_optimized_waypoints(self, optimization_interval=10, safety_distance=1.0):
         if self.lidar_data is None:
@@ -346,7 +327,7 @@ class GazeboEnv:
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
             # 加入優化間隔控制
-            if i % optimization_interval == 0 or self.is_point_near_obstacle(new_wp_x, new_wp_y, safety_distance):
+            if i % optimization_interval == 0 or self.check_obstacle_proximity(new_wp_x, new_wp_y, safety_distance):
                 best_x, best_y = new_wp_x, new_wp_y
                 max_distance_to_obstacle = 0
 
@@ -357,14 +338,12 @@ class GazeboEnv:
                         temp_x = new_wp_x + offset_distance * np.cos(adjusted_direction)
                         temp_y = new_wp_y + offset_distance * np.sin(adjusted_direction)
 
-                        # 避免盲區及檢查安全距離
-                        if not self.is_point_near_obstacle(temp_x, temp_y) and not self.is_in_blind_spot(temp_x, temp_y):
+                        if not self.check_obstacle_proximity(temp_x, temp_y):
                             distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
                             if distance_to_obstacle > max_distance_to_obstacle:
                                 best_x, best_y = temp_x, temp_y
                                 max_distance_to_obstacle = distance_to_obstacle
 
-                # 使用最佳點作為新的路徑點
                 new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
@@ -374,9 +353,10 @@ class GazeboEnv:
         self.waypoints = self.smooth_waypoints(optimized_waypoints)  # 平滑路徑
         self.current_waypoint_index = 0  # 重置路徑索引
 
-    def is_point_near_obstacle(self, x, y, threshold=1.2):
+    def check_obstacle_proximity(self, x, y, threshold=1.2, blind_spot_length=3.36):
         """
-        確保安全距離，檢查是否靠近障礙物
+        檢查點位是否靠近障礙物或在盲區內。
+        返回 True 表示在障礙物附近或盲區內。
         """
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data is not available yet.")
@@ -389,17 +369,15 @@ class GazeboEnv:
                 min_distance_to_obstacle = distance
 
         # 判斷是否在安全閾值內
-        return min_distance_to_obstacle < threshold or self.is_in_blind_spot(x, y)
+        if min_distance_to_obstacle < threshold:
+            return True
 
-    def is_in_blind_spot(self, x, y, blind_spot_length=3.36):
-        """
-        檢查給定的點是否位於車輛的盲區內
-        """
+        # 計算盲區距離
         blind_spot_edges = self.calculate_blind_spot_edge_distances()
-        min_distance_to_edges = min(blind_spot_edges)
+        if min(blind_spot_edges) < blind_spot_length:
+            return True
 
-        # 如果距離小於盲區長度，則該點在盲區內
-        return min_distance_to_edges < blind_spot_length
+        return False
 
     # 用於計算當前點與最近障礙物之間的距離
     def calculate_distance_to_nearest_obstacle(self, x, y):
@@ -743,8 +721,8 @@ class GazeboEnv:
         reward += (1.0 / (distance_to_goal + 1e-5)) * 10
 
         # 3. 安全性奖励，远离障碍物时奖励
-        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.5):
-            reward += 50  # 如果距离障碍物足够远，增加奖励
+        if not self.check_obstacle_proximity(robot_x, robot_y, threshold=0.5):
+            reward += 50
 
         # 4. 盲区检测并施加惩罚
         blind_spot_distances = self.calculate_blind_spot_edge_distances()
