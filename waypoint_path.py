@@ -4,7 +4,7 @@ import numpy as np
 
 # 读取CSV文件
 csv_file = '/home/chihsun/shared_dir/0822-1floor/optimized_waypoints.csv'
-#csv_file = '/home/chihsun/shared_dir/0822-1floor/saved_waypoints.csv'
+# csv_file = '/home/chihsun/shared_dir/0822-1floor/saved_waypoints.csv'
 df = pd.read_csv(csv_file)
 
 # 初始化图像

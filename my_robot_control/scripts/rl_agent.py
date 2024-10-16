@@ -18,6 +18,7 @@ import tf
 from tf.transformations import quaternion_from_euler
 import time
 from torch.amp import GradScaler
+import random
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -29,6 +30,9 @@ PPO_EPOCHS = 10
 CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
+EXPLORATION_NOISE_SCALE = 1.0  # 探索性噪音係數
+ENTROPY_DECAY = 0.001
+BLIND_SPOT_LENGTH = 3.36
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
@@ -308,7 +312,7 @@ class GazeboEnv:
         ]
         return waypoints
 
-    def generate_optimized_waypoints(self, optimization_interval=10, safety_distance=1.0):
+    def generate_optimized_waypoints(self, optimization_interval=3, max_distance=1.5):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -327,22 +331,21 @@ class GazeboEnv:
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
             # 加入優化間隔控制
-            if i % optimization_interval == 0 or self.check_obstacle_proximity(new_wp_x, new_wp_y, safety_distance):
+            if i % optimization_interval == 0 or self.check_obstacle_proximity(new_wp_x, new_wp_y, max_distance):
                 best_x, best_y = new_wp_x, new_wp_y
                 max_distance_to_obstacle = 0
 
                 # 沿著法線方向偏移並嘗試最佳化
-                for angle_offset in [-np.pi / 4, 0, np.pi / 4]:  # 左、中、右三方向
-                    adjusted_direction = normal_direction + angle_offset
-                    for offset_distance in [0.1, 0.2, 0.3]:
-                        temp_x = new_wp_x + offset_distance * np.cos(adjusted_direction)
-                        temp_y = new_wp_y + offset_distance * np.sin(adjusted_direction)
+                for angle_offset in [-np.pi / 2, -np.pi / 4, 0, np.pi / 4, np.pi / 2]:  # 左、左前、前、右前、右方向
+                    for offset_distance in np.arange(0.1, max_distance + 0.5, 0.1):  # 測試更大的距離
+                        temp_x = new_wp_x + offset_distance * np.cos(normal_direction + angle_offset)
+                        temp_y = new_wp_y + offset_distance * np.sin(normal_direction + angle_offset)
 
-                        if not self.check_obstacle_proximity(temp_x, temp_y):
-                            distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
-                            if distance_to_obstacle > max_distance_to_obstacle:
-                                best_x, best_y = temp_x, temp_y
-                                max_distance_to_obstacle = distance_to_obstacle
+                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+
+                        if distance_to_obstacle > max_distance_to_obstacle:
+                            best_x, best_y = temp_x, temp_y
+                            max_distance_to_obstacle = distance_to_obstacle
 
                 new_wp_x, new_wp_y = best_x, best_y
 
@@ -711,29 +714,30 @@ class GazeboEnv:
         reward = 0
         done = False
 
-        # 1. 根据方向误差计算奖励
+        # 1. 根據方向誤差計算獎勵
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward += max(0, 5 - yaw_diff * 5)  # 误差越小，奖励越高
+        reward += max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越高
 
-        # 2. 距离目标的奖励
-        distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
-        reward += (1.0 / (distance_to_goal + 1e-5)) * 10
+        # 2. 計算距離目標的獎勵或懲罰
+        distance_to_goal = np.linalg.norm([target_x - robot_x, target_y - robot_y])
+        if distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
+            reward += 200  # 若接近目標，則給予較高獎勵
+        else:
+            reward -= distance_to_goal  # 隨著距離增加，減少獎勵
 
-        # 3. 安全性奖励，远离障碍物时奖励
-        if not self.check_obstacle_proximity(robot_x, robot_y, threshold=0.5):
-            reward += 50
+        # 3. 安全性獎勵：距離障礙物越遠，獎勵越高
+        distance_to_nearest_obstacle = self.calculate_distance_to_nearest_obstacle(robot_x, robot_y)
+        if distance_to_nearest_obstacle > 0.5:  # 設定安全距離閾值
+            reward += (distance_to_nearest_obstacle - 0.5) * 50  # 隨距離增加，獎勵逐步上升
+        else:
+            reward -= 50  # 若接近障礙物，則減少獎勵
 
-        # 4. 盲区检测并施加惩罚
+        # 4. 盲區處理
         blind_spot_distances = self.calculate_blind_spot_edge_distances()
         for distance in blind_spot_distances:
-            if distance < 0.5:  # 根据车辆盲区设置距离
-                reward -= 50  # 处于盲区内增加惩罚
-
-        # 5. 是否到达最终目标点
-        if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
-            reward += 1000
-            done = True
+            if distance < BLIND_SPOT_LENGTH:
+                reward -= 100  # 若盲區內有障礙物，則給予懲罰
 
         return reward, done
 
@@ -847,8 +851,6 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
-        
-        # 新增一個分支來輸出 yaw 值
         self.yaw_head = nn.Linear(128, 1)
 
     def _get_conv_output_size(self, shape):
@@ -877,35 +879,37 @@ class ActorCritic(nn.Module):
         action_std = torch.exp(action_log_std)
 
         value = self.critic(x)
-
-        # 增加 yaw 值的輸出
         yaw = self.yaw_head(x)
 
         return action_mean, action_std, value, yaw
 
     def act(self, state):
-        action_mean, action_std, _, yaw = self(state)  # 同時輸出 yaw
-        action = action_mean + action_std * torch.randn_like(action_std)
+        action_mean, action_std, _, yaw = self(state)
+        action = action_mean + action_std * torch.randn_like(action_std) * EXPLORATION_NOISE_SCALE
         action = torch.tanh(action)
         max_action = torch.tensor([2.0, 0.6], device=action.device)
         min_action = torch.tensor([-2.0, -0.6], device=action.device)
         action = min_action + (action + 1) * (max_action - min_action) / 2
-
-        # 輸出行為（action）和 yaw
+        
+        # 引入隨機動作選擇機制
+        if random.random() < 0.2:  # 20%的概率選擇隨機動作
+            action = min_action + (torch.rand_like(action) * (max_action - min_action))
+        
         return action.detach(), yaw.detach()
     
     def evaluate(self, state, action):
-        action_mean, action_std, value, yaw = self(state)  # 同時計算 yaw
+        action_mean, action_std, value, yaw = self(state)
         dist = torch.distributions.Normal(action_mean, action_std)
         action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
         dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
         return action_log_probs, value, dist_entropy, yaw
 
+# Define the new PPO update to include entropy and exploration decay
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
-    for _ in range(ppo_epochs):
+    for epoch in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
         
-        adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
+        adjusted_lr = LEARNING_RATE * (1 + 0.1 * (reward_batch.mean().item() / (reward_batch.std().item() + 1e-5)))
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
 
@@ -919,12 +923,17 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
                 advantages = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
 
                 ratio = (log_probs - old_log_probs).exp()
+                
+                clip_param = CLIP_PARAM * (1 - 0.1 * (reward_batch.std().item() / (reward_batch.mean().item() + 1e-5)))
                 surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
+                surr2 = torch.clamp(ratio, 1 - clip_param, 1 + clip_param) * advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
-                entropy_loss = -0.02 * dist_entropy.mean()  # 添加熵正则项
+
+                entropy_coef = 0.02 * np.exp(-ENTROPY_DECAY * epoch)
+                entropy_loss = -entropy_coef * dist_entropy.mean()
+                
                 loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
             scaler.scale(loss).backward()
@@ -934,6 +943,7 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
             memory.update_priorities(indices, priorities)
 
+# Main function
 def main():
     env = GazeboEnv()
     model = ActorCritic(env.observation_space, env.action_space).to(device)
@@ -952,8 +962,18 @@ def main():
 
     num_episodes = 1000000
     best_test_reward = -np.inf
+    exploration_noise_scale = 1.0
 
     for e in range(num_episodes):
+        # 動態調整探索係數
+        if e % 100 == 0 and e > 0:  # 每 100 回合動態調整探索性
+            recent_reward = total_reward if total_reward is not None else 0
+            if recent_reward < 0:
+                exploration_noise_scale = min(1.5, exploration_noise_scale * 1.1)  # 提高探索性
+            else:
+                exploration_noise_scale = max(0.5, exploration_noise_scale * 0.9)  # 減少探索性
+            print(f"Episode {e}, Adjusted Exploration Noise Scale: {exploration_noise_scale}")
+
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         total_reward = 0
