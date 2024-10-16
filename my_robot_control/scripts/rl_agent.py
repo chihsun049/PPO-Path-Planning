@@ -312,7 +312,7 @@ class GazeboEnv:
         ]
         return waypoints
 
-    def generate_optimized_waypoints(self, optimization_interval=3, max_distance=1.5):
+    def generate_optimized_waypoints(self, optimization_interval=3, max_distance=2.0):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data not yet available, skipping optimization.")
             return
@@ -321,33 +321,33 @@ class GazeboEnv:
         for i in range(len(self.waypoints) - 1):
             current_wp = self.waypoints[i]
             next_wp = self.waypoints[i + 1]
-
+            
             # 計算方向和法線向量
             direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
-            normal_direction = direction + np.pi / 2  # 法線向量方向
 
             # 初始新路徑點沿著方向前進
             new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
             new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
 
-            # 加入優化間隔控制
-            if i % optimization_interval == 0 or self.check_obstacle_proximity(new_wp_x, new_wp_y, max_distance):
+            # 若靠近障礙物，則進行優化調整
+            if self.check_obstacle_proximity(new_wp_x, new_wp_y, max_distance):
                 best_x, best_y = new_wp_x, new_wp_y
                 max_distance_to_obstacle = 0
 
-                # 沿著法線方向偏移並嘗試最佳化
-                for angle_offset in [-np.pi / 2, -np.pi / 4, 0, np.pi / 4, np.pi / 2]:  # 左、左前、前、右前、右方向
-                    for offset_distance in np.arange(0.1, max_distance + 0.5, 0.1):  # 測試更大的距離
-                        temp_x = new_wp_x + offset_distance * np.cos(normal_direction + angle_offset)
-                        temp_y = new_wp_y + offset_distance * np.sin(normal_direction + angle_offset)
+                # 全方位嘗試不同角度和偏移距離
+                for _ in range(3):  # 多階段優化
+                    for angle_offset in np.linspace(0, 2 * np.pi, 12):  # 全方位 12 個方向
+                        for offset_distance in np.arange(0.1, max_distance + 2.5, 0.1):  # 增大偏移距離
+                            temp_x = new_wp_x + offset_distance * np.cos(angle_offset)
+                            temp_y = new_wp_y + offset_distance * np.sin(angle_offset)
 
-                        distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+                            distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
 
-                        if distance_to_obstacle > max_distance_to_obstacle:
-                            best_x, best_y = temp_x, temp_y
-                            max_distance_to_obstacle = distance_to_obstacle
-
-                new_wp_x, new_wp_y = best_x, best_y
+                            if distance_to_obstacle > max_distance_to_obstacle:
+                                best_x, best_y = temp_x, temp_y
+                                max_distance_to_obstacle = distance_to_obstacle
+                    # 更新最佳位置
+                    new_wp_x, new_wp_y = best_x, best_y
 
             optimized_waypoints.append((new_wp_x, new_wp_y))
 
@@ -726,16 +726,19 @@ class GazeboEnv:
         else:
             reward -= distance_to_goal  # 隨著距離增加，減少獎勵
 
-        # 3. 安全性獎勵：距離障礙物越遠，獎勵越高
-        distance_to_nearest_obstacle = self.calculate_distance_to_nearest_obstacle(robot_x, robot_y)
-        if distance_to_nearest_obstacle > 0.5:  # 設定安全距離閾值
-            reward += (distance_to_nearest_obstacle - 0.5) * 50  # 隨距離增加，獎勵逐步上升
+        # 3. 安全性獎勵：遠離障礙物的距離越大，獎勵越高
+        # 計算車輛周圍最近的障礙物距離
+        edge_distances = self.calculate_blind_spot_edge_distances()
+        min_distance_to_obstacle = min(edge_distances)  # 四周中最接近的障礙物距離
+        
+        # 若最小距離大於0.5，則隨距離增加獎勵
+        if min_distance_to_obstacle > 0.5:
+            reward += (min_distance_to_obstacle - 0.5) * 50  # 隨著距離增加，獎勵逐步上升
         else:
-            reward -= 50  # 若接近障礙物，則減少獎勵
+            reward -= 100  # 若接近障礙物，則減少獎勵
 
-        # 4. 盲區處理
-        blind_spot_distances = self.calculate_blind_spot_edge_distances()
-        for distance in blind_spot_distances:
+        # 4. 盲區懲罰：如果盲區內有障礙物，則給予懲罰
+        for distance in edge_distances:
             if distance < BLIND_SPOT_LENGTH:
                 reward -= 100  # 若盲區內有障礙物，則給予懲罰
 
@@ -966,9 +969,9 @@ def main():
 
     for e in range(num_episodes):
         # 動態調整探索係數
-        if e % 100 == 0 and e > 0:  # 每 100 回合動態調整探索性
+        if e % 100 == 0 and e > 0:
             recent_reward = total_reward if total_reward is not None else 0
-            if recent_reward < 0:
+            if recent_reward < best_test_reward * 0.9:
                 exploration_noise_scale = min(1.5, exploration_noise_scale * 1.1)  # 提高探索性
             else:
                 exploration_noise_scale = max(0.5, exploration_noise_scale * 0.9)  # 減少探索性
