@@ -34,7 +34,7 @@ CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
 
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class PrioritizedMemory:
@@ -342,18 +342,14 @@ class GazeboEnv:
         return gazebo_x, gazebo_y
 
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
-        """
-        A* 算法對 50x50 的正方形內進行路徑優化
-        """
-        # 使用 self.gazebo_to_image_coords 而不是 gazebo_to_image_coords
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
-
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
 
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
+        # 狹長區域範圍
+        for x in range(img_start_x - grid_size // 3, img_start_x + grid_size // 3):
             for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
                 if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
                     continue
@@ -361,20 +357,19 @@ class GazeboEnv:
                 g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 2):min(y + grid_size // 2, png_image.shape[0]),
-                                                    max(0, x - grid_size // 2):min(x + grid_size // 2, png_image.shape[1])] < 250)
+                # 加重牆外障礙物的懲罰
+                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 3):min(y + grid_size // 3, png_image.shape[0]),
+                                                    max(0, x - grid_size // 3):min(x + grid_size // 3, png_image.shape[1])] < 250)
 
-                f = g + h + unwalkable_count * 2
+                f = g + h + unwalkable_count * 5  # 增加懲罰倍率來限制牆外區域
 
                 if f < best_f_score:
                     best_f_score = f
                     best_point = (x, y)
 
-        # 使用 self.image_to_gazebo_coords 而不是 image_to_gazebo_coords
         optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
 
         return optimized_gazebo_x, optimized_gazebo_y
-
 
     def optimize_waypoints_with_a_star(self):
         """
@@ -387,13 +382,8 @@ class GazeboEnv:
             optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
             optimized_waypoints.append(optimized_point)
 
-        # 最終優化點
         optimized_waypoints.append(self.waypoints[-1])
-
-        # 刪除過濾距離的步驟
-        # self.waypoints = self.filter_waypoints_by_distance(optimized_waypoints)
         
-        # 直接將優化點用作最終路徑
         self.waypoints = optimized_waypoints
         self.current_waypoint_index = 0
 
@@ -405,28 +395,6 @@ class GazeboEnv:
             if distance < min_distance:
                 min_distance = distance
         return min_distance
-
-    def smooth_waypoints(self, waypoints):
-        waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]  # Only keep x and y coordinates
-        smoothed_points = self.bezier_curve(waypoints_2d)
-        smoothed_waypoints = [(pt[0], pt[1]) for pt in smoothed_points]  # No yaw involved
-        self.current_waypoint_index = 0
-        return smoothed_waypoints
-    
-    def bezier_curve(self, waypoints, n_points=100):
-        waypoints = np.array(waypoints)
-        n = len(waypoints) - 1
-
-        def bernstein_poly(i, n, t):
-            return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
-
-        t = np.linspace(0.0, 1.0, n_points)
-        curve = np.zeros((n_points, 2))
-
-        for i in range(n + 1):
-            curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
-
-        return curve
 
     def is_point_near_obstacle(self, x, y, threshold=0.25):
         if self.lidar_data is None:
@@ -465,6 +433,10 @@ class GazeboEnv:
         if len(data.states) > 0:
             self.collision_detected = True
             rospy.loginfo("Collision detected!")
+            
+            # 记录失败区域
+            robot_x, robot_y, _ = self.get_robot_position()
+            self.failed_zones.append((robot_x, robot_y))
         else:
             self.collision_detected = False
 
@@ -731,31 +703,31 @@ class GazeboEnv:
         reward = 0
         done = False
 
-        # # 將機器人的座標轉換為地圖上的坐標
-        # map_x = int((robot_x - self.map_origin[0]) / self.map_resolution)
-        # map_y = int((robot_y - self.map_origin[1]) / self.map_resolution)
+        # 將機器人的座標轉換為地圖上的坐標
+        map_x = int((robot_x - self.map_origin[0]) / self.map_resolution)
+        map_y = int((robot_y - self.map_origin[1]) / self.map_resolution)
 
-        # map_y = 4000 - map_y
+        map_y = 4000 - map_y
 
-        # # 檢查機器人座標是否在地圖範圍內
-        # if 0 <= map_x < 4000 and 0 <= map_y < 4000:
-        #     # 根據機器人在地圖上的位置給予不同的獎勵或懲罰
-        #     if self.slam_map[map_y, map_x] >= 250:
-        #         reward += 10  # 白色區域 (可走區域)，給予較大獎勵
-        #         print("On the road +10")
-        #     elif self.slam_map[map_y, map_x] <= 190:
-        #         reward -= 100  # 黑色區域 (障礙物)，給予懲罰
-        #         print("Hit obstacle -100")
-        #         done = True  # 碰到障礙物時，直接結束
-        #     elif self.slam_map[map_y, map_x] >190 and self.slam_map[map_y, map_x]<250:
-        #         reward += 5  # 灰色區域 (未知區域)，給予適當獎勵
-        #         print("In unknown area +5")
-        #     else:
-        #         reward -= 10  # 偏離地圖或無法識別的區域，給予懲罰
-        #         print("Not on the road -10")
-        # else:
-        #     reward -= 20  # 機器人在地圖範圍外，給予懲罰
-        #     print("Out of map bounds -20")
+        # 檢查機器人座標是否在地圖範圍內
+        if 0 <= map_x < 4000 and 0 <= map_y < 4000:
+            # 根據機器人在地圖上的位置給予不同的獎勵或懲罰
+            if self.slam_map[map_y, map_x] >= 250:
+                reward += 10  # 白色區域 (可走區域)，給予較大獎勵
+                # print("On the road +10")
+            elif self.slam_map[map_y, map_x] <= 190:
+                reward -= 100  # 黑色區域 (障礙物)，給予懲罰
+                # print("Hit obstacle -100")
+                done = True  # 碰到障礙物時，直接結束
+            elif self.slam_map[map_y, map_x] >190 and self.slam_map[map_y, map_x]<250:
+                reward += 5  # 灰色區域 (未知區域)，給予適當獎勵
+                # print("In unknown area +5")
+            else:
+                reward -= 10  # 偏離地圖或無法識別的區域，給予懲罰
+                # print("Not on the road -10")
+        else:
+            reward -= 20  # 機器人在地圖範圍外，給予懲罰
+            # print("Out of map bounds -20")
 
         # 計算方向誤差的獎勵
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
@@ -864,8 +836,7 @@ class GazeboEnv:
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
-
-
+    
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
