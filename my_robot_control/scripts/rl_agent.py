@@ -7,6 +7,7 @@ import torch.optim as optim
 import os
 from geometry_msgs.msg import Twist, PointStamped
 from sensor_msgs.msg import PointCloud2, Imu
+from std_msgs.msg import Float32
 from gazebo_msgs.srv import SetModelState, GetModelState
 from gazebo_msgs.msg import ModelState, ContactsState
 import sensor_msgs.point_cloud2 as pc2
@@ -20,6 +21,7 @@ import time
 from torch.amp import GradScaler
 import yaml
 from PIL import Image
+import math
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -120,7 +122,8 @@ class GazeboEnv:
     def __init__(self):
         rospy.init_node('gazebo_rl_agent', anonymous=True)
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        self.pub_imu = rospy.Publisher('/imu/data', Imu, queue_size=10)
+        self.slope_angle_publisher = rospy.Publisher('/slope_angle', Float32, queue_size=10)
+        self.imu_subscriber = rospy.Subscriber('/imu/data', Imu, self.imu_callback)
         self.sub_scan = rospy.Subscriber('/velodyne_points', PointCloud2, self.scan_callback)
         self.sub_collision_chassis = rospy.Subscriber('/my_robot/bumper_data', ContactsState, self.collision_callback)
         self.set_model_state = rospy.ServiceProxy('/gazebo/set_model_state', SetModelState)
@@ -393,17 +396,6 @@ class GazeboEnv:
         self.waypoints = optimized_waypoints
         self.current_waypoint_index = 0
 
-
-    def is_in_blind_spot(self, x, y, blind_spot_length=3.36):
-        """
-        檢查給定的點是否位於車輛的盲區內
-        """
-        blind_spot_edges = self.calculate_blind_spot_edge_distances()
-        min_distance_to_edges = min(blind_spot_edges)
-
-        # 如果距離小於盲區長度，則該點在盲區內
-        return min_distance_to_edges < blind_spot_length
-
     # 用於計算當前點與最近障礙物之間的距離
     def calculate_distance_to_nearest_obstacle(self, x, y):
         min_distance = float('inf')
@@ -478,27 +470,16 @@ class GazeboEnv:
     def is_collision_detected(self):
         return self.collision_detected
 
-    def generate_imu_data(self):
-        imu_data = Imu()
-        imu_data.header.stamp = rospy.Time.now()
-        imu_data.header.frame_id = 'chassis'
+    def imu_callback(self, msg):
+        # 提取 pitch 角度並發布坡度數據
+        pitch_angle = self.get_pitch_angle(msg.orientation)
+        self.slope_angle_publisher.publish(pitch_angle)
 
-        imu_data.linear_acceleration.x = np.random.normal(0, 0.1)
-        imu_data.linear_acceleration.y = np.random.normal(0, 0.1)
-        imu_data.linear_acceleration.z = np.random.normal(9.81, 0.1)
-        
-        imu_data.angular_velocity.x = np.random.normal(0, 0.01)
-        imu_data.angular_velocity.y = np.random.normal(0, 0.01)
-        imu_data.angular_velocity.z = np.random.normal(0, 0.01)
-
-        robot_x, robot_y, robot_yaw = self.get_robot_position()
-        quaternion = quaternion_from_euler(0.0, 0.0, robot_yaw)
-        imu_data.orientation.x = quaternion[0]
-        imu_data.orientation.y = quaternion[1]
-        imu_data.orientation.z = quaternion[2]
-        imu_data.orientation.w = quaternion[3]
-
-        return imu_data
+    def get_pitch_angle(self, orientation):
+        # 將 IMU 四元數轉換為 pitch 角度
+        sin_pitch = 2 * (orientation.w * orientation.y - orientation.z * orientation.x)
+        pitch = math.asin(max(-1.0, min(1.0, sin_pitch)))
+        return pitch
 
     def scan_callback(self, data):
         # 确保数据有效
@@ -679,8 +660,7 @@ class GazeboEnv:
         self.pub_cmd_vel.publish(twist)
 
         # 發送 IMU 數據
-        imu_data = self.generate_imu_data()
-        self.pub_imu.publish(imu_data)
+        self.slope_angle_publisher.publish(self.pitch_angle)
 
         rospy.sleep(0.1)
 
@@ -737,10 +717,6 @@ class GazeboEnv:
         self.last_twist = Twist()
         self.pub_cmd_vel.publish(self.last_twist)
 
-        # 重置IMU數據
-        imu_data = self.generate_imu_data()
-        self.pub_imu.publish(imu_data)
-
         # 重置內部狀態變量
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
@@ -748,8 +724,6 @@ class GazeboEnv:
         self.collision_detected = False
 
         return self.state
-
-
 
     def calculate_reward(self, target_x, target_y):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
@@ -799,10 +773,6 @@ class GazeboEnv:
             reward -= 500  # 距離障礙物較近時，給予懲罰
 
         return reward, done
-
-
-
-
 
     def get_robot_position(self):
         try:

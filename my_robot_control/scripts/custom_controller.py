@@ -3,6 +3,7 @@ import rospy
 from geometry_msgs.msg import Twist
 from gazebo_msgs.srv import ApplyJointEffort
 from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Float32
 import math
 
 class CustomController:
@@ -11,7 +12,9 @@ class CustomController:
 
         # 订阅 /cmd_vel 和 /imu 话题
         self.cmd_vel_subscriber = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback)
-        self.imu_subscriber = rospy.Subscriber('/imu/data', Imu, self.imu_callback)
+        # 訂閱坡度角數據
+        self.slope_angle_subscriber = rospy.Subscriber('/slope_angle', Float32, self.slope_angle_callback)
+        self.pitch_angle = 0.0  # 初始化坡度角變數
         self.joint_state_subscriber = rospy.Subscriber('/joint_states', JointState, self.joint_states_callback)
 
         # 定义应用关节力的服务
@@ -44,11 +47,14 @@ class CustomController:
             if name in self.current_steering_angles:
                 self.current_steering_angles[name] = msg.position[i]
 
-    def imu_callback(self, msg):
-        # 获取车辆的倾斜角度 (pitch)
-        orientation_q = msg.orientation
-        _, pitch, _ = self.quaternion_to_euler(orientation_q)
-        self.pitch_angle = pitch
+    def slope_angle_callback(self, msg):
+        # 更新坡度角
+        self.pitch_angle = msg.data
+
+    def calculate_slope_compensation(self):
+        # 使用接收的 pitch_angle 計算坡度補償
+        slope_compensation = self.pitch_angle * 10  # 根據需求調整計算
+        return slope_compensation
 
     def quaternion_to_euler(self, q):
         # 将四元数转换为欧拉角度
