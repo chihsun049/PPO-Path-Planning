@@ -145,6 +145,8 @@ class GazeboEnv:
 
         self.lidar_data = None  # 初始化 lidar_data，避免 AttributeError
 
+        self.pitch_angle = 0.0
+
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
 
@@ -164,7 +166,6 @@ class GazeboEnv:
             # 使用 PIL 讀取PNG檔
             png_image = Image.open(png_path).convert('L')
             self.slam_map = np.array(png_image)  # 轉為NumPy陣列
-
 
     def generate_waypoints(self):
         waypoints = [
@@ -993,8 +994,8 @@ def main():
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
 
-    model_path = "/home/daniel/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
-    best_model_path = "/home/daniel/catkin_ws/src/my_robot_control/scripts/best_model.pth"
+    model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
+    best_model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
     
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
