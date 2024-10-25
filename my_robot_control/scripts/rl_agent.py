@@ -18,8 +18,8 @@ import tf
 from tf.transformations import quaternion_from_euler
 import time
 from torch.amp import GradScaler
-import random
-import matplotlib.pyplot as plt
+import yaml
+from PIL import Image
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -27,18 +27,12 @@ MEMORY_SIZE = 10000
 BATCH_SIZE = 256
 GAMMA = 0.99
 LEARNING_RATE = 0.0003
-PPO_EPOCHS = 10
+PPO_EPOCHS = 5
 CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
-EXPLORATION_NOISE_SCALE = 0.5  # 提高探索噪音係數
-ENTROPY_DECAY = 0.001
-BLIND_SPOT_LENGTH = 3.36
-VEHICLE_LENGTH = 1.0
-VEHICLE_WIDTH = 0.5
-LIDAR_OFFSET = 0.5
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
 class PrioritizedMemory:
@@ -110,7 +104,9 @@ class PrioritizedMemory:
         )
 
     def update_priorities(self, batch_indices, batch_priorities):
+        # 確保每個 priority 是單一標量
         for idx, priority in zip(batch_indices, batch_priorities):
+            # 如果 priority 是 numpy 陣列，檢查其 size
             if priority.size > 1:
                 priority = priority[0]
             self.priorities[idx] = priority.item() + self.epsilon
@@ -148,7 +144,24 @@ class GazeboEnv:
 
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
-        self.optimized_waypoints = []
+
+        # 加载SLAM地圖
+        self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
+
+        self.optimize_waypoints_with_a_star()
+        
+    def load_slam_map(self, yaml_path):
+        # 讀取 YAML 檔案
+        with open(yaml_path, 'r') as file:
+            map_metadata = yaml.safe_load(file)
+            self.map_origin = map_metadata['origin']  # 地圖原點
+            self.map_resolution = map_metadata['resolution']  # 地圖解析度
+            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
+            
+            # 使用 PIL 讀取PNG檔
+            png_image = Image.open(png_path).convert('L')
+            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
+
 
     def generate_waypoints(self):
         waypoints = [
@@ -313,85 +326,127 @@ class GazeboEnv:
             (self.target_x, self.target_y)
         ]
         return waypoints
+    
+    def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
+        img_x = 2000 + gazebo_x * 20
+        img_y = 2000 - gazebo_y * 20
+        return int(img_x), int(img_y)
 
-    def generate_optimized_waypoints(self, max_distance=1.0):
-        if self.lidar_data is None:
-            rospy.logwarn("LiDAR data not yet available, skipping optimization.")
-            return
+    def image_to_gazebo_coords(self, img_x, img_y):
+        gazebo_x = (img_x - 2000) / 20
+        gazebo_y = (2000 - img_y) / 20
+        return gazebo_x, gazebo_y
 
-        optimized_waypoints = [self.waypoints[0]]  # 保留第一個點
-        for i in range(1, len(self.waypoints) - 1):  # 優化中間點
-            current_wp = self.waypoints[i]
-            next_wp = self.waypoints[i + 1]
-            direction = np.arctan2(next_wp[1] - current_wp[1], next_wp[0] - current_wp[0])
-            new_wp_x = current_wp[0] + 0.1 * np.cos(direction)
-            new_wp_y = current_wp[1] + 0.1 * np.sin(direction)
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+        """
+        A* 算法對 50x50 的正方形內進行路徑優化
+        """
+        # 使用 self.gazebo_to_image_coords 而不是 gazebo_to_image_coords
+        img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
 
-            best_x, best_y = new_wp_x, new_wp_y
-            max_distance_to_obstacle = 0
+        img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
-            for angle_offset in np.linspace(-np.pi / 4, np.pi / 4, 16):
-                for offset_distance in np.arange(0.1, max_distance, 0.1):
-                    temp_x = new_wp_x + offset_distance * np.cos(direction + angle_offset)
-                    temp_y = new_wp_y + offset_distance * np.sin(direction + angle_offset)
-                    distance_to_obstacle = self.calculate_distance_to_nearest_obstacle(temp_x, temp_y)
+        best_f_score = float('inf')
+        best_point = (img_start_x, img_start_y)
 
-                    if distance_to_obstacle > max_distance_to_obstacle:
-                        best_x, best_y = temp_x, temp_y
-                        max_distance_to_obstacle = distance_to_obstacle
+        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
+            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
+                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
+                    continue
 
-            optimized_waypoints.append((best_x, best_y))
+                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
+                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-        optimized_waypoints.append(self.waypoints[-1])  # 保留最後一個點
-        self.optimized_waypoints = optimized_waypoints
+                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 2):min(y + grid_size // 2, png_image.shape[0]),
+                                                    max(0, x - grid_size // 2):min(x + grid_size // 2, png_image.shape[1])] < 250)
 
-    def check_obstacle_proximity(self, x, y, threshold=1.2, blind_spot_length=3.36):
+                f = g + h + unwalkable_count * 2
+
+                if f < best_f_score:
+                    best_f_score = f
+                    best_point = (x, y)
+
+        # 使用 self.image_to_gazebo_coords 而不是 image_to_gazebo_coords
+        optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
+
+        return optimized_gazebo_x, optimized_gazebo_y
+
+
+    def optimize_waypoints_with_a_star(self):
+        """
+        使用 A* 算法來優化路徑點
+        """
+        optimized_waypoints = []
+        for i in range(len(self.waypoints) - 1):
+            start_point = (self.waypoints[i][0], self.waypoints[i][1])
+            goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
+            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
+            optimized_waypoints.append(optimized_point)
+
+        # 最終優化點
+        optimized_waypoints.append(self.waypoints[-1])
+
+        # 刪除過濾距離的步驟
+        # self.waypoints = self.filter_waypoints_by_distance(optimized_waypoints)
+        
+        # 直接將優化點用作最終路徑
+        self.waypoints = optimized_waypoints
+        self.current_waypoint_index = 0
+
+
+    def is_in_blind_spot(self, x, y, blind_spot_length=3.36):
+        """
+        檢查給定的點是否位於車輛的盲區內
+        """
+        blind_spot_edges = self.calculate_blind_spot_edge_distances()
+        min_distance_to_edges = min(blind_spot_edges)
+
+        # 如果距離小於盲區長度，則該點在盲區內
+        return min_distance_to_edges < blind_spot_length
+
+    # 用於計算當前點與最近障礙物之間的距離
+    def calculate_distance_to_nearest_obstacle(self, x, y):
+        min_distance = float('inf')
+        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
+            distance = np.sqrt((point[0] - x) ** 2 + (point[1] - y) ** 2)
+            if distance < min_distance:
+                min_distance = distance
+        return min_distance
+
+    def smooth_waypoints(self, waypoints):
+        waypoints_2d = [(wp[0], wp[1]) for wp in waypoints]  # Only keep x and y coordinates
+        smoothed_points = self.bezier_curve(waypoints_2d)
+        smoothed_waypoints = [(pt[0], pt[1]) for pt in smoothed_points]  # No yaw involved
+        self.current_waypoint_index = 0
+        return smoothed_waypoints
+    
+    def bezier_curve(self, waypoints, n_points=100):
+        waypoints = np.array(waypoints)
+        n = len(waypoints) - 1
+
+        def bernstein_poly(i, n, t):
+            return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
+
+        t = np.linspace(0.0, 1.0, n_points)
+        curve = np.zeros((n_points, 2))
+
+        for i in range(n + 1):
+            curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
+
+        return curve
+
+    def is_point_near_obstacle(self, x, y, threshold=0.25):
         if self.lidar_data is None:
             rospy.logwarn("LiDAR data is not available yet.")
             return False
 
         min_distance_to_obstacle = float('inf')
         for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
-            distance = np.sqrt((point[0] - x) ** 2 + (point[1] - y) ** 2)
+            distance = np.sqrt((point[0] - x)**2 + (point[1] - y)**2)
             if distance < min_distance_to_obstacle:
                 min_distance_to_obstacle = distance
 
-        if min_distance_to_obstacle < threshold:
-            return True
-
-        blind_spot_edges = self.calculate_blind_spot_edge_distances()
-        if min(blind_spot_edges) < blind_spot_length:
-            return True
-
-        return False
-
-    def calculate_distance_to_nearest_obstacle(self, x, y):
-        min_distance = float('inf')
-        half_vehicle_length = VEHICLE_LENGTH / 2
-        half_vehicle_width = VEHICLE_WIDTH / 2
-
-        for point in pc2.read_points(self.lidar_data, field_names=("x", "y", "z"), skip_nans=True):
-
-            distance = np.sqrt((point[0] - x) ** 2 + (point[1] - y) ** 2)
-            adjusted_distance = distance - LIDAR_OFFSET
-            if abs(point[1] - y) < half_vehicle_width:  # 若障礙物位於車輛側面範圍內
-                adjusted_distance -= half_vehicle_width
-
-            if adjusted_distance < min_distance:
-                min_distance = adjusted_distance
-        return max(min_distance, 0)
-
-    def smooth_waypoints(self, waypoints, smooth_factor=0.2):
-        smoothed_waypoints = []
-        smoothed_waypoints.append(waypoints[0])  # 保留第一個點
-        for i in range(1, len(waypoints) - 1):
-            prev_wp = np.array(waypoints[i - 1])
-            current_wp = np.array(waypoints[i])
-            next_wp = np.array(waypoints[i + 1])
-            smoothed_wp = current_wp + smooth_factor * (prev_wp + next_wp - 2 * current_wp)
-            smoothed_waypoints.append(tuple(smoothed_wp))
-        smoothed_waypoints.append(waypoints[-1])  # 保留最後一個點
-        return smoothed_waypoints
+        return min_distance_to_obstacle < threshold
     
     def calculate_blind_spot_edge_distances(self):
         # 计算车辆的边缘距离，同时考虑盲区
@@ -452,7 +507,7 @@ class GazeboEnv:
             combined_pcl_data = self.accumulate_lidar_data([data])
 
             if self.current_waypoint_index >= len(self.waypoints):
-                # rospy.logwarn("current_waypoint_index out of range, resetting to last valid index.")
+                rospy.logwarn("current_waypoint_index out of range, resetting to last valid index.")
                 self.current_waypoint_index = len(self.waypoints) - 1
 
             current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
@@ -562,12 +617,12 @@ class GazeboEnv:
         # 判斷是否到達最終目標點
         if np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y]) < 0.5:
             self.done = True
-            reward += 1000  # 給予較高的獎勵表示成功到達終點
+            reward += 10000  # 給予較高的獎勵表示成功到達終點
 
         # 檢查是否發生碰撞
         if self.is_collision_detected():
             rospy.loginfo("Collision detected, resetting environment.")
-            reward = -200.0  # 碰撞懲罰
+            reward = -2000.0  # 碰撞懲罰
             self.reset()  # 重置環境
             return self.state, reward, True, {}
 
@@ -575,7 +630,7 @@ class GazeboEnv:
         distance_to_goal = np.linalg.norm([current_waypoint_x - robot_x, current_waypoint_y - robot_y])
 
         # 如果距離當前路徑點太遠，則跳到下一個路徑點
-        max_waypoint_distance = 5.0  # 你可以根據需要調整此閾值
+        max_waypoint_distance = 5  # 你可以根據需要調整此閾值
         if distance_to_goal > max_waypoint_distance:
             self.current_waypoint_index += 1
             if self.current_waypoint_index >= len(self.waypoints):
@@ -634,6 +689,7 @@ class GazeboEnv:
         return self.state, reward, self.done, {}
 
     def reset(self):
+        # 設置初始機器人位置和姿態
         yaw = -0.0053
         quaternion = quaternion_from_euler(0.0, 0.0, yaw)
         state_msg = ModelState()
@@ -646,6 +702,14 @@ class GazeboEnv:
         state_msg.pose.orientation.z = quaternion[2]
         state_msg.pose.orientation.w = quaternion[3]
 
+        state_msg.twist.linear.x = 0.0
+        state_msg.twist.linear.y = 0.0
+        state_msg.twist.linear.z = 0.0
+        state_msg.twist.angular.x = 0.0
+        state_msg.twist.angular.y = 0.0
+        state_msg.twist.angular.z = 0.0
+
+        # 重置機器人狀態
         rospy.wait_for_service('/gazebo/set_model_state')
         try:
             self.set_model_state(state_msg)
@@ -654,26 +718,30 @@ class GazeboEnv:
 
         rospy.sleep(0.5)
 
-        # 使用優化過的路徑點
-        if hasattr(self, 'optimized_waypoints') and self.optimized_waypoints:
-            self.waypoints = self.optimized_waypoints
+        # 確保使用優化過的路徑點
+        if hasattr(self, 'waypoints') and self.waypoints:
+            rospy.loginfo("Using optimized waypoints for reset.")
         else:
-            self.waypoints = self.generate_waypoints()
+            rospy.loginfo("No optimized waypoints found, generating new waypoints.")
+            self.waypoints = self.generate_waypoints()  # 如果還沒有優化過的路徑點，生成原始路徑
 
-        # Reset attributes
         self.current_waypoint_index = 0
         self.done = False
 
+        # 重置時，使用空的 LiDAR 資料生成占用格
         empty_lidar_data = PointCloud2()
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
         self.state = self.generate_occupancy_grid(empty_lidar_data, current_waypoint_x, current_waypoint_y)
 
+        # 停止機器人運動
         self.last_twist = Twist()
         self.pub_cmd_vel.publish(self.last_twist)
 
+        # 重置IMU數據
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
+        # 重置內部狀態變量
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
         self.previous_distance_to_goal = None
@@ -681,40 +749,60 @@ class GazeboEnv:
 
         return self.state
 
+
+
     def calculate_reward(self, target_x, target_y):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         reward = 0
         done = False
 
-        # 1. 根據方向誤差計算獎勵
+        # # 將機器人的座標轉換為地圖上的坐標
+        # map_x = int((robot_x - self.map_origin[0]) / self.map_resolution)
+        # map_y = int((robot_y - self.map_origin[1]) / self.map_resolution)
+
+        # map_y = 4000 - map_y
+
+        # # 檢查機器人座標是否在地圖範圍內
+        # if 0 <= map_x < 4000 and 0 <= map_y < 4000:
+        #     # 根據機器人在地圖上的位置給予不同的獎勵或懲罰
+        #     if self.slam_map[map_y, map_x] >= 250:
+        #         reward += 10  # 白色區域 (可走區域)，給予較大獎勵
+        #         print("On the road +10")
+        #     elif self.slam_map[map_y, map_x] <= 190:
+        #         reward -= 100  # 黑色區域 (障礙物)，給予懲罰
+        #         print("Hit obstacle -100")
+        #         done = True  # 碰到障礙物時，直接結束
+        #     elif self.slam_map[map_y, map_x] >190 and self.slam_map[map_y, map_x]<250:
+        #         reward += 5  # 灰色區域 (未知區域)，給予適當獎勵
+        #         print("In unknown area +5")
+        #     else:
+        #         reward -= 10  # 偏離地圖或無法識別的區域，給予懲罰
+        #         print("Not on the road -10")
+        # else:
+        #     reward -= 20  # 機器人在地圖範圍外，給予懲罰
+        #     print("Out of map bounds -20")
+
+        # 計算方向誤差的獎勵
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        reward += max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越高
+        yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))  # 確保角度在[-pi, pi]範圍內
+        reward += 10*max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越大
 
-        # 2. 計算距離目標的獎勵或懲罰
-        distance_to_goal = np.linalg.norm([target_x - robot_x, target_y - robot_y])
-        if distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
-            reward += 200  # 若接近目標，則給予較高獎勵
+        # 計算距離目標點的獎勵
+        distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
+        reward += max(0, 10 - distance_to_goal * 2)  # 距離越近，獎勵越高
+
+        # 增加遠離障礙物的安全性獎勵
+        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
+            reward += 50  # 距離障礙物較遠時，給予安全性獎勵
         else:
-            reward -= distance_to_goal  # 隨著距離增加，減少獎勵
-
-        # 3. 安全性獎勵：遠離障礙物的距離越大，獎勵越高
-        # 計算車輛周圍最近的障礙物距離
-        edge_distances = self.calculate_blind_spot_edge_distances()
-        min_distance_to_obstacle = min(edge_distances)  # 四周中最接近的障礙物距離
-        
-        # 若最小距離大於0.5，則隨距離增加獎勵
-        if min_distance_to_obstacle > 0.5:
-            reward += (min_distance_to_obstacle - 0.5) * 50  # 隨著距離增加，獎勵逐步上升
-        else:
-            reward -= 100  # 若接近障礙物，則減少獎勵
-
-        # 4. 盲區懲罰：如果盲區內有障礙物，則給予懲罰
-        for distance in edge_distances:
-            if distance < BLIND_SPOT_LENGTH:
-                reward -= 100  # 若盲區內有障礙物，則給予懲罰
+            reward -= 500  # 距離障礙物較近時，給予懲罰
 
         return reward, done
+
+
+
+
 
     def get_robot_position(self):
         try:
@@ -743,8 +831,30 @@ class GazeboEnv:
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
         lookahead_distance = 2.0 + 0.5 * linear_speed  # 根據速度調整前視距離
 
-        # 找到距離當前最近的路徑點
-        closest_index = self.find_closest_waypoint(robot_x, robot_y)
+        # 定義角度範圍，以當前車輛的yaw為中心
+        angle_range = np.deg2rad(40)  # ±35度的範圍
+        closest_index = None
+        min_distance = float('inf')
+
+        # 尋找該範圍內的最近路徑點
+        for i in range(self.current_waypoint_index, len(self.waypoints)):
+            wp_x, wp_y = self.waypoints[i]
+            dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
+            direction_to_wp = np.arctan2(wp_y - robot_y, wp_x - robot_x)
+
+            # 計算該點相對於當前車輛朝向的角度
+            yaw_diff = direction_to_wp - robot_yaw
+            yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))  # 確保角度在[-pi, pi]範圍內
+
+            # 如果點位於yaw ± 35度範圍內，並且距離更近
+            if np.abs(yaw_diff) < angle_range and dist_to_wp < min_distance:
+                min_distance = dist_to_wp
+                closest_index = i
+
+        # 如果沒有找到符合條件的點，則繼續使用原始最近點
+        if closest_index is None:
+            closest_index = self.find_closest_waypoint(robot_x, robot_y)
+
         target_index = closest_index
 
         # 根據前視距離選擇參考的路徑點
@@ -757,24 +867,21 @@ class GazeboEnv:
                 target_index = i
                 break
 
-        # 檢查 target_index 是否有效
-        if target_index >= len(self.waypoints):
-            rospy.logwarn("Target index out of bounds, returning default action")
-            return np.array([0.0, 0.0])  # 返回一個默認動作
-
         # 獲取前視點座標
         target_x, target_y = self.waypoints[target_index]
 
         # 計算前視點的方向
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
-        yaw_error = direction_to_target - robot_yaw  # 確保 yaw_error 在使用前被正確賦值
-        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
+        yaw_error = direction_to_target - robot_yaw
+        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))  # 確保角度在[-pi, pi]範圍內
 
         # 根據角度誤差調整速度
-        if np.abs(yaw_error) > 0.2:
-            linear_speed = 1.0  # 調整轉向時的速度更小
+        if np.abs(yaw_error) > 0.3:
+            linear_speed = 0.5
+        elif np.abs(yaw_error) > 0.1:
+            linear_speed = 1.0
         else:
-            linear_speed = 1.5  # 平坦路徑下加速
+            linear_speed = 1.5
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
@@ -786,6 +893,7 @@ class GazeboEnv:
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
+
 
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
@@ -800,8 +908,8 @@ class GazeboEnv:
     
     def adjust_control_params(self, linear_speed):
         if linear_speed <= 0.5:
-            kp = 0.6  # 增加比例增益
-            kd = 0.3  # 增加微分增益
+            kp = 0.5
+            kd = 0.2
         elif linear_speed <= 1.0:
             kp = 0.4
             kd = 0.3
@@ -809,25 +917,6 @@ class GazeboEnv:
             kp = 0.3
             kd = 0.4
         return kp, kd
-    
-def plot_path(waypoints, episode):
-    x_vals = [pt[0] for pt in waypoints]
-    y_vals = [pt[1] for pt in waypoints]
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(x_vals, y_vals, 'bo-', label="Path")
-    plt.plot(x_vals[0], y_vals[0], 'go', label="Start")
-    plt.plot(x_vals[-1], y_vals[-1], 'ro', label="End")
-    plt.xlabel("X")
-    plt.ylabel("Y")
-    plt.title(f"Vehicle Path Visualization - Episode {episode}")
-    plt.legend()
-
-    # 確定圖片保存路徑
-    save_path = f"/home/chihsun/catkin_ws/src/my_robot_control/scripts/episode_{episode}_path.png"
-    plt.savefig(save_path)
-    print(f"Saved path plot for Episode {episode} at {save_path}")
-    plt.close()
 
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
@@ -848,7 +937,6 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
         self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
-        self.yaw_head = nn.Linear(128, 1)
 
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
@@ -876,59 +964,49 @@ class ActorCritic(nn.Module):
         action_std = torch.exp(action_log_std)
 
         value = self.critic(x)
-        yaw = self.yaw_head(x)
 
-        return action_mean, action_std, value, yaw
+        return action_mean, action_std, value
 
     def act(self, state):
-        action_mean, action_std, _, yaw = self(state)
-        action = action_mean + action_std * torch.randn_like(action_std) * EXPLORATION_NOISE_SCALE
+        action_mean, action_std, _ = self(state)
+        action = action_mean + action_std * torch.randn_like(action_std)
         action = torch.tanh(action)
         max_action = torch.tensor([2.0, 0.6], device=action.device)
         min_action = torch.tensor([-2.0, -0.6], device=action.device)
         action = min_action + (action + 1) * (max_action - min_action) / 2
+        return action.detach()
 
-        if random.random() < 0.2:  # 20%的概率選擇隨機動作
-            action = min_action + (torch.rand_like(action) * (max_action - min_action))
-        
-        return action.detach(), yaw.detach()
-    
     def evaluate(self, state, action):
-        action_mean, action_std, value, yaw = self(state)
+        action_mean, action_std, value = self(state)
         dist = torch.distributions.Normal(action_mean, action_std)
         action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
         dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        return action_log_probs, value, dist_entropy, yaw
+        return action_log_probs, value, dist_entropy
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
-    for epoch in range(ppo_epochs):
+    for _ in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
         
-        adjusted_lr = LEARNING_RATE * (1 + 0.1 * (reward_batch.mean().item() / (reward_batch.std().item() + 1e-5)))
+        adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
 
         with torch.no_grad():
-            old_log_probs, _, _, _ = model.evaluate(state_batch, action_batch)
+            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
         old_log_probs = old_log_probs.detach()
 
         for _ in range(PPO_EPOCHS):
             with torch.amp.autocast('cuda'):
-                log_probs, state_values, dist_entropy, _ = model.evaluate(state_batch, action_batch)
+                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
                 advantages = reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach() - state_values
 
                 ratio = (log_probs - old_log_probs).exp()
-                
-                clip_param = CLIP_PARAM * (1 - 0.1 * (reward_batch.std().item() / (reward_batch.mean().item() + 1e-5)))
                 surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - clip_param, 1 + clip_param) * advantages
+                surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = nn.MSELoss()(state_values, reward_batch + (1 - done_batch) * GAMMA * model(next_state_batch)[2].detach())
-
-                entropy_coef = 0.02 * np.exp(-ENTROPY_DECAY * epoch)
-                entropy_loss = -entropy_coef * dist_entropy.mean()
-                
+                entropy_loss = -0.01 * dist_entropy.mean()  # 添加熵正则项
                 loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
             scaler.scale(loss).backward()
@@ -945,8 +1023,8 @@ def main():
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
 
-    model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
-    best_model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
+    model_path = "/home/daniel/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
+    best_model_path = "/home/daniel/catkin_ws/src/my_robot_control/scripts/best_model.pth"
     
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -956,33 +1034,32 @@ def main():
 
     num_episodes = 1000000
     best_test_reward = -np.inf
-    exploration_noise_scale = 1.0
 
     for e in range(num_episodes):
-        if e % 100 == 0 and e > 0:
-            recent_reward = total_reward if total_reward is not None else 0
-            if recent_reward < best_test_reward * 0.9:
-                exploration_noise_scale = min(1.5, exploration_noise_scale * 1.1)
-            else:
-                exploration_noise_scale = max(0.5, exploration_noise_scale * 0.9)  # 調整噪音縮放，減少隨機性
-            print(f"Episode {e}, Adjusted Exploration Noise Scale: {exploration_noise_scale}")
+        # 在每個 episode 開始時優化路徑點
+        env.optimize_waypoints_with_a_star()
+
+        # 打印優化後的 waypoints
+        print(f"Optimized waypoints for episode {e}: {env.waypoints}")
 
         state = env.reset()
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         total_reward = 0
+
         start_time = time.time()
 
         for time_step in range(1500):
-            action, yaw = model.act(state)
+            action = model.act(state)
             action_np = action.detach().cpu().numpy()
-            yaw_np = yaw.detach().cpu().numpy()
 
             next_state, reward, done, _ = env.step(action_np)
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
-            
+
             memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
+
             state = next_state
             total_reward += reward
+
             elapsed_time = time.time() - start_time
 
             if done or elapsed_time > 240:
@@ -995,10 +1072,6 @@ def main():
         memory.clear()
 
         print(f"Episode {e}, Total Reward: {total_reward}")
-
-        env.generate_optimized_waypoints()
-
-        plot_path(env.waypoints, e)
 
         if total_reward > best_test_reward:
             best_test_reward = total_reward
