@@ -150,6 +150,8 @@ class GazeboEnv:
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
 
+        self.failed_zones = []  # 用來記錄多次碰撞失敗的區域
+
         # 加载SLAM地圖
         self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
 
@@ -341,34 +343,35 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=30):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
 
-        # 狹長區域範圍
         for x in range(img_start_x - grid_size // 3, img_start_x + grid_size // 3):
             for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
                 if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
                     continue
 
+                # 跳過失敗區域附近的點
+                if any(np.sqrt((fx - x)**2 + (fy - y)**2) < 10 for fx, fy in self.failed_zones):
+                    continue
+
                 g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 加重牆外障礙物的懲罰
                 unwalkable_count = np.sum(png_image[max(0, y - grid_size // 3):min(y + grid_size // 3, png_image.shape[0]),
                                                     max(0, x - grid_size // 3):min(x + grid_size // 3, png_image.shape[1])] < 250)
 
-                f = g + h + unwalkable_count * 5  # 增加懲罰倍率來限制牆外區域
+                f = g + h + unwalkable_count * 10
 
                 if f < best_f_score:
                     best_f_score = f
                     best_point = (x, y)
 
         optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
-
         return optimized_gazebo_x, optimized_gazebo_y
 
     def optimize_waypoints_with_a_star(self):
@@ -434,7 +437,7 @@ class GazeboEnv:
             self.collision_detected = True
             rospy.loginfo("Collision detected!")
             
-            # 记录失败区域
+            # 記錄失敗區域
             robot_x, robot_y, _ = self.get_robot_position()
             self.failed_zones.append((robot_x, robot_y))
         else:
@@ -706,44 +709,37 @@ class GazeboEnv:
         # 將機器人的座標轉換為地圖上的坐標
         map_x = int((robot_x - self.map_origin[0]) / self.map_resolution)
         map_y = int((robot_y - self.map_origin[1]) / self.map_resolution)
-
         map_y = 4000 - map_y
 
-        # 檢查機器人座標是否在地圖範圍內
         if 0 <= map_x < 4000 and 0 <= map_y < 4000:
-            # 根據機器人在地圖上的位置給予不同的獎勵或懲罰
             if self.slam_map[map_y, map_x] >= 250:
-                reward += 10  # 白色區域 (可走區域)，給予較大獎勵
-                # print("On the road +10")
+                reward += 10  # 可行區域
             elif self.slam_map[map_y, map_x] <= 190:
-                reward -= 100  # 黑色區域 (障礙物)，給予懲罰
-                # print("Hit obstacle -100")
-                done = True  # 碰到障礙物時，直接結束
-            elif self.slam_map[map_y, map_x] >190 and self.slam_map[map_y, map_x]<250:
-                reward += 5  # 灰色區域 (未知區域)，給予適當獎勵
-                # print("In unknown area +5")
-            else:
-                reward -= 10  # 偏離地圖或無法識別的區域，給予懲罰
-                # print("Not on the road -10")
-        else:
-            reward -= 20  # 機器人在地圖範圍外，給予懲罰
-            # print("Out of map bounds -20")
+                reward -= 200  # 障礙物
+                done = True
+            elif 190 < self.slam_map[map_y, map_x] < 250:
+                reward -= 50  # 灰色區域
 
-        # 計算方向誤差的獎勵
+        else:
+            reward -= 20  # 地圖範圍外
+
+        # 增加安全性懲罰，確保機器人遠離牆外
+        if self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
+            reward -= 500  # 若太接近牆外則給予懲罰
+
+        # 鼓勵機器人保持在牆內側
+        safe_zone_threshold = 0.8  # 調整該值確保機器人保持在牆內側
+        distance_to_wall = self.calculate_distance_to_nearest_obstacle(robot_x, robot_y)
+        if distance_to_wall > safe_zone_threshold:
+            reward += 50  # 鼓勵機器人保持在牆內側
+
+        # 方向和距離獎勵
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_diff = np.abs(direction_to_target - robot_yaw)
-        yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))  # 確保角度在[-pi, pi]範圍內
-        reward += 10*max(0, 5 - yaw_diff * 5)  # 誤差越小，獎勵越大
-
-        # 計算距離目標點的獎勵
+        yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
+        reward += 10 * max(0, 5 - yaw_diff * 5)
         distance_to_goal = np.sqrt((target_x - robot_x) ** 2 + (target_y - robot_y) ** 2)
-        reward += max(0, 10 - distance_to_goal * 2)  # 距離越近，獎勵越高
-
-        # 增加遠離障礙物的安全性獎勵
-        if not self.is_point_near_obstacle(robot_x, robot_y, threshold=0.3):
-            reward += 50  # 距離障礙物較遠時，給予安全性獎勵
-        else:
-            reward -= 500  # 距離障礙物較近時，給予懲罰
+        reward += max(0, 10 - distance_to_goal * 2)
 
         return reward, done
 
