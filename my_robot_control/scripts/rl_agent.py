@@ -455,19 +455,18 @@ class GazeboEnv:
         new_neighbor = self.adjust_neighbor(neighbor, action)
         return new_neighbor
         
-    def generate_rl_state(self, current, neighbor, f_score):
-        # 提取地圖局部區域
+    def generate_rl_state(self, current, neighbors, f_score):
         local_map = self.extract_local_map(current)
-        # 計算與目標的距離
-        distance_to_goal = f_score[neighbor]
-        # 將這些信息打包成輸入向量
-        state = np.concatenate([current, neighbor, [distance_to_goal]])
-        return torch.tensor(state, dtype=torch.float32).to(device)
+        neighbor_features = [f_score.get(neighbor, float('inf')) for neighbor in neighbors]
+        free_flags = [self.is_line_free(self.slam_map, current, neighbor) for neighbor in neighbors]
+        return np.concatenate([local_map.flatten(), neighbor_features, free_flags])
     
     def adjust_neighbor(self, neighbor, action):
-        # 將動作作為對鄰居坐標的小偏移量
-        dx, dy = action[0].item(), action[1].item()
-        return (neighbor[0] + dx, neighbor[1] + dy)
+        distance = np.linalg.norm(action[:2])
+        angle = np.arctan2(action[1], action[0])
+        dx = distance * np.cos(angle)
+        dy = distance * np.sin(angle)
+        return neighbor[0] + dx, neighbor[1] + dy
     
     def extract_local_map(self, current, size=64):
         img_x, img_y = self.gazebo_to_image_coords(*current)
