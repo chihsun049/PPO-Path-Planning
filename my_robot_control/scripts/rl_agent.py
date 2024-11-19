@@ -124,6 +124,8 @@ class PrioritizedMemory:
 class GazeboEnv:
     def __init__(self, model):
         rospy.init_node('gazebo_rl_agent', anonymous=True)
+        if model is None:
+            raise ValueError("A valid model must be provided to GazeboEnv.")
         self.model = model
         self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.pub_imu = rospy.Publisher('/imu/data', Imu, queue_size=10)
@@ -144,6 +146,7 @@ class GazeboEnv:
         self.collision_detected = False
         self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
         self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
+        self.max_neighbors = 8  # 根據可能的鄰居數設置
 
         self.max_no_progress_steps = 10
         self.no_progress_steps = 0
@@ -358,8 +361,36 @@ class GazeboEnv:
         gazebo_x = (img_x - 2000) / 20
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
+    
+    def heuristic(self, current, goal):
+        """
+        計算啟發式估計成本（比如歐幾里得距離）。
+        """
+        return np.linalg.norm(np.array(current) - np.array(goal))
+    
+    def get_neighbors(self, current):
+        """
+        獲取當前節點的鄰居節點，並檢查通行性。
+        """
+        x, y = current
+        possible_moves = [
+            (x + 1, y), (x - 1, y),
+            (x, y + 1), (x, y - 1),
+            (x + 1, y + 1), (x - 1, y + 1),
+            (x + 1, y - 1), (x - 1, y - 1)
+        ]
 
-    def a_star_with_rl_intervention(self, start, goal):
+        neighbors = []
+        for nx, ny in possible_moves:
+            # 確保 nx 和 ny 是整數，並檢查是否在地圖範圍內
+            nx, ny = int(nx), int(ny)
+            if 0 <= nx < self.slam_map.shape[1] and 0 <= ny < self.slam_map.shape[0]:
+                # 檢查地圖值是否表示可通行
+                if self.slam_map[ny, nx] >= 250:
+                    neighbors.append((nx, ny))
+        return neighbors
+
+    def a_star_with_rl_intervention(self, slam_map, start, goal):
         """
         A* 算法，結合強化學習模型來選擇擴展點，並讓模型在正常運行時學習擴展點的選擇策略。
         """
@@ -380,7 +411,7 @@ class GazeboEnv:
             # RL 模型參與：選擇擴展點
             state = self.generate_rl_state(current, neighbors, f_score)  # 獲取當前狀態
             rl_action, rl_action_probs = self.model.act(state)  # 模型決策
-            rl_selected_neighbor = neighbors[rl_action]
+            rl_selected_neighbor = neighbors[rl_action % len(neighbors)]
 
             # 比較 RL 選擇與原始邏輯
             a_star_selected_neighbor = min(neighbors, key=lambda n: f_score.get(n, float('inf')))
@@ -456,10 +487,17 @@ class GazeboEnv:
         return new_neighbor
         
     def generate_rl_state(self, current, neighbors, f_score):
-        local_map = self.extract_local_map(current)
-        neighbor_features = [f_score.get(neighbor, float('inf')) for neighbor in neighbors]
-        free_flags = [self.is_line_free(self.slam_map, current, neighbor) for neighbor in neighbors]
-        return np.concatenate([local_map.flatten(), neighbor_features, free_flags])
+        local_map = self.extract_local_map(current)  # 提取 64x64 區域
+        distance_to_goal = f_score[current]
+        
+        # 構建狀態
+        state = np.zeros((3, 64, 64), dtype=np.float32)
+        state[0, :, :] = local_map
+        state[1, :, :] = current[0]  # x 坐標信息
+        state[2, :, :] = current[1]  # y 坐標信息
+        
+        # 轉換為張量並添加批次維度
+        return torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
     
     def adjust_neighbor(self, neighbor, action):
         distance = np.linalg.norm(action[:2])
@@ -467,6 +505,29 @@ class GazeboEnv:
         dx = distance * np.cos(angle)
         dy = distance * np.sin(angle)
         return neighbor[0] + dx, neighbor[1] + dy
+    
+    def act(self, state):
+        # 確保輸入為 4D 張量
+        if isinstance(state, np.ndarray):
+            state = torch.tensor(state, dtype=torch.float32).to(device)
+
+        while state.dim() < 4:
+            state = state.unsqueeze(0)  # 添加批次維度
+
+        # 驗證輸入維度
+        if state.size(1) != 3:  # 通道數應為 3
+            raise ValueError(f"Expected 3 channels, but got {state.size(1)} channels.")
+
+        action_logits, _ = self(state)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        action = torch.multinomial(action_probs, 1)
+        action = action.item()  # 轉為整數
+
+        # 限制動作範圍（根據最大可能鄰居數進行限制）
+        if hasattr(self, 'max_neighbors'):
+            action = action % self.max_neighbors
+
+        return action, action_probs
     
     def extract_local_map(self, current, size=64):
         img_x, img_y = self.gazebo_to_image_coords(*current)
@@ -477,8 +538,8 @@ class GazeboEnv:
         end_y = min(self.slam_map.shape[0], img_y + half_size)
 
         local_map = np.zeros((size, size), dtype=np.float32)
-        local_map_slice = self.slam_map[start_y:end_y, start_x:end_x]
-        local_map[:local_map_slice.shape[0], :local_map_slice.shape[1]] = local_map_slice
+        map_slice = self.slam_map[start_y:end_y, start_x:end_x]
+        local_map[:map_slice.shape[0], :map_slice.shape[1]] = map_slice
 
         return local_map
 
@@ -1049,8 +1110,8 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             scaler.update()
 
 def main():
-    env = GazeboEnv(None)  # 初始化環境
-    model = ActorCritic(env.observation_space, 2).to(device)  # 強化學習模型，假設動作空間為 2
+    model = ActorCritic((3, 64, 64), 8).to(device)  # 假設輸出為 8 個候選點
+    env = GazeboEnv(model)  # 傳入模型
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
