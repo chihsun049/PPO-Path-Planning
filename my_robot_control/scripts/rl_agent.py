@@ -45,6 +45,16 @@ class PrioritizedMemory:
         self.epsilon = 1e-5
 
     def add(self, state, action, reward, done, next_state):
+        if isinstance(state, np.ndarray):
+            state = torch.tensor(state, dtype=torch.float32)
+        if isinstance(action, np.ndarray):
+            action = torch.tensor(action, dtype=torch.float32)
+        if isinstance(reward, np.ndarray):
+            reward = torch.tensor(reward, dtype=torch.float32)
+        if isinstance(done, np.ndarray):
+            done = torch.tensor(done, dtype=torch.float32)
+        if isinstance(next_state, np.ndarray):
+            next_state = torch.tensor(next_state, dtype=torch.float32)
         if state is None or action is None or reward is None or done is None or next_state is None:
             rospy.logwarn("Warning: Attempted to add None to memory, skipping entry.")
             return
@@ -95,8 +105,9 @@ class PrioritizedMemory:
         states, actions, rewards, dones, next_states = batch
 
         # Ensure all states are 4D tensors
-        states = [s if s.dim() == 4 else s.view(1, 3, 64, 64) for s in states]
-        next_states = [ns if ns.dim() == 4 else ns.view(1, 3, 64, 64) for ns in next_states]
+        # 在 memory.sample() 返回數據後統一維度
+        states = torch.stack([s.view(1, 3, 64, 64) if s.dim() == 3 else s for s in states])
+        next_states = torch.stack([ns.view(1, 3, 64, 64) if ns.dim() == 3 else ns for ns in next_states])
 
         return (
             torch.stack(states).to(device),
@@ -368,32 +379,22 @@ class GazeboEnv:
         """
         return np.linalg.norm(np.array(current) - np.array(goal))
     
-    def get_neighbors(self, current):
+    def get_neighbors(self, current, search_radius=25):
         """
-        獲取當前節點的鄰居節點，並檢查通行性。
+        獲取當前節點周圍 `50x50` 的鄰居節點（以像素為單位）。
         """
         x, y = current
-        possible_moves = [
-            (x + 1, y), (x - 1, y),
-            (x, y + 1), (x, y - 1),
-            (x + 1, y + 1), (x - 1, y + 1),
-            (x + 1, y - 1), (x - 1, y - 1)
-        ]
-
         neighbors = []
-        for nx, ny in possible_moves:
-            # 確保 nx 和 ny 是整數，並檢查是否在地圖範圍內
-            nx, ny = int(nx), int(ny)
-            if 0 <= nx < self.slam_map.shape[1] and 0 <= ny < self.slam_map.shape[0]:
-                # 檢查地圖值是否表示可通行
-                if self.slam_map[ny, nx] >= 250:
-                    neighbors.append((nx, ny))
+        for dx in range(-search_radius, search_radius + 1):
+            for dy in range(-search_radius, search_radius + 1):
+                nx, ny = int(x + dx), int(y + dy)
+                # 確保鄰居節點在地圖範圍內，且不是障礙物
+                if 0 <= nx < self.slam_map.shape[1] and 0 <= ny < self.slam_map.shape[0]:
+                    if self.slam_map[ny, nx] >= 250:  # 250 表示可通行
+                        neighbors.append((nx, ny))
         return neighbors
 
     def a_star_with_rl_intervention(self, slam_map, start, goal):
-        """
-        A* 算法，結合強化學習模型來選擇擴展點，並讓模型在正常運行時學習擴展點的選擇策略。
-        """
         open_set = PriorityQueue()
         open_set.put((0, start))
         came_from = {}
@@ -406,43 +407,26 @@ class GazeboEnv:
             if current == goal:
                 return self.reconstruct_path(came_from, current)
 
+            # 提取節點的 50x50 局部地圖
+            local_map = self.extract_local_map(current, size=50)
+
+            # 將局部地圖和當前狀態輸入到 RL 模型
+            state = self.generate_rl_state(local_map, current, f_score)
+            rl_action, _ = self.model.act(state)
+            rl_selected_neighbor = self.adjust_neighbor_from_action(current, rl_action)
+
+            if rl_selected_neighbor not in neighbors:
+                neighbors.append(rl_selected_neighbor)
             neighbors = self.get_neighbors(current)
-            
-            # RL 模型參與：選擇擴展點
-            state = self.generate_rl_state(current, neighbors, f_score)  # 獲取當前狀態
-            rl_action, rl_action_probs = self.model.act(state)  # 模型決策
-            rl_selected_neighbor = neighbors[rl_action % len(neighbors)]
-
-            # 比較 RL 選擇與原始邏輯
-            a_star_selected_neighbor = min(neighbors, key=lambda n: f_score.get(n, float('inf')))
-
-            # 獎勵設計：選擇點是否接近目標
-            reward = self.calculate_action_reward(
-                current, rl_selected_neighbor, a_star_selected_neighbor, goal
-            )
-            
-            # 記錄模型的行為（加入記憶體）
-            next_state = self.generate_rl_state(rl_selected_neighbor, self.get_neighbors(rl_selected_neighbor), f_score)
-            self.memory.add(state, rl_action, reward, False, next_state)
-
             for neighbor in neighbors:
-                if not self.is_line_free(self.slam_map, current, neighbor):
-                    continue  # 忽略不可行的鄰居
-
                 tentative_g_score = g_score[current] + self.cost(current, neighbor)
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     g_score[neighbor] = tentative_g_score
                     f_score[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
-
-                    if neighbor == rl_selected_neighbor:
-                        # 使用 RL 模型的選擇
-                        open_set.put((f_score[neighbor], neighbor))
-                    else:
-                        # 使用 A* 原始邏輯選擇
-                        open_set.put((f_score[neighbor], neighbor))
                     came_from[neighbor] = current
+                    open_set.put((f_score[neighbor], neighbor))
 
-        return None  # 無法到達目標
+        return None  # 如果無法到達目標
     
     def calculate_action_reward(self, current, rl_neighbor, a_star_neighbor, goal):
         """
@@ -463,19 +447,15 @@ class GazeboEnv:
     def is_line_free(self, png_image, start, end):
         """
         檢查從 start 到 end 的直線上是否有障礙物。
-        返回障礙物比例而非布爾值。
+        使用 Bresenham 演算法來生成線上的點，並檢查這些點是否可通行。
         """
-        rr, cc = line(start[1], start[0], end[1], end[0])  # 獲取直線上的點
-        obstacle_count = 0
-        total_points = 0
-
+        rr, cc = line(start[1], start[0], end[1], end[0])  # 使用 skimage.draw.line 獲取直線上的點
         for r, c in zip(rr, cc):
-            if 0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]:
-                total_points += 1
-                if png_image[r, c] < 250:  # 假設低於 250 為障礙物
-                    obstacle_count += 1
-
-        return obstacle_count / total_points if total_points > 0 else 1.0
+            if not (0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]):
+                return False  # 如果點超出圖片範圍
+            if png_image[r, c] < 250:  # 假設低於 250 為障礙物
+                return False  # 直線上有障礙物
+        return True
     
     def rl_intervention(self, current, neighbor, f_score):
         """
@@ -486,17 +466,15 @@ class GazeboEnv:
         new_neighbor = self.adjust_neighbor(neighbor, action)
         return new_neighbor
         
-    def generate_rl_state(self, current, neighbors, f_score):
-        local_map = self.extract_local_map(current)  # 提取 64x64 區域
-        distance_to_goal = f_score[current]
-        
-        # 構建狀態
-        state = np.zeros((3, 64, 64), dtype=np.float32)
-        state[0, :, :] = local_map
+    def generate_rl_state(self, local_map, current, f_score):
+        """
+        根據節點的局部地圖和路徑資訊生成狀態。
+        """
+        state = np.zeros((3, 50, 50), dtype=np.float32)  # 適配 50x50
+        state[0, :, :] = local_map  # 障礙物分布
         state[1, :, :] = current[0]  # x 坐標信息
         state[2, :, :] = current[1]  # y 坐標信息
-        
-        # 轉換為張量並添加批次維度
+
         return torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
     
     def adjust_neighbor(self, neighbor, action):
@@ -506,30 +484,10 @@ class GazeboEnv:
         dy = distance * np.sin(angle)
         return neighbor[0] + dx, neighbor[1] + dy
     
-    def act(self, state):
-        # 確保輸入為 4D 張量
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32).to(device)
-
-        while state.dim() < 4:
-            state = state.unsqueeze(0)  # 添加批次維度
-
-        # 驗證輸入維度
-        if state.size(1) != 3:  # 通道數應為 3
-            raise ValueError(f"Expected 3 channels, but got {state.size(1)} channels.")
-
-        action_logits, _ = self(state)
-        action_probs = torch.softmax(action_logits, dim=-1)
-        action = torch.multinomial(action_probs, 1)
-        action = action.item()  # 轉為整數
-
-        # 限制動作範圍（根據最大可能鄰居數進行限制）
-        if hasattr(self, 'max_neighbors'):
-            action = action % self.max_neighbors
-
-        return action, action_probs
-    
-    def extract_local_map(self, current, size=64):
+    def extract_local_map(self, current, size=50):
+        """
+        提取節點周圍 `50x50` 的局部地圖資訊。
+        """
         img_x, img_y = self.gazebo_to_image_coords(*current)
         half_size = size // 2
         start_x = max(0, img_x - half_size)
@@ -537,36 +495,99 @@ class GazeboEnv:
         end_x = min(self.slam_map.shape[1], img_x + half_size)
         end_y = min(self.slam_map.shape[0], img_y + half_size)
 
+        # 初始化局部地圖並填充數據
         local_map = np.zeros((size, size), dtype=np.float32)
         map_slice = self.slam_map[start_y:end_y, start_x:end_x]
         local_map[:map_slice.shape[0], :map_slice.shape[1]] = map_slice
 
         return local_map
+    
+    def pure_a_star(self, slam_map, start, goal):
+        """
+        單純的 A* 算法實現，無 RL 模型介入。
+        """
+        open_set = PriorityQueue()
+        open_set.put((0, start))
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
+
+        while not open_set.empty():
+            _, current = open_set.get()
+
+            if current == goal:
+                return self.reconstruct_path(came_from, current)
+
+            neighbors = self.get_neighbors(current)
+            for neighbor in neighbors:
+                # 檢查從 current 到 neighbor 是否有障礙物
+                if not self.is_line_free(slam_map, current, neighbor):
+                    continue
+
+                tentative_g_score = g_score[current] + self.cost(current, neighbor)
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
+                    open_set.put((f_score[neighbor], neighbor))
+
+        return None  # 如果無法到達目標
 
     def optimize_waypoints_with_a_star(self):
         """
-        使用 A* 算法來優化路徑點，但僅在尚未計算過時執行
+        使用純 A* 來優化路徑點，但僅在尚未計算過時執行。
         """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Using previously calculated optimized waypoints.")
             self.waypoints = self.optimized_waypoints  # 使用已計算的優化路徑
             return
 
-        rospy.loginfo("Calculating optimized waypoints for the first time using A*.")
+        rospy.loginfo("Calculating optimized waypoints for the first time using pure A*.")
         optimized_waypoints = []
+
+        # 地圖的有效範圍
+        map_height, map_width = self.slam_map.shape
+
         for i in range(len(self.waypoints) - 1):
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-            optimized_point = self.a_star_with_rl_intervention(self.slam_map, start_point, goal_point)
-            optimized_waypoints.append(optimized_point)
 
-        # 最後一個終點加入到優化後的路徑點列表中
-        optimized_waypoints.append(self.waypoints[-1])
-        
+            # 將起點和目標點轉換為地圖坐標
+            img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
+            img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
+
+            # 檢查邊界和可通行性
+            if not (0 <= img_start_x < map_width and 0 <= img_start_y < map_height):
+                rospy.logwarn(f"Start point {start_point} is out of bounds. Keeping original waypoint.")
+                optimized_waypoints.append(start_point)
+                continue
+
+            if not (0 <= img_goal_x < map_width and 0 <= img_goal_y < map_height):
+                rospy.logwarn(f"Goal point {goal_point} is out of bounds. Keeping original waypoint.")
+                optimized_waypoints.append(goal_point)
+                continue
+
+            if self.slam_map[img_start_y, img_start_x] < 250:
+                rospy.logwarn(f"Start point {start_point} is in an obstacle. Keeping original waypoint.")
+                optimized_waypoints.append(start_point)
+                continue
+
+            if self.slam_map[img_goal_y, img_goal_x] < 250:
+                rospy.logwarn(f"Goal point {goal_point} is in an obstacle. Keeping original waypoint.")
+                optimized_waypoints.append(goal_point)
+                continue
+
+            # 調用純 A* 算法
+            optimized_path = self.pure_a_star(self.slam_map, start_point, goal_point)
+            if optimized_path:
+                optimized_waypoints.extend(optimized_path)
+            else:
+                rospy.logwarn(f"Failed to optimize segment {i} ({start_point} -> {goal_point}). Keeping original waypoint.")
+                optimized_waypoints.append(goal_point)  # 如果失敗，保持原路徑點
+
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
-        self.optimized_waypoints_calculated = True  # 設定標記，表示已計算過
-
+        self.optimized_waypoints_calculated = True
 
     def bezier_curve(self, waypoints, n_points=100):
         waypoints = np.array(waypoints)
@@ -1041,26 +1062,14 @@ class ActorCritic(nn.Module):
         return action_logits, value
 
     def act(self, state):
-        # 確保 state 是 tensor，如果是 numpy，轉換為 tensor
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32).to(device)
-
-        # 去除多餘維度直到 <= 4
-        while state.dim() > 4:
-            state = state.squeeze(0)
-
-        # 添加缺少的維度直到 = 4
-        while state.dim() < 4:
-            state = state.unsqueeze(0)
-
-        # 最終確認 state 是 4D
-        if state.dim() != 4:
-            raise ValueError(f"Expected state to be 4D, but got {state.dim()}D")
-
+        if state.dim() < 4:
+            state = state.unsqueeze(0)  # 添加一個 batch 維度
+        elif state.dim() > 4:
+            state = state.squeeze(0)  # 去掉多餘的維度
         action_logits, _ = self(state)
-        action_probs = torch.softmax(action_logits, dim=-1)  # 計算動作概率分布
-        action = torch.multinomial(action_probs, 1)  # 從分布中采樣動作
-        return action.item(), action_probs
+        action_probs = torch.softmax(action_logits, dim=-1)
+        action = torch.multinomial(action_probs, 1)  # 采样动作
+        return action, action_probs
 
     def evaluate(self, state, action):
         action_logits, value = self(state)
@@ -1073,29 +1082,37 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
 
-        adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = adjusted_lr
-
+        # Calculate old log_probs
         with torch.no_grad():
-            old_action_mean, _ = model(state_batch)
-            old_log_probs = torch.distributions.Normal(old_action_mean, torch.ones_like(old_action_mean)).log_prob(action_batch).sum(dim=-1, keepdim=True)
+            old_action_mean, old_action_std, _ = model(state_batch)
+            dist = torch.distributions.Normal(old_action_mean, old_action_std)
+            old_log_probs = dist.log_prob(action_batch).sum(dim=-1, keepdim=True)
 
+        # Update PPO
         for _ in range(PPO_EPOCHS):
             with torch.amp.autocast('cuda'):
-                action_mean, state_values = model(state_batch)
+                action_mean, action_std, state_values = model(state_batch)
 
-                # 使用高斯分布計算新動作的 log_prob
-                dist = torch.distributions.Normal(action_mean, torch.ones_like(action_mean))
+                # Calculate new log_probs
+                dist = torch.distributions.Normal(action_mean, action_std)
                 log_probs = dist.log_prob(action_batch).sum(dim=-1, keepdim=True)
 
-                # Advantage 計算
+                # Calculate advantages with GAE
                 with torch.no_grad():
-                    next_state_values = model(next_state_batch)[1]
-                    target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
-                    advantages = target_values - state_values
+                    next_state_values = model(next_state_batch)[2]
+                    delta = reward_batch + (1 - done_batch) * GAMMA * next_state_values - state_values
+                    advantages = torch.zeros_like(delta)
+                    advantage = 0.0
+                    for t in reversed(range(len(delta))):
+                        advantage = delta[t] + GAMMA * 0.95 * advantage * (1 - done_batch[t])
+                        advantages[t] = advantage
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                # PPO 損失計算
+                    # Ensure target_values and state_values shape match
+                    target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
+                    target_values = target_values.unsqueeze(-1) if target_values.dim() == 1 else target_values
+
+                # PPO Loss
                 ratio = (log_probs - old_log_probs).exp()
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
@@ -1105,8 +1122,10 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
                 entropy_loss = -0.01 * dist.entropy().mean()
                 loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
+            # Update model
             scaler.scale(loss).backward()
             scaler.step(optimizer)
+            optimizer.zero_grad()  # 清零梯度
             scaler.update()
 
 def main():
@@ -1138,9 +1157,9 @@ def main():
 
         for step_count in range(150):  # 每個 episode 的最大步數
             # 使用強化學習模型決定擴展點（旁觀學習）
-            action = model.act(state)  # 強化學習模型動作
-            next_state, reward, done, info = env.step(action.cpu().numpy())  # 執行一步
-            
+            action, _ = model.act(state)  # 解包动作和概率
+            next_state, reward, done, info = env.step(action.cpu().numpy())
+
             # 記錄是否由 RL 干預
             if env.no_progress_steps >= env.max_no_progress_steps:
                 rl_interventions += 1
