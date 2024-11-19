@@ -6,14 +6,12 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 from geometry_msgs.msg import Twist, PointStamped
-from sensor_msgs.msg import PointCloud2, Imu
+from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState, ContactsState
+from gazebo_msgs.msg import ModelState
 import sensor_msgs.point_cloud2 as pc2
 from scipy.special import comb
 from collections import namedtuple
-import cv2
-import open3d as o3d
 import tf
 from tf.transformations import quaternion_from_euler
 import time
@@ -21,6 +19,7 @@ from torch.amp import GradScaler
 import yaml
 from PIL import Image
 from skimage.draw import line
+from queue import PriorityQueue
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -360,55 +359,129 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+    def a_star_with_rl_intervention(self, start, goal):
         """
-        A* 算法對 50x50 的正方形內進行路徑優化，確保路徑上沒有障礙物。
+        A* 算法，結合強化學習模型來選擇擴展點，並讓模型在正常運行時學習擴展點的選擇策略。
         """
-        # 使用 self.gazebo_to_image_coords 而不是 gazebo_to_image_coords
-        img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
-        img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
+        open_set = PriorityQueue()
+        open_set.put((0, start))
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
 
-        best_f_score = float('inf')
-        best_point = (img_start_x, img_start_y)
+        while not open_set.empty():
+            _, current = open_set.get()
 
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
-                    continue
+            if current == goal:
+                return self.reconstruct_path(came_from, current)
 
-                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
-                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
+            neighbors = self.get_neighbors(current)
+            
+            # RL 模型參與：選擇擴展點
+            state = self.generate_rl_state(current, neighbors, f_score)  # 獲取當前狀態
+            rl_action, rl_action_probs = self.model.act(state)  # 模型決策
+            rl_selected_neighbor = neighbors[rl_action]
 
-                # 檢查從 (img_start_x, img_start_y) 到 (x, y) 的直線是否存在障礙物
-                if not self.is_line_free(png_image, (img_start_x, img_start_y), (x, y)):
-                    continue
+            # 比較 RL 選擇與原始邏輯
+            a_star_selected_neighbor = min(neighbors, key=lambda n: f_score.get(n, float('inf')))
 
-                unwalkable_count = np.sum(png_image[max(0, y - grid_size // 2):min(y + grid_size // 2, png_image.shape[0]),
-                                                    max(0, x - grid_size // 2):min(x + grid_size // 2, png_image.shape[1])] < 250)
+            # 獎勵設計：選擇點是否接近目標
+            reward = self.calculate_action_reward(
+                current, rl_selected_neighbor, a_star_selected_neighbor, goal
+            )
+            
+            # 記錄模型的行為（加入記憶體）
+            next_state = self.generate_rl_state(rl_selected_neighbor, self.get_neighbors(rl_selected_neighbor), f_score)
+            self.memory.add(state, rl_action, reward, False, next_state)
 
-                f = g + h + unwalkable_count * 2
+            for neighbor in neighbors:
+                if not self.is_line_free(self.slam_map, current, neighbor):
+                    continue  # 忽略不可行的鄰居
 
-                if f < best_f_score:
-                    best_f_score = f
-                    best_point = (x, y)
+                tentative_g_score = g_score[current] + self.cost(current, neighbor)
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
 
-        # 使用 self.image_to_gazebo_coords 而不是 image_to_gazebo_coords
-        optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
+                    if neighbor == rl_selected_neighbor:
+                        # 使用 RL 模型的選擇
+                        open_set.put((f_score[neighbor], neighbor))
+                    else:
+                        # 使用 A* 原始邏輯選擇
+                        open_set.put((f_score[neighbor], neighbor))
+                    came_from[neighbor] = current
 
-        return optimized_gazebo_x, optimized_gazebo_y
+        return None  # 無法到達目標
+    
+    def calculate_action_reward(self, current, rl_neighbor, a_star_neighbor, goal):
+        """
+        根據 RL 選擇的擴展點與 A* 原始邏輯的差異設計獎勵。
+        """
+        # 獎勵 RL 選擇的點是否更靠近目標
+        rl_distance_to_goal = np.linalg.norm(np.array(goal) - np.array(rl_neighbor))
+        a_star_distance_to_goal = np.linalg.norm(np.array(goal) - np.array(a_star_neighbor))
+
+        # 如果 RL 選擇的更優，給予正獎勵，否則懲罰
+        if rl_distance_to_goal < a_star_distance_to_goal:
+            reward = 1.0  # 正獎勵
+        else:
+            reward = -1.0  # 懲罰
+
+        return reward
 
     def is_line_free(self, png_image, start, end):
         """
         檢查從 start 到 end 的直線上是否有障礙物。
-        使用 Bresenham 演算法來生成線上的點，並檢查這些點是否可通行。
+        返回障礙物比例而非布爾值。
         """
-        rr, cc = line(start[1], start[0], end[1], end[0])  # 使用 skimage.draw.line 獲取直線上的點
+        rr, cc = line(start[1], start[0], end[1], end[0])  # 獲取直線上的點
+        obstacle_count = 0
+        total_points = 0
+
         for r, c in zip(rr, cc):
-            if not (0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]):
-                return False  # 如果點超出圖片範圍
-            if png_image[r, c] < 250:  # 假設低於 250 為障礙物
-                return False  # 直線上有障礙物
-        return True
+            if 0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]:
+                total_points += 1
+                if png_image[r, c] < 250:  # 假設低於 250 為障礙物
+                    obstacle_count += 1
+
+        return obstacle_count / total_points if total_points > 0 else 1.0
+    
+    def rl_intervention(self, current, neighbor, f_score):
+        """
+        強化學習模型決定新的擴展點。
+        """
+        state = self.generate_rl_state(current, neighbor, f_score)
+        action = self.model.act(state)
+        new_neighbor = self.adjust_neighbor(neighbor, action)
+        return new_neighbor
+        
+    def generate_rl_state(self, current, neighbor, f_score):
+        # 提取地圖局部區域
+        local_map = self.extract_local_map(current)
+        # 計算與目標的距離
+        distance_to_goal = f_score[neighbor]
+        # 將這些信息打包成輸入向量
+        state = np.concatenate([current, neighbor, [distance_to_goal]])
+        return torch.tensor(state, dtype=torch.float32).to(device)
+    
+    def adjust_neighbor(self, neighbor, action):
+        # 將動作作為對鄰居坐標的小偏移量
+        dx, dy = action[0].item(), action[1].item()
+        return (neighbor[0] + dx, neighbor[1] + dy)
+    
+    def extract_local_map(self, current, size=64):
+        img_x, img_y = self.gazebo_to_image_coords(*current)
+        half_size = size // 2
+        start_x = max(0, img_x - half_size)
+        start_y = max(0, img_y - half_size)
+        end_x = min(self.slam_map.shape[1], img_x + half_size)
+        end_y = min(self.slam_map.shape[0], img_y + half_size)
+
+        local_map = np.zeros((size, size), dtype=np.float32)
+        local_map_slice = self.slam_map[start_y:end_y, start_x:end_x]
+        local_map[:local_map_slice.shape[0], :local_map_slice.shape[1]] = local_map_slice
+
+        return local_map
 
     def optimize_waypoints_with_a_star(self):
         """
@@ -424,7 +497,7 @@ class GazeboEnv:
         for i in range(len(self.waypoints) - 1):
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
+            optimized_point = self.a_star_with_rl_intervention(self.slam_map, start_point, goal_point)
             optimized_waypoints.append(optimized_point)
 
         # 最後一個終點加入到優化後的路徑點列表中
@@ -549,21 +622,51 @@ class GazeboEnv:
             reward += distance_reward * 100
             self.current_waypoint_index = closest_index
             print('distance to goal +', reward)
-        # self.current_waypoint_index = closest_index
 
         # 確認最近的 waypoint 是否與目標位置相同
         current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
 
-        distance_moved = np.linalg.norm([robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]]) if self.previous_robot_position else 0
+        # 計算距離移動量，並檢查是否有進展
+        distance_moved = (
+            np.linalg.norm([robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]])
+            if self.previous_robot_position
+            else 0
+        )
         self.previous_robot_position = (robot_x, robot_y)
 
+        # 判斷是否需要 RL 介入 A* 算法
+        if distance_moved < 0.03:
+            self.no_progress_steps += 1
+            if self.no_progress_steps >= self.max_no_progress_steps:
+                self.waypoint_failures[self.current_waypoint_index] += 1
+                print(f"Failure at point {self.current_waypoint_index}. RL intervention in A*")
+                rospy.loginfo("No progress detected, re-planning path with RL.")
+
+                # RL 介入 A* 算法，重新生成路徑
+                new_path = self.a_star_with_rl_intervention((robot_x, robot_y), (self.target_x, self.target_y))
+                if new_path:
+                    print("New path generated by RL intervention.")
+                    self.waypoints = new_path  # 更新路徑
+                    self.waypoint_distances = self.calculate_waypoint_distances()
+                    self.current_waypoint_index = 0
+                    self.no_progress_steps = 0
+                else:
+                    print("RL intervention failed to generate a valid path.")
+                    reward = -2000.0
+                    self.reset()
+                    return self.state, reward, True, {}
+
+        else:
+            self.no_progress_steps = 0
+
+        # 根據路徑執行控制
         use_deep_rl_control = any(
             self.waypoint_failures.get(i, 0) > 1
             for i in range(max(0, self.current_waypoint_index - 3), min(len(self.waypoints), self.current_waypoint_index + 4))
         )
 
         if use_deep_rl_control:
-            print('operate by RL')
+            print('Operate by RL.')
             if isinstance(self.state, np.ndarray):
                 self.state = torch.tensor(self.state, dtype=torch.float32).view(1, 3, 64, 64).to(device)
             elif self.state.dim() != 4:
@@ -573,55 +676,29 @@ class GazeboEnv:
             print("RL Action output:", action)
             linear_speed = np.clip(action[0, 0].item(), -2.0, 2.0)
             steer_angle = np.clip(action[0, 1].item(), -0.6, 0.6)
-
-            if distance_moved < 0.05:
-                self.no_progress_steps += 1
-                if self.no_progress_steps >= self.max_no_progress_steps:
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward = -2000.0
-                    self.reset()
-                    return self.state, reward, True, {}
-            else:
-                self.no_progress_steps = 0
-
         else:
-            # 計算當前位置與 current_waypoint_index 的距離
-            robot_x, robot_y, _ = self.get_robot_position()
-            current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
-            distance_to_waypoint = np.linalg.norm([robot_x - current_waypoint_x, robot_y - current_waypoint_y])
-
-            if distance_moved < 0.03:
-                self.no_progress_steps += 1
-                if self.no_progress_steps >= self.max_no_progress_steps:
-                    self.waypoint_failures[self.current_waypoint_index] += 1
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward = -2000.0
-                    self.reset()
-                    return self.state, reward, True, {}
-            else:
-                self.no_progress_steps = 0
-
-
+            # 基於 A* 路徑的 Pure Pursuit 控制
             action = self.calculate_action_pure_pursuit()
             print("A* Action output:", action)
             linear_speed = np.clip(action[0], -2.0, 3.0)
             steer_angle = np.clip(action[1], -0.6, 0.6)
 
+        # 發布控制指令
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
         self.pub_cmd_vel.publish(twist)
 
+        # 發布 IMU 資料
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
         rospy.sleep(0.1)
 
+        # 計算獎勵
         reward, _ = self.calculate_reward(robot_x, robot_y, reward, self.state)
 
-        print(reward)
+        print(f"Reward: {reward}")
         return self.state, reward, self.done, {}
 
     def reset(self):
@@ -686,26 +763,63 @@ class GazeboEnv:
 
         return self.state
 
-
     def calculate_reward(self, robot_x, robot_y, reward, state):
         done = False
-        # 將機器人的座標轉換為地圖上的坐標
 
+        # 確保 state 是 numpy 格式
         if isinstance(state, torch.Tensor):
             state = state.cpu().numpy()
 
+        # 確定佔據網格的數據格式
         if state.ndim == 4:
-            # 对于 4 维情况，取第一个批次数据中的第一层
-            occupancy_grid = state[0, 0]
+            occupancy_grid = state[0, 0]  # 第 0 批次的第一層
         elif state.ndim == 3:
-            # 对于 3 维情况，直接取第一层
-            occupancy_grid = state[0]
+            occupancy_grid = state[0]  # 直接取第一層
+        else:
+            raise ValueError("Unexpected state dimension. Expected 3D or 4D, got {}D.".format(state.ndim))
 
+        # 機器人的當前圖像座標
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
-        obstacle_count = np.sum(occupancy_grid <= 190)  # 假設state[0]為佔據網格通道
-        print('obstacle_count',obstacle_count)
-        reward += 300 - obstacle_count*3
 
+        # 1. 獎勵：靠近目標的距離
+        distance_to_goal = np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y])
+        if self.previous_distance_to_goal is not None:
+            progress_reward = max(0, self.previous_distance_to_goal - distance_to_goal) * 100
+            reward += progress_reward
+            print(f"Progress reward: {progress_reward}")
+        self.previous_distance_to_goal = distance_to_goal
+
+        # 2. 懲罰：撞到障礙物
+        obstacle_count = np.sum(occupancy_grid <= 190)  # 計算當前佔據網格中障礙物的數量
+        obstacle_penalty = obstacle_count * 3
+        reward -= obstacle_penalty
+        print(f"Obstacle penalty: {obstacle_penalty}")
+
+        # 3. 懲罰：過度震蕩或偏離路徑
+        # 使用車輛的平滑性評估，例如前後車速或方向改變過大
+        if self.previous_robot_position:
+            movement_distance = np.linalg.norm(
+                [robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]]
+            )
+            if movement_distance < 0.05:  # 若移動過小，可能卡住
+                reward -= 50
+                print("Low movement penalty applied.")
+
+        # 4. 獎勵：到達目標
+        if distance_to_goal < 0.2:  # 假設 0.2 米以內為成功到達目標
+            reward += 1000
+            done = True
+            print("Goal reached! Reward applied.")
+
+        # 5. 超時處理（可以根據需求調整）
+        if self.no_progress_steps >= self.max_no_progress_steps:
+            reward -= 1000
+            done = True
+            print("Episode failed due to no progress.")
+
+        self.previous_robot_position = (robot_x, robot_y)
+
+        print(f"Total reward: {reward}")
         return reward, done
 
     def get_robot_position(self):
@@ -837,10 +951,8 @@ class ActorCritic(nn.Module):
         self.dropout = nn.Dropout(p=0.5)
         self.fc2 = nn.Linear(256, 128)
 
-        self.actor = nn.Linear(128, action_space)
+        self.actor = nn.Linear(128, action_space)  # 對應的 action_space 是候選擴展點數量
         self.critic = nn.Linear(128, 1)
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
-        
 
     def _get_conv_output_size(self, shape):
         x = torch.zeros(1, *shape)
@@ -863,13 +975,10 @@ class ActorCritic(nn.Module):
         x = torch.relu(self.fc2(x))
         x = self.dropout(x)
 
-        action_mean = self.actor(x)
-        action_log_std = self.actor_log_std.expand_as(action_mean)
-        action_std = torch.exp(action_log_std)
-
+        action_logits = self.actor(x)  # 動作概率的 logits
         value = self.critic(x)
 
-        return action_mean, action_std, value
+        return action_logits, value
 
     def act(self, state):
         # 確保 state 是 tensor，如果是 numpy，轉換為 tensor
@@ -888,132 +997,120 @@ class ActorCritic(nn.Module):
         if state.dim() != 4:
             raise ValueError(f"Expected state to be 4D, but got {state.dim()}D")
 
-        action_mean, action_std, _ = self(state)
-        action = action_mean + action_std * torch.randn_like(action_std)
-        action = torch.tanh(action)
-        max_action = torch.tensor([2.0, 0.6], device=action.device)
-        min_action = torch.tensor([-2.0, -0.6], device=action.device)
-        action = min_action + (action + 1) * (max_action - min_action) / 2
-        return action.detach()
+        action_logits, _ = self(state)
+        action_probs = torch.softmax(action_logits, dim=-1)  # 計算動作概率分布
+        action = torch.multinomial(action_probs, 1)  # 從分布中采樣動作
+        return action.item(), action_probs
 
     def evaluate(self, state, action):
-        action_mean, action_std, value = self(state)
-        dist = torch.distributions.Normal(action_mean, action_std)
-        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
-        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
+        action_logits, value = self(state)
+        action_probs = torch.softmax(action_logits, dim=-1)
+        action_log_probs = torch.log(action_probs.gather(1, action.unsqueeze(-1)))  # 選擇已執行動作的 log prob
+        dist_entropy = -(action_probs * torch.log(action_probs + 1e-10)).sum(dim=-1)  # 熵
         return action_log_probs, value, dist_entropy
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
     for _ in range(ppo_epochs):
         state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(BATCH_SIZE)
-        
+
         adjusted_lr = LEARNING_RATE * (weights.mean().item() + 1e-3)
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
 
         with torch.no_grad():
-            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
-        old_log_probs = old_log_probs.detach()
+            old_action_mean, _ = model(state_batch)
+            old_log_probs = torch.distributions.Normal(old_action_mean, torch.ones_like(old_action_mean)).log_prob(action_batch).sum(dim=-1, keepdim=True)
 
         for _ in range(PPO_EPOCHS):
             with torch.amp.autocast('cuda'):
-                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
+                action_mean, state_values = model(state_batch)
 
-                # 確保 reward_batch 和 state_values 都具有形狀 (batch_size, 1)
-                reward_batch = reward_batch.unsqueeze(-1) if reward_batch.dim() == 1 else reward_batch
-                done_batch = done_batch.unsqueeze(-1) if done_batch.dim() == 1 else done_batch
-                state_values = state_values.unsqueeze(-1) if state_values.dim() == 1 else state_values
+                # 使用高斯分布計算新動作的 log_prob
+                dist = torch.distributions.Normal(action_mean, torch.ones_like(action_mean))
+                log_probs = dist.log_prob(action_batch).sum(dim=-1, keepdim=True)
 
-                # 計算 advantages
+                # Advantage 計算
                 with torch.no_grad():
-                    next_state_values = model(next_state_batch)[2]
-                    next_state_values = next_state_values.unsqueeze(-1) if next_state_values.dim() == 1 else next_state_values
-                
-                target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
-                advantages = target_values - state_values
+                    next_state_values = model(next_state_batch)[1]
+                    target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
+                    advantages = target_values - state_values
 
-                # 計算 PPO 損失
+                # PPO 損失計算
                 ratio = (log_probs - old_log_probs).exp()
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
 
                 actor_loss = -torch.min(surr1, surr2).mean()
                 critic_loss = nn.MSELoss()(state_values, target_values)
-                entropy_loss = -0.01 * dist_entropy.mean()  # 添加熵正則項
+                entropy_loss = -0.01 * dist.entropy().mean()
                 loss = actor_loss + 0.5 * critic_loss + entropy_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            priorities = (advantages + 1e-5).abs().detach().cpu().numpy()
-            memory.update_priorities(indices, priorities)
-
 def main():
-    env = GazeboEnv(None)
-    model = ActorCritic(env.observation_space, env.action_space).to(device)
-    env.model = model
+    env = GazeboEnv(None)  # 初始化環境
+    model = ActorCritic(env.observation_space, 2).to(device)  # 強化學習模型，假設動作空間為 2
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
 
     model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
     best_model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
-    
+
+    # 加載已有模型（如果存在）
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        model.load_state_dict(torch.load(model_path, map_location=device))
         print("Loaded existing model.")
     else:
-        print("Created new model.")
+        print("Training new model.")
 
     num_episodes = 1000000
     best_test_reward = -np.inf
 
-    for e in range(num_episodes):
-        if not env.optimized_waypoints_calculated:
-            env.optimize_waypoints_with_a_star()
-
-        state = env.reset()
-        # 檢查 state 是否是 torch.Tensor，如果不是，則先將其轉為 tensor
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32)
-        state = state.clone().detach().unsqueeze(0).to(device)
-
+    for episode in range(num_episodes):
+        state = env.reset()  # 重置環境
         total_reward = 0
+        rl_interventions = 0  # 記錄 RL 介入次數
+        successful_interventions = 0
         start_time = time.time()
 
-        for time_step in range(1500):
-            action = model.act(state)
-            action_np = action.detach().cpu().numpy()
+        for step_count in range(150):  # 每個 episode 的最大步數
+            # 使用強化學習模型決定擴展點（旁觀學習）
+            action = model.act(state)  # 強化學習模型動作
+            next_state, reward, done, info = env.step(action.cpu().numpy())  # 執行一步
             
-            # 執行 step 並取得 next_state、reward 和 done
-            next_state, reward, done, _ = env.step(action_np)
-
-            # 檢查 next_state 是否是 torch.Tensor，如果不是，則先將其轉為 tensor
-            if not isinstance(next_state, torch.Tensor):
-                next_state = torch.tensor(next_state, dtype=torch.float32)
-            next_state = next_state.clone().detach().unsqueeze(0).to(device)
-
+            # 記錄是否由 RL 干預
+            if env.no_progress_steps >= env.max_no_progress_steps:
+                rl_interventions += 1
+                # 執行 RL 干預後的 A* 路徑重規劃
+                intervention_path = env.a_star_with_rl_intervention(
+                    (env.previous_robot_position[0], env.previous_robot_position[1]),
+                    (env.target_x, env.target_y)
+                )
+                if intervention_path is not None:
+                    successful_interventions += 1  # 記錄成功干預次數
+            
             # 將數據添加到記憶體
-            memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-            
-            # 更新 state 和總分
+            memory.add(state.cpu().numpy(), action.cpu().numpy(), reward, done, next_state.cpu().numpy())
+
             state = next_state
             total_reward += reward
 
-            # 檢查是否超過時間限制或達到終止條件
-            elapsed_time = time.time() - start_time
-            if done or elapsed_time > 240:
-                if elapsed_time > 240:
-                    reward -= 1000.0
-                    print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
+            if done:
                 break
 
-        # 更新 PPO 和清除記憶體
+        # 訓練 PPO 模型
         ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler)
         memory.clear()
 
-        print(f"Episode {e}, Total Reward: {total_reward}")
+        # 日誌信息
+        elapsed_time = time.time() - start_time
+        print(
+            f"Episode {episode}, Total Reward: {total_reward}, RL Interventions: {rl_interventions}, "
+            f"Successful Interventions: {successful_interventions}, Elapsed Time: {elapsed_time:.2f}s"
+        )
 
         # 保存最佳模型
         if total_reward > best_test_reward:
@@ -1021,16 +1118,16 @@ def main():
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with reward: {best_test_reward}")
 
-        # 每五次保存模型
-        if e % 5 == 0:
+        # 定期保存模型
+        if episode % 10 == 0:
             torch.save(model.state_dict(), model_path)
-            print(f"Model saved after {e} episodes.")
+            print(f"Model saved after {episode} episodes.")
 
-        rospy.sleep(1.0)
+        rospy.sleep(1.0)  # 防止過快執行
 
+    # 保存最終模型
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
-
 
 if __name__ == '__main__':
     main()
