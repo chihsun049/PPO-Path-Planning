@@ -916,6 +916,7 @@ class ActorCritic(nn.Module):
         self.critic = nn.Linear(128, 1)
 
     def forward(self, x):
+        x = x.view(x.size(0), -1)  # 展平成 (batch_size, input_dim)
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         action_mean = self.actor(x)
