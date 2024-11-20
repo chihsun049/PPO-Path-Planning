@@ -459,7 +459,7 @@ class GazeboEnv:
         while open_set:
             step += 1
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
-            rospy.loginfo(f"Step {step}: Current Node {current}, f_score {f_score[current]}")
+            #rospy.loginfo(f"Step {step}: Current Node {current}, f_score {f_score[current]}")
 
             if current == (img_goal_x, img_goal_y):  # 到達目標
                 rospy.loginfo("Goal reached! Reconstructing path...")
