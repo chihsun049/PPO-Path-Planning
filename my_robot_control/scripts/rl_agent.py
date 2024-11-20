@@ -363,147 +363,154 @@ class GazeboEnv:
     
     def heuristic_cost(self, point, goal):
         """
-        計算啟發式估值，通常使用歐幾里得距離。
-        :param point: 當前節點 (x, y)
-        :param goal: 目標節點 (x, y)
-        :return: 啟發式估值（例如距離）
+        啟發式函數，結合基礎距離與障礙物懲罰。
         """
-        return np.linalg.norm([goal[0] - point[0], goal[1] - point[1]])
+        base_cost = np.linalg.norm([goal[0] - point[0], goal[1] - point[1]])
+        obstacle_distance = self.calculate_obstacle_distance(point)
+        if obstacle_distance > 10:
+            obstacle_penalty = 0  # 遠離障礙物時無懲罰
+        else:
+            obstacle_penalty = 10 / (obstacle_distance + 1e-6)  # 距離越近懲罰越高
+        return base_cost + obstacle_penalty
     
-    def get_neighbors(self, current, grid_size):
-        """
-        獲取當前節點的鄰居節點。
-        :param current: 當前節點 (x, y)
-        :param grid_size: 網格大小
-        :return: 鄰居節點列表
-        """
-        neighbors = []
+    def calculate_obstacle_distance(self, point):
+        # 找到距離點最近的障礙物（以像素計算）
+        x, y = point
+        search_range = 10  # 搜索範圍（像素）
+        obstacle_coords = np.argwhere(self.slam_map[max(0, y - search_range):min(self.slam_map.shape[0], y + search_range),
+                                                    max(0, x - search_range):min(self.slam_map.shape[1], x + search_range)] < 250)
+        if len(obstacle_coords) == 0:
+            return float('inf')  # 如果周圍無障礙物，返回無窮遠
+        obstacle_coords += [max(0, x - search_range), max(0, y - search_range)]  # 還原全局座標
+        distances = np.linalg.norm(obstacle_coords - np.array([x, y]), axis=1)
+        return distances.min()  # 返回最近障礙物的距離
+    
+    def get_neighbors(self, current, grid_size=1):
         x, y = current
-
-        # 定義鄰居偏移量 (四連通或八連通)
-        offsets = [
-            (grid_size, 0), (-grid_size, 0),  # 左右
-            (0, grid_size), (0, -grid_size),  # 上下
-            (grid_size, grid_size), (-grid_size, -grid_size),  # 左上和右下
-            (grid_size, -grid_size), (-grid_size, grid_size)  # 左下和右上
+        neighbors = [
+            (x + dx, y + dy)
+            for dx, dy in [
+                (-grid_size, 0), (grid_size, 0), (0, -grid_size), (0, grid_size),
+                (-grid_size, -grid_size), (grid_size, grid_size), (-grid_size, grid_size), (grid_size, -grid_size)
+            ]
+            if 0 <= x + dx < self.slam_map.shape[1] and 0 <= y + dy < self.slam_map.shape[0]
         ]
-
-        for dx, dy in offsets:
-            neighbor = (x + dx, y + dy)
-
-            # 檢查鄰居是否在地圖範圍內
-            if 0 <= neighbor[0] < self.slam_map.shape[1] and 0 <= neighbor[1] < self.slam_map.shape[0]:
-                neighbors.append(neighbor)
-
         return neighbors
     
     def reconstruct_path(self, came_from, current):
         """
         回溯來重建完整的路徑。
-
-        :param came_from: 字典，記錄了每個節點的父節點
-        :param current: 當前節點
-        :return: 完整的路徑（從起點到終點）
         """
         path = [current]
         while current in came_from:
-            current = came_from[current]
+            next_node = came_from[current]
+            if np.linalg.norm(np.array(current) - np.array(next_node)) < 1e-3:  # 容錯處理
+                break
+            current = next_node
             path.append(current)
-        path.reverse()  # 將路徑從起點到終點
+        path.reverse()
         return path
     
     def is_line_free(self, png_image, start, end):
         """
         檢查從 start 到 end 的直線上是否有障礙物。
-        使用 Bresenham 演算法來生成線上的點，並檢查這些點是否可通行。
+        增加安全距離檢查，允許靠近但不穿過障礙物。
         """
-        # 確保座標為整數
+        safe_threshold = 200  # 障礙物閾值
         start = (int(round(start[0])), int(round(start[1])))
         end = (int(round(end[0])), int(round(end[1])))
 
-        rr, cc = line(start[1], start[0], end[1], end[0])  # 使用 skimage.draw.line 獲取直線上的點
+        rr, cc = line(start[1], start[0], end[1], end[0])  # Bresenham 算法
         for r, c in zip(rr, cc):
             if not (0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]):
-                return False  # 如果點超出圖片範圍
-            if png_image[r, c] < 250:  # 假設低於 250 為障礙物
-                return False  # 直線上有障礙物
+                return False  # 超出地圖範圍
+            if png_image[r, c] < safe_threshold:  # 若低於安全閾值，視為不可行
+                return False
         return True
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+    def dynamic_grid_size(self, current, neighbor):
+        obstacle_distance = self.calculate_obstacle_distance(current)
+        if obstacle_distance > 15:  # 遠離障礙物
+            return 5
+        elif obstacle_distance > 5:  # 中等距離
+            return 2
+        else:  # 靠近障礙物
+            return 1
+
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=1):
+        """
+        A* 算法，實現遠離障礙物的路徑優化。
+        """
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        open_list = []
-        closed_list = set()
-        g_score = {start_point: 0}
-        f_score = {start_point: self.heuristic_cost(start_point, goal_point)}
+        open_set = [(img_start_x, img_start_y)]  # 開放列表
+        came_from = {}  # 路徑回溯
+        g_score = {open_set[0]: 0}  # 起始節點 g 值
+        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y))}
 
-        open_list.append((f_score[start_point], start_point))
+        while open_set:
+            # 選擇 f 值最低的節點
+            current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
+            if current == (img_goal_x, img_goal_y):  # 到達目標
+                optimized_path = self.reconstruct_path(came_from, current)
+                smoothed_path = self.bezier_curve(optimized_path, n_points=100)  # 平滑路徑
+                gazebo_x, gazebo_y = self.image_to_gazebo_coords(*smoothed_path[1])  # 返回平滑後的下一個點
+                return gazebo_x, gazebo_y
 
-        while open_list:
-            _, current = min(open_list, key=lambda x: x[0])  # 按 f 值排序選擇最小值
-            open_list = [node for node in open_list if node[1] != current]
-            closed_list.add(current)
-
-            if current == goal_point:
-                return self.reconstruct_path(closed_list, current)
-
+            open_set.remove(current)
             neighbors = self.get_neighbors(current, grid_size)
-            neighbor_scores = []
 
             for neighbor in neighbors:
-                if neighbor in closed_list or not self.is_line_free(png_image, current, neighbor):
+                if not self.is_line_free(png_image, current, neighbor):  # 檢查直線可行性
                     continue
 
-                tentative_g_score = g_score[current] + self.euclidean_distance(current, neighbor)
+                # 計算 g 值
+                tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
 
-                if not self.use_rl_in_a_star:
+                # 動態調整網格大小，遠離障礙物時網格可擴大
+                grid_size = self.dynamic_grid_size(current, neighbor)
+
+                # 使用改進的啟發式函數
+                h_cost = self.heuristic_cost(neighbor, (img_goal_x, img_goal_y))
+                f_cost = tentative_g_score + h_cost
+
+                # 如果鄰居未訪問過或找到更優的路徑，更新節點數據
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = g_score[neighbor] + self.heuristic_cost(neighbor, goal_point)
-                else:
-                    rl_input = self.generate_rl_input(current, neighbor, goal_point, g_score, f_score)
-                    state_tensor = torch.tensor(rl_input, dtype=torch.float32).unsqueeze(0).to(device)
-                    action = self.model.act(state_tensor).item()
-                    g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = g_score[neighbor] + self.heuristic_cost(neighbor, goal_point) - action
+                    f_score[neighbor] = f_cost
+                    if neighbor not in open_set:
+                        open_set.append(neighbor)
 
-                neighbor_scores.append((f_score[neighbor], neighbor))
+            # 調試日誌：打印當前節點和路徑數據
+            #rospy.loginfo(f"Current node: {current}, g_score: {g_score[current]}, f_score: {f_score[current]}")
 
-            open_list.extend(neighbor_scores)
-
-        rospy.logerr(f"A* failed: No path found between {start_point} and {goal_point}.")
-        return None
+        rospy.logwarn(f"A* failed between waypoints {start_point} and {goal_point}.")
+        return start_point  # 如果 A* 失敗，返回原點
 
     def optimize_waypoints_with_a_star(self):
-        """
-        使用 A* 算法來優化路徑點，但僅在尚未計算過時執行
-        """
         if self.optimized_waypoints_calculated:
-            rospy.loginfo("Using previously calculated optimized waypoints.")
-            self.waypoints = self.optimized_waypoints  # 使用已計算的優化路徑
+            rospy.loginfo("Using previously calculated waypoints.")
             return
 
-        rospy.loginfo("Calculating optimized waypoints for the first time using A*.")
+        rospy.loginfo("Optimizing waypoints using A*.")
         optimized_waypoints = []
-
         for i in range(len(self.waypoints) - 1):
-            start_point = (self.waypoints[i][0], self.waypoints[i][1])
-            goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
+            start = self.waypoints[i]
+            goal = self.waypoints[i + 1]
+            optimized_waypoint = self.a_star_optimize_waypoint(self.slam_map, start, goal)
 
-            if optimized_point is None:
-                rospy.logerr(f"A* optimization failed between waypoints {i} and {i + 1}.")
-                return  # 提前退出，避免路徑不完整
-            optimized_waypoints.append(optimized_point)
+            if optimized_waypoint == start:  # 如果無法找到更好的路徑
+                rospy.logwarn(f"A* failed between waypoints {start} and {goal}. Using original waypoint.")
+                optimized_waypoints.append(start)
+            else:
+                optimized_waypoints.append(optimized_waypoint)
 
-        optimized_waypoints.append(self.waypoints[-1])  # 確保終點加入到路徑
+        optimized_waypoints.append(self.waypoints[-1])  # 加入最終目標
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
         self.optimized_waypoints_calculated = True
-
-        # 驗證優化後的路徑點
-        if not self.waypoints or any(waypoint is None for waypoint in self.waypoints):
-            rospy.logerr("Optimized waypoints are invalid.")
     
     def generate_rl_input(self, current, neighbor, goal, g_score, f_score):
         """
@@ -627,89 +634,72 @@ class GazeboEnv:
         return occupancy_grid
 
     def step(self, action):
-        """
-        執行環境一步，讓車輛行駛。
-        - 無進展次數達到上限時觸發 RL 介入，重新規劃路徑。
-        """
-        # 檢查 waypoints 是否有效
-        if not self.waypoints or self.current_waypoint_index >= len(self.waypoints):
-            rospy.logerr("Waypoints are invalid or current waypoint index is out of range.")
-            return self.state, -1000.0, True, {}  # 大懲罰，結束回合
-
-        # 獲取當前位置與狀態
+        reward = 0
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         self.state = self.generate_occupancy_grid(robot_x, robot_y)
 
-        # 判斷是否到達終點
-        distance_to_goal = np.linalg.norm([robot_x - self.target_x, robot_y - self.target_y])
-        if distance_to_goal < 0.3:  # 終點的距離閾值
-            rospy.loginfo("Robot reached the goal!")
-            return self.state, 1000.0, True, {}  # 高額獎勵並結束回合
+        # 計算當前機器人位置與所有 waypoints 的距離，並找到距離最近的 waypoint 的索引
+        distances = [np.linalg.norm([robot_x - wp_x, robot_y - wp_y]) for wp_x, wp_y in self.waypoints]
+        closest_index = np.argmin(distances)
 
-        # 獲取當前 waypoint
-        current_waypoint_x, current_waypoint_y = self.waypoints[self.current_waypoint_index]
-        distance_to_waypoint = np.linalg.norm([robot_x - current_waypoint_x, robot_y - current_waypoint_y])
+        # 如果找到更近的路徑點，更新 current_waypoint_index 並給予獎勵
+        if closest_index > self.current_waypoint_index:
+            distance_reward = sum(self.waypoint_distances[self.current_waypoint_index:closest_index])
+            reward += distance_reward * 100
+            self.current_waypoint_index = closest_index
+            print('Distance to goal reward:', reward)
 
-        # 判斷是否有進展
+        # 判斷是否需要 RL 介入
         distance_moved = (
             np.linalg.norm([robot_x - self.previous_robot_position[0], robot_y - self.previous_robot_position[1]])
             if self.previous_robot_position else 0
         )
         self.previous_robot_position = (robot_x, robot_y)
 
-        if distance_moved < 0.05:  # 無進展情況
-            self.no_progress_steps += 1
-            if self.no_progress_steps >= self.max_no_progress_steps:
-                print(f"No progress detected at waypoint {self.current_waypoint_index}. RL is intervening.")
-                rospy.loginfo("RL intervening to replan path.")
+        self.use_rl_in_a_star = (
+            self.no_progress_steps >= self.max_no_progress_steps or
+            self.waypoint_failures.get(self.current_waypoint_index, 0) > 1
+        )
 
-                # 啟用 RL 接管 A* 規劃
-                self.use_rl_in_a_star = True
+        if self.use_rl_in_a_star:
+            print("RL intervening in A* for waypoint optimization.")
+            # 強制啟用 RL 模型介入 A* 的擴展節點選擇
+            self.optimize_waypoints_with_a_star()
+            # 重置 RL 干預標誌位，回到普通控制模式
+            self.use_rl_in_a_star = False
 
-                # 使用 RL 幫助 A* 重新規劃路徑
-                rl_start = (robot_x, robot_y)
-                rl_goal = (self.target_x, self.target_y)
-
-                new_waypoints = self.a_star_optimize_waypoint(self.slam_map, rl_start, rl_goal)
-
-                # 關閉 RL 接管模式
-                self.use_rl_in_a_star = False
-
-                if new_waypoints:
-                    self.waypoints = new_waypoints  # 替換為新的路徑
-                    self.current_waypoint_index = 0  # 重置 waypoint 索引
-                    print("New path generated using RL-assisted A*.")
-                else:
-                    print("Failed to generate new path. Resetting environment.")
-                    self.reset()
-                    return self.state, -2000.0, True, {}  # 大懲罰並結束回合
-
-                # 重置無進展次數
-                self.no_progress_steps = 0
-        else:
-            # 如果有進展，重置計數器
-            self.no_progress_steps = 0
-
-        # 控制邏輯（使用純 A* 路徑跟蹤）
+        # 使用純 A* 路徑跟隨
+        print("Using Pure Pursuit (A*).")
         action = self.calculate_action_pure_pursuit()
         linear_speed = np.clip(action[0], -2.0, 3.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
-        # 發布速度指令到模擬環境
+        # 判斷是否無進展
+        if distance_moved < 0.03:
+            self.no_progress_steps += 1
+            if self.no_progress_steps >= self.max_no_progress_steps:
+                self.waypoint_failures[self.current_waypoint_index] += 1
+                print(f"A* failed at waypoint {self.current_waypoint_index}. Resetting environment.")
+                reward -= 2000.0
+                self.reset()
+                return self.state, reward, True, {}
+        else:
+            self.no_progress_steps = 0
+
+        # 發布速度指令
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
         self.pub_cmd_vel.publish(twist)
 
-        # 更新 IMU 數據
+        # 更新 IMU 資料
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
         rospy.sleep(0.1)
 
-        # 計算獎勵
-        reward, done = self.calculate_reward(robot_x, robot_y, 0, self.state)
-
+        # 計算總獎勵
+        reward, done = self.calculate_reward(robot_x, robot_y, reward, self.state)
         return self.state, reward, done, {}
 
     def reset(self):
