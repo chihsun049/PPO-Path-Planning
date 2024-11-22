@@ -21,6 +21,7 @@ from torch.amp import GradScaler
 import yaml
 from PIL import Image
 from skimage.draw import line
+import matplotlib.pyplot as plt
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -365,11 +366,42 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
     
-    def heuristic_cost(self, point, goal):
-        base_cost = np.linalg.norm([goal[0] - point[0], goal[1] - point[1]])
-        obstacle_distance = self.calculate_obstacle_distance(point)
+    def heuristic_cost(self, current, goal, next_waypoint, waypoint_list, waypoint_index, direction_weight=3.0, obstacle_weight=1.0, dist_to_goal_weight=1.0):
+        """
+        综合启发函数，明确引导路径规划顺序。
+        - `current`: 当前点 (像素坐标)。
+        - `goal`: 当前子目标点 (像素坐标)。
+        - `next_waypoint`: 下一个目标路径点 (像素坐标)。
+        - `waypoint_list`: 路径点列表。
+        - `waypoint_index`: 当前路径点索引。
+        """
+        # 距离目标点的直线距离
+        dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
+
+        # 距离障碍物的惩罚
+        obstacle_distance = self.calculate_obstacle_distance(current)
         obstacle_penalty = max(0, 10 / (obstacle_distance + 1e-6) - 1) if obstacle_distance < 10 else 0
-        return base_cost + obstacle_penalty
+
+        # 引导方向权重：偏离路径序列的方向会增加惩罚
+        current_to_next = np.array(next_waypoint) - np.array(current)
+        waypoint_direction = np.array(waypoint_list[waypoint_index + 1]) - np.array(next_waypoint)
+
+        # 计算当前点到下一个路径点的方向误差
+        angle_error = np.arccos(
+            np.clip(
+                np.dot(current_to_next, waypoint_direction) / 
+                (np.linalg.norm(current_to_next) * np.linalg.norm(waypoint_direction) + 1e-6),
+                -1.0, 1.0
+            )
+        )
+        direction_penalty = angle_error
+
+        # 综合启发值：距离、方向、障碍物
+        return (
+            dist_to_goal_weight * dist_to_goal +
+            direction_weight * direction_penalty +
+            obstacle_weight * obstacle_penalty
+        )
     
     def calculate_obstacle_distance(self, point):
         # 找到距離點最近的障礙物（以像素計算）
@@ -383,14 +415,20 @@ class GazeboEnv:
         distances = np.linalg.norm(obstacle_coords - np.array([x, y]), axis=1)
         return distances.min()  # 返回最近障礙物的距離
     
-    def get_neighbors(self, current, grid_size=1):
+    def get_neighbors(self, current, step=1):
+        """
+        生成邻居点。
+        - `current`: 当前点 (x, y)。
+        - `step`: 固定步长。
+        """
         x, y = current
+        directions = [
+            (step, 0), (-step, 0), (0, step), (0, -step),  # 上下左右
+            (step, step), (step, -step), (-step, step), (-step, -step)  # 对角线
+        ]
         neighbors = [
             (x + dx, y + dy)
-            for dx, dy in [
-                (-grid_size, 0), (grid_size, 0), (0, -grid_size), (0, grid_size),
-                (-grid_size, -grid_size), (grid_size, grid_size), (-grid_size, grid_size), (grid_size, -grid_size)
-            ]
+            for dx, dy in directions
             if 0 <= x + dx < self.slam_map.shape[1] and 0 <= y + dy < self.slam_map.shape[0]
         ]
         return neighbors
@@ -409,7 +447,7 @@ class GazeboEnv:
         path.reverse()
         return path
     
-    def is_line_free(self, png_image, start, end, safe_threshold=200):
+    def is_line_free(self, png_image, start, end, safe_threshold=250):
         """
         檢查從 start 到 end 的直線是否沒有障礙物。
 
@@ -438,57 +476,96 @@ class GazeboEnv:
 
     def dynamic_grid_size(self, current, neighbor):
         obstacle_distance = self.calculate_obstacle_distance(current)
-        if obstacle_distance > 20:  # 遠離障礙物
-            return 5
+        if obstacle_distance > 50:  # 遠離障礙物
+            return 30
+        elif obstacle_distance > 30:  # 中等距離
+            return 20
         elif obstacle_distance > 10:  # 中等距離
-            return 2
+            return 5
         else:  # 靠近障礙物
             return 1
+    
+    def visualize_path(self, start, goal, path_points, map_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.png', save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/a_star_path.png'):
+        """
+        可视化 A* 生成的路径，并将其保存为图片。
+        :param start: 起点坐标 (gazebo 坐标系)
+        :param goal: 终点坐标 (gazebo 坐标系)
+        :param path_points: A* 生成的路径点列表 (像素坐标系)
+        :param map_path: SLAM 地图路径
+        :param save_path: 保存图片的路径
+        """
+        # 加载 SLAM 地图
+        if not hasattr(self, 'slam_map'):
+            raise ValueError("SLAM map not loaded.")
+        
+        # 转换地图为灰度图
+        map_img = self.slam_map.copy()
+        map_img[map_img < 250] = 0  # 障碍物区域
+        map_img[map_img >= 250] = 255  # 可通行区域
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=10):
-        rospy.loginfo(f"Starting A* path planning: Start {start_point} -> Goal {goal_point}")
+        # 绘制地图
+        plt.figure(figsize=(10, 10))
+        plt.imshow(map_img, cmap='gray', origin='upper')
+
+        # 转换路径点到图像坐标
+        img_start = self.gazebo_to_image_coords(*start)
+        img_goal = self.gazebo_to_image_coords(*goal)
+        img_path = [(p[0], p[1]) for p in path_points]
+
+        # 绘制起点、终点和路径
+        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
+        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
+        path_x, path_y = zip(*img_path)
+        plt.plot(path_x, path_y, color='green', linewidth=2, label='A* Path')
+
+        # 添加图例和保存图片
+        plt.legend()
+        plt.title('A* Path Visualization')
+        plt.savefig(save_path)
+        plt.close()
+        rospy.loginfo(f"Path visualization saved to {save_path}")
+
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, waypoint_list, waypoint_index, step=1):
+        """
+        A*路径规划，结合方向权重优化，确保路径按照顺序。
+        """
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        open_set = [(img_start_x, img_start_y)]  # 開放列表
-        came_from = {}  # 路徑回溯
-        g_score = {open_set[0]: 0}  # 起始節點 g 值
-        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y))}
+        open_set = [(img_start_x, img_start_y)]
+        came_from = {}
+        g_score = {open_set[0]: 0}
+        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y), waypoint_list[waypoint_index + 1], waypoint_list, waypoint_index)}
 
-        step = 0  # 記錄步驟數
         while open_set:
-            step += 1
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
-            #rospy.loginfo(f"Step {step}: Current Node {current}, f_score {f_score[current]}")
 
-            if current == (img_goal_x, img_goal_y):  # 到達目標
-                rospy.loginfo("Goal reached! Reconstructing path...")
-                optimized_path = self.reconstruct_path(came_from, current)
-                rospy.loginfo(f"Optimized path: {optimized_path}")
-                return optimized_path
+            if current == (img_goal_x, img_goal_y):  # 到达目标点
+                path = self.reconstruct_path(came_from, current)
+
+                # 可视化路径
+                self.visualize_path(start_point, goal_point, path)
+
+                return path
 
             open_set.remove(current)
-            neighbors = self.get_neighbors(current, grid_size)
-
-            for neighbor in neighbors:
-                if not self.is_line_free(png_image, current, neighbor):  # 檢查直線可行性
-                    rospy.logdebug(f"Neighbor {neighbor} is not free. Skipping.")
+            for neighbor in self.get_neighbors(current, step):
+                if not self.is_line_free(png_image, current, neighbor):  # 检查是否可行
                     continue
 
                 tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
-
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    h_cost = self.heuristic_cost(neighbor, (img_goal_x, img_goal_y))
-                    f_score[neighbor] = tentative_g_score + h_cost
-
-                    rospy.logdebug(f"Neighbor {neighbor} added to open set with f_score {f_score[neighbor]}")
+                    f_score[neighbor] = (
+                        tentative_g_score +
+                        self.heuristic_cost(neighbor, (img_goal_x, img_goal_y), waypoint_list[waypoint_index + 1], waypoint_list, waypoint_index)
+                    )
                     if neighbor not in open_set:
                         open_set.append(neighbor)
 
         rospy.logwarn(f"A* failed between {start_point} and {goal_point}.")
-        return [start_point, goal_point]  # 如果 A* 失敗，返回原點到目標的直接路徑
+        return [start_point, goal_point]
 
     def optimize_waypoints_with_a_star(self):
         if self.optimized_waypoints_calculated:
@@ -503,17 +580,17 @@ class GazeboEnv:
 
             rospy.loginfo(f"Optimizing path segment {i}: Start {start} -> Goal {goal}")
 
-            # 判斷子路徑是否需要重新規劃
+            # 判断子路径是否需要重新规划
             if self.waypoint_failures.get(i, 0) > 2:
                 rospy.logwarn(f"Waypoint segment {i} failed too many times. Re-planning.")
-                self.subpath_stability[i] = 0  # 重置穩定性計數
+                self.subpath_stability[i] = 0  # 重置稳定性计数
             elif hasattr(self, 'subpath_stability') and self.subpath_stability.get(i, 0) > 5:
-                # 子路徑穩定，直接使用之前的優化結果
+                # 子路径稳定，直接使用之前的优化结果
                 rospy.loginfo(f"Waypoint segment {i} is stable. Skipping re-planning.")
                 optimized_waypoints.extend(self.optimized_waypoints[i:i + 2])
                 continue
 
-            # 隨機混入 RL 決策，逐步提高 RL 接管比例
+            # 随机混入 RL 决策，逐步提高 RL 接管比例
             if np.random.random() < min(self.episode_counter / 1000, 1.0):
                 self.use_rl_for_a_star = True
                 rospy.loginfo(f"Using RL-assisted A* for segment {i}.")
@@ -521,17 +598,17 @@ class GazeboEnv:
                 self.use_rl_for_a_star = False
                 rospy.loginfo(f"Using standard A* for segment {i}.")
 
-            # A* 優化子路徑
-            path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal)
+            # A* 优化子路径
+            path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal, self.waypoints, i)
 
-            # 更新穩定性與失敗次數
+            # 更新稳定性与失败次数
             if path_segment == [start, goal]:
                 rospy.logwarn(f"A* failed for segment {i}. Using direct path.")
                 self.waypoint_failures[i] = self.waypoint_failures.get(i, 0) + 1
                 self.subpath_stability[i] = 0
             else:
                 rospy.loginfo(f"Optimized path for segment {i} successfully.")
-                self.waypoint_failures[i] = 0  # 重置失敗次數
+                self.waypoint_failures[i] = 0  # 重置失败次数
                 self.subpath_stability[i] = self.subpath_stability.get(i, 0) + 1
 
             optimized_waypoints.extend(path_segment)
@@ -541,26 +618,6 @@ class GazeboEnv:
         self.optimized_waypoints_calculated = True
         rospy.loginfo("Waypoint optimization complete.")
     
-    def generate_rl_input(self, current, neighbor, goal, g_score, f_score):
-        """
-        生成 Actor-Critic 的輸入數據：
-        - 當前節點到鄰居的位移 (dx, dy)
-        - 鄰居到目標的位移 (goal_dx, goal_dy)
-        - 當前節點的 g 值與鄰居的 f 值
-        """
-        current_x, current_y = current
-        neighbor_x, neighbor_y = neighbor
-        goal_x, goal_y = goal
-
-        return [
-            neighbor_x - current_x,
-            neighbor_y - current_y,
-            goal_x - neighbor_x,
-            goal_y - neighbor_y,
-            g_score[current],
-            f_score.get(neighbor, float('inf'))
-        ]
-
     def bezier_curve(self, waypoints, n_points=100):
         waypoints = np.array(waypoints)
         n = len(waypoints) - 1
@@ -575,13 +632,6 @@ class GazeboEnv:
             curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
 
         return curve
-
-    def collision_callback(self, data):
-        if len(data.states) > 0:
-            self.collision_detected = True
-            rospy.loginfo("Collision detected!")
-        else:
-            self.collision_detected = False
 
     def generate_imu_data(self):
         imu_data = Imu()
@@ -686,7 +736,7 @@ class GazeboEnv:
             return self.state, reward, True, {}
 
         # 計算行動
-        print("Using Pure Pursuit (A*).")
+        #print("Using Pure Pursuit (A*).")
         action = self.calculate_action_pure_pursuit()
         linear_speed = np.clip(action[0], -2.0, 3.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
