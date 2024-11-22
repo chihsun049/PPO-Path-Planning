@@ -52,9 +52,17 @@ class CustomController:
         self.pitch_angle = msg.data
 
     def calculate_slope_compensation(self):
-        # 使用接收的 pitch_angle 計算坡度補償
-        slope_compensation = self.pitch_angle * 10  # 根據需求調整計算
-        return slope_compensation
+        # 根据车辆的倾斜角度计算坡度补偿
+        gravity = 9.81  # 地球重力加速度 (m/s^2)
+        slope_force = self.vehicle_mass * gravity * math.sin(self.pitch_angle) * 30
+        
+        # 根据坡度的正负，决定是增加还是减少动力
+        if self.pitch_angle > 0.3:  # 上坡时增加动力
+            return slope_force
+        elif self.pitch_angle < -0.3:  # 下坡时减少动力
+            return -slope_force
+        else:
+            return 0.0  # 平地或无明显坡度时，无需补偿
 
     def quaternion_to_euler(self, q):
         # 将四元数转换为欧拉角度

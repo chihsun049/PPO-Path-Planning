@@ -361,27 +361,19 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal, next_waypoint=None, 
-                   direction_weight=1.0, obstacle_weight=10.0, 
+    def heuristic_cost(self, current, goal, next_waypoint=None,
+                   direction_weight=1.0, obstacle_weight=50.0, 
                    global_goal_weight=1.0, turn_safety_weight=5.0):
-        """
-        修改后的启发函数，增加提前转弯的启发代价。
-        """
-        # 到目标点的距离（全局目标）
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
-
-        # 到障碍物的距离和惩罚
         obstacle_distance = self.calculate_obstacle_distance(current)
         if obstacle_distance < 1e-3:  # 防止除以零
             obstacle_distance = 1e-3
-        obstacle_penalty = obstacle_weight / obstacle_distance  # 障碍物距离的反比例惩罚
+        obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)  # 加强障碍物影响
 
-        # 如果有下一路点，计算方向引导
         direction_penalty = 0
         if next_waypoint:
             current_to_next = np.array(next_waypoint) - np.array(current)
             goal_direction = np.array(goal) - np.array(current)
-            # 计算方向误差（使用余弦夹角公式）
             angle_error = np.arccos(
                 np.clip(
                     np.dot(current_to_next, goal_direction) /
@@ -391,22 +383,19 @@ class GazeboEnv:
             )
             direction_penalty = direction_weight * angle_error
 
-        # 提前转弯代价（基于离墙距离和目标方向）
         turn_safety_penalty = 0
         if next_waypoint:
             dist_to_next_wp = np.linalg.norm(np.array(next_waypoint) - np.array(current))
             if dist_to_next_wp < 2.0:  # 距离较短时，增加转弯代价
                 turn_safety_penalty = turn_safety_weight * (1 / dist_to_next_wp)
 
-        # 动态调整全局目标权重
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50)
 
-        # 综合启发值
         return (
-            dynamic_global_goal_weight * dist_to_goal +  # 动态全局目标权重
-            direction_penalty +  # 保持方向引导
-            obstacle_penalty +  # 强化障碍物避让
-            turn_safety_penalty  # 提前转弯的代价
+            dynamic_global_goal_weight * dist_to_goal +
+            direction_penalty +
+            obstacle_penalty +
+            turn_safety_penalty
         )
     
     def calculate_obstacle_distance(self, point):
@@ -453,42 +442,28 @@ class GazeboEnv:
         path.reverse()
         return path
     
-    def is_line_free(self, png_image, start, end, safe_threshold=230, min_clearance=5):
+    def is_line_free(self, png_image, current, neighbor, safe_threshold=230, min_clearance=5):
         """
-        檢查從 start 到 end 的直線是否沒有障礙物，並保證最小安全距離。
+        檢查從 current 到 neighbor 的直線是否沒有障礙物，並保證最小安全距離。
         """
         # 確保座標為整數
-        start = (int(round(start[0])), int(round(start[1])))
-        end = (int(round(end[0])), int(round(end[1])))
+        current = (int(round(current[0])), int(round(current[1])))
+        neighbor = (int(round(neighbor[0])), int(round(neighbor[1])))
 
-        # 使用 Bresenham 算法生成線上的像素點
-        rr, cc = line(start[1], start[0], end[1], end[0])  # skimage.draw.line
+        # 使用 Bresenham 算法生成 current 到 neighbor 的線段
+        rr, cc = line(current[1], current[0], neighbor[1], neighbor[0])  # skimage.draw.line
 
-        # 遍歷線上的每個點檢查障礙物
+        # 遍歷線段上的每個像素點，檢查障礙物和安全距離
         for r, c in zip(rr, cc):
-            # 檢查是否越界
+            # 確保像素點在地圖範圍內
             if not (0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]):
-                return False  # 超出地圖範圍視為障礙
-            # 檢查像素值是否低於閾值，或距離障礙物太近
+                return False  # 超出地圖範圍，視為障礙
+            # 檢查像素值是否低於閾值，表示存在障礙物
             if png_image[r, c] < safe_threshold:
-                return False  # 發現障礙物
+                return False
             # 檢查是否滿足最小安全距離
-            if not self.has_minimum_clearance(png_image, r, c, min_clearance):
-                return False  # 不滿足安全距離
 
-        return True  # 全部點均可通行
-
-    def has_minimum_clearance(self, png_image, r, c, clearance):
-        """
-        檢查某一點是否滿足最小安全距離。
-        """
-        height, width = png_image.shape
-        for dr in range(-clearance, clearance + 1):
-            for dc in range(-clearance, clearance + 1):
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < height and 0 <= nc < width and png_image[nr, nc] < 230:
-                    return False  # 發現障礙物
-        return True
+        return True  # 通過檢查，返回可通行
 
     def dynamic_grid_size(self, current, neighbor):
         obstacle_distance = self.calculate_obstacle_distance(current)
@@ -522,7 +497,7 @@ class GazeboEnv:
 
             open_set.remove(current)
             for neighbor in self.get_neighbors(current, step):
-                if not self.is_line_free(png_image, current, neighbor):  # 檢查是否可以直線通行
+                if not self.is_line_free(png_image, current, neighbor):  # 只檢查 current 到 neighbor 是否通暢
                     continue
 
                 tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
@@ -562,6 +537,12 @@ class GazeboEnv:
             complete_path.append(goal)
 
         self.optimized_waypoints = [self.image_to_gazebo_coords(*p) for p in complete_path]
+
+        # 添加间隔采样逻辑
+        self.optimized_waypoints = self.optimized_waypoints[::5]  # 每隔5个点取1个点
+        if self.optimized_waypoints[-1] != self.waypoints[-1]:
+            self.optimized_waypoints.append(self.waypoints[-1])  # 确保终点被保留
+
         self.optimized_waypoints_calculated = True
 
         # 替换原始路径为优化后的路径
@@ -882,52 +863,66 @@ class GazeboEnv:
 
         # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 2.0 + 0.5 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 2.0 + 1.5 * linear_speed  # 根據速度調整前視距離
 
-        # 找到最近的路徑點
-        closest_index = self.find_closest_waypoint(robot_x, robot_y)
+        # 定義角度範圍，以當前車輛的yaw為中心
+        angle_range = np.deg2rad(40)  # ±40度的範圍
+        closest_index = None
+        min_distance = float('inf')
 
-        # 累計距離，尋找符合前視距離的目標點
+        # 尋找該範圍內的最近路徑點
+        for i in range(self.current_waypoint_index, len(self.optimized_waypoints)):
+            wp_x, wp_y = self.optimized_waypoints[i]
+            dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
+            direction_to_wp = np.arctan2(wp_y - robot_y, wp_x - robot_x)
+
+            # 計算該點相對於當前車輛朝向的角度
+            yaw_diff = direction_to_wp - robot_yaw
+            yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))  # 確保角度在[-pi, pi]範圍內
+
+            # 如果點位於yaw ± 35度範圍內，並且距離更近
+            if np.abs(yaw_diff) < angle_range and dist_to_wp < min_distance:
+                min_distance = dist_to_wp
+                closest_index = i
+
+        # 如果沒有找到符合條件的點，則繼續使用原始最近點
+        if closest_index is None:
+            closest_index = self.find_closest_waypoint(robot_x, robot_y)
+
+        target_index = closest_index
+
+        # 根據前視距離選擇參考的路徑點
         cumulative_distance = 0.0
-        target_index = closest_index  # 默認為最近的路徑點
         for i in range(closest_index, len(self.waypoints)):
             wp_x, wp_y = self.waypoints[i]
             dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
             cumulative_distance += dist_to_wp
-
-            # 如果累計距離超過前視距離
             if cumulative_distance >= lookahead_distance:
-                # 提前轉彎的目標點（提前 2 個點，避免在急轉彎時選擇過於靠近的點）
-                if i + 2 < len(self.waypoints):  # 確保不超出範圍
-                    target_index = i + 2
-                else:
-                    target_index = i
+                target_index = i
                 break
-
-        # 獲取目標點座標
+        # 獲取前視點座標
         target_x, target_y = self.waypoints[target_index]
 
-        # 計算目標點的方向
+        # 計算前視點的方向
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_error = direction_to_target - robot_yaw
-        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))  # 確保角度在 [-pi, pi] 範圍內
+        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))  # 確保角度在[-pi, pi]範圍內
 
         # 根據角度誤差調整速度
-        if np.abs(yaw_error) > 0.5:
-            linear_speed = 0.2  # 急轉彎時大幅減速
-        elif np.abs(yaw_error) > 0.3:
-            linear_speed = 0.5  # 減速
+        if np.abs(yaw_error) > 0.3:
+            linear_speed = 0.5
+        elif np.abs(yaw_error) > 0.1:
+            linear_speed = 1.0
         else:
-            linear_speed = 1.5  # 正常速度
+            linear_speed = 1.5
 
-        # 使用 PD 控制器調整轉向角度
+        # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = yaw_error - previous_yaw_error
         steer_angle = kp * yaw_error + kd * current_yaw_error_rate
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)  # 限制轉向角速度
+        steer_angle = np.clip(steer_angle, -0.6, 0.6)
 
-        # 更新歷史誤差
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
@@ -946,13 +941,13 @@ class GazeboEnv:
     def adjust_control_params(self, linear_speed):
         if linear_speed <= 0.5:
             kp = 0.5
-            kd = 0.2
+            kd = 0.4
         elif linear_speed <= 1.0:
             kp = 0.4
             kd = 0.3
         else:
             kp = 0.3
-            kd = 0.4
+            kd = 0.2
         return kp, kd
 
 class ActorCritic(nn.Module):
