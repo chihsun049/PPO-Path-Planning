@@ -351,7 +351,6 @@ class GazeboEnv:
             distances.append(distance)
         return distances
 
-
     def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
         img_x = 2000 + gazebo_x * 20
         img_y = 2000 - gazebo_y * 20
@@ -362,23 +361,26 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal, next_waypoint=None, direction_weight=1.0, obstacle_weight=5.0, global_goal_weight=3.0):
+    def heuristic_cost(self, current, goal, next_waypoint=None, 
+                   direction_weight=1.0, obstacle_weight=10.0, global_goal_weight=1.0):
         """
-        綜合啟發函數，結合全局目標和障礙物考量。
+        修改后的启发函数，增加障碍物距离的影响权重，使得路径更远离障碍物。
         """
-        # 到目標點的距離（全局目標）
+        # 到目标点的距离（全局目标）
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
 
-        # 到障礙物的懲罰
+        # 到障碍物的距离和惩罚
         obstacle_distance = self.calculate_obstacle_distance(current)
-        obstacle_penalty = max(0, 50 / (obstacle_distance + 1e-6)) if obstacle_distance < 20 else 0
+        if obstacle_distance < 1e-3:  # 防止除以零
+            obstacle_distance = 1e-3
+        obstacle_penalty = obstacle_weight / obstacle_distance  # 障碍物距离的反比例惩罚
 
-        # 如果有下一個路徑點，考慮方向引導
+        # 如果有下一路点，计算方向引导
         direction_penalty = 0
         if next_waypoint:
             current_to_next = np.array(next_waypoint) - np.array(current)
             goal_direction = np.array(goal) - np.array(current)
-            # 計算方向誤差
+            # 计算方向误差（使用余弦夹角公式）
             angle_error = np.arccos(
                 np.clip(
                     np.dot(current_to_next, goal_direction) /
@@ -386,19 +388,22 @@ class GazeboEnv:
                     -1.0, 1.0
                 )
             )
-            direction_penalty = angle_error
+            direction_penalty = direction_weight * angle_error
 
-        # 綜合啟發值
+        # 动态调整全局目标权重
+        dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50)
+
+        # 综合启发值
         return (
-            global_goal_weight * dist_to_goal +
-            direction_weight * direction_penalty +
-            obstacle_weight * obstacle_penalty
+            dynamic_global_goal_weight * dist_to_goal +  # 动态全局目标权重
+            direction_penalty +  # 保持方向引导
+            obstacle_penalty  # 强化障碍物避让
         )
     
     def calculate_obstacle_distance(self, point):
         # 找到距離點最近的障礙物（以像素計算）
         x, y = point
-        search_range = 10  # 搜索範圍（像素）
+        search_range = 20  # 搜索範圍（像素）
         obstacle_coords = np.argwhere(self.slam_map[max(0, y - search_range):min(self.slam_map.shape[0], y + search_range),
                                                     max(0, x - search_range):min(self.slam_map.shape[1], x + search_range)] < 250)
         if len(obstacle_coords) == 0:
@@ -439,7 +444,7 @@ class GazeboEnv:
         path.reverse()
         return path
     
-    def is_line_free(self, png_image, start, end, safe_threshold=250):
+    def is_line_free(self, png_image, start, end, safe_threshold=230):
         """
         檢查從 start 到 end 的直線是否沒有障礙物。
 
@@ -669,28 +674,31 @@ class GazeboEnv:
 
         return occupancy_grid
     
-    def check_no_progress(self, current_distance_to_goal):
+    def check_no_progress(self):
         """
-        檢查機器人是否長時間沒有進展。
+        检查机器人是否长时间没有移动，判定为无进展。
         """
         current_time = rospy.get_time()
-        
-        # 初始化 previous_distance_to_goal
-        if self.previous_distance_to_goal is None:
-            self.previous_distance_to_goal = current_distance_to_goal
+        robot_x, robot_y, _ = self.get_robot_position()  # 获取机器人当前位置信息
+
+        # 初始化之前的位置和时间
+        if self.previous_robot_position is None:
+            self.previous_robot_position = (robot_x, robot_y)
             self.last_progress_time = current_time
             return False
 
-        # 如果距離減少，則更新進展時間
-        if current_distance_to_goal < self.previous_distance_to_goal - 0.05:  # 容許微小浮動
-            self.last_progress_time = current_time
-            self.previous_distance_to_goal = current_distance_to_goal
-            return False
+        # 计算当前位置与之前位置的距离
+        distance_moved = np.linalg.norm(np.array(self.previous_robot_position) - np.array((robot_x, robot_y)))
 
-        # 如果超過超時時間沒有進展，返回 True
-        if current_time - self.last_progress_time > self.progress_timeout:
-            rospy.logwarn("No progress detected. Triggering environment reset.")
-            return True
+        # 如果距离小于移动阈值，检查时间是否超过超时阈值
+        if distance_moved < 0.05:  # 移动距离阈值（单位：米）
+            if current_time - self.last_progress_time > self.progress_timeout:
+                rospy.logwarn(f"Robot has not moved for {self.progress_timeout} seconds. Triggering reset.")
+                return True
+        else:
+            # 如果机器人有移动，更新最后进展时间和位置
+            self.last_progress_time = current_time
+            self.previous_robot_position = (robot_x, robot_y)
 
         return False
 
@@ -705,9 +713,9 @@ class GazeboEnv:
         distance_to_goal = distances[closest_index]
 
         # 無進展檢測
-        if self.check_no_progress(distance_to_goal):
+        if self.check_no_progress():
             self.done = True
-            reward -= 1000  # 對無進展情況給予懲罰
+            reward -= 1000  # 给无进展惩罚
             return self.state, reward, True, {}
 
         # 打印調試訊息
