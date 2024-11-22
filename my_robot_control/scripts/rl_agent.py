@@ -147,13 +147,9 @@ class GazeboEnv:
         self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
         self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
 
-        self.max_no_progress_steps = 10
-        self.no_progress_steps = 0
-        self.use_rl_for_a_star = False  # 是否啟用 RL 介入 A*
-        self.episode_counter = 0  # 用於控制模仿學習階段與 RL 過渡
-
-        self.subpath_stability = {}  # 追蹤子路徑穩定性
-        self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}  # 初始化失敗次數
+        self.progress_timeout = 20  # 無進展的超時秒數
+        self.last_progress_time = rospy.get_time()  # 上次檢測到進展的時間
+        self.previous_distance_to_goal = None  # 上次距離目標的距離
         
         # 新增屬性，標記是否已計算過優化路徑
         self.optimized_waypoints_calculated = False
@@ -365,40 +361,36 @@ class GazeboEnv:
         gazebo_x = (img_x - 2000) / 20
         gazebo_y = (2000 - img_y) / 20
         return gazebo_x, gazebo_y
-    
-    def heuristic_cost(self, current, goal, next_waypoint, waypoint_list, waypoint_index, direction_weight=5.0, obstacle_weight=1.0, dist_to_goal_weight=1.0):
+
+    def heuristic_cost(self, current, goal, next_waypoint=None, direction_weight=1.0, obstacle_weight=5.0, global_goal_weight=3.0):
         """
-        综合启发函数，明确引导路径规划顺序。
-        - current: 当前点 (像素坐标)。
-        - goal: 当前子目标点 (像素坐标)。
-        - next_waypoint: 下一个目标路径点 (像素坐标)。
-        - waypoint_list: 路径点列表。
-        - waypoint_index: 当前路径点索引。
+        綜合啟發函數，結合全局目標和障礙物考量。
         """
-        # 距离目标点的直线距离
+        # 到目標點的距離（全局目標）
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
 
-        # 距离障碍物的惩罚
+        # 到障礙物的懲罰
         obstacle_distance = self.calculate_obstacle_distance(current)
-        obstacle_penalty = max(0, 10 / (obstacle_distance + 1e-6) - 1) if obstacle_distance < 10 else 0
+        obstacle_penalty = max(0, 50 / (obstacle_distance + 1e-6)) if obstacle_distance < 20 else 0
 
-        # 引导方向权重：偏离路径序列的方向会增加惩罚
-        current_to_next = np.array(next_waypoint) - np.array(current)
-        waypoint_direction = np.array(waypoint_list[waypoint_index + 1]) - np.array(next_waypoint)
-
-        # 计算当前点到下一个路径点的方向误差
-        angle_error = np.arccos(
-            np.clip(
-                np.dot(current_to_next, waypoint_direction) / 
-                (np.linalg.norm(current_to_next) * np.linalg.norm(waypoint_direction) + 1e-6),
-                -1.0, 1.0
+        # 如果有下一個路徑點，考慮方向引導
+        direction_penalty = 0
+        if next_waypoint:
+            current_to_next = np.array(next_waypoint) - np.array(current)
+            goal_direction = np.array(goal) - np.array(current)
+            # 計算方向誤差
+            angle_error = np.arccos(
+                np.clip(
+                    np.dot(current_to_next, goal_direction) /
+                    (np.linalg.norm(current_to_next) * np.linalg.norm(goal_direction) + 1e-6),
+                    -1.0, 1.0
+                )
             )
-        )
-        direction_penalty = angle_error
+            direction_penalty = angle_error
 
-        # 综合启发值：距离、方向、障碍物
+        # 綜合啟發值
         return (
-            dist_to_goal_weight * dist_to_goal +
+            global_goal_weight * dist_to_goal +
             direction_weight * direction_penalty +
             obstacle_weight * obstacle_penalty
         )
@@ -485,104 +477,28 @@ class GazeboEnv:
         else:  # 靠近障礙物
             return 1
     
-    def visualize_path(self, start, goal, path_points, map_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.png', save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/a_star_path.png'):
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
         """
-        可视化 A* 生成的路径，并将其保存为图片。
-        :param start: 起点坐标 (gazebo 坐标系)
-        :param goal: 终点坐标 (gazebo 坐标系)
-        :param path_points: A* 生成的路径点列表 (像素坐标系)
-        :param map_path: SLAM 地图路径
-        :param save_path: 保存图片的路径
+        執行改進版的 A* 規劃。
         """
-        # 加载 SLAM 地图
-        if not hasattr(self, 'slam_map'):
-            raise ValueError("SLAM map not loaded.")
-        
-        # 转换地图为灰度图
-        map_img = self.slam_map.copy()
-        map_img[map_img < 250] = 0  # 障碍物区域
-        map_img[map_img >= 250] = 255  # 可通行区域
-
-        # 绘制地图
-        plt.figure(figsize=(10, 10))
-        plt.imshow(map_img, cmap='gray', origin='upper')
-
-        # 转换路径点到图像坐标
-        img_start = self.gazebo_to_image_coords(*start)
-        img_goal = self.gazebo_to_image_coords(*goal)
-        img_path = [(p[0], p[1]) for p in path_points]
-
-        # 绘制起点、终点和路径
-        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
-        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
-        path_x, path_y = zip(*img_path)
-        plt.plot(path_x, path_y, color='green', linewidth=2, label='A* Path')
-
-        # 添加图例和保存图片
-        plt.legend()
-        plt.title('A* Path Visualization')
-        plt.savefig(save_path)
-        plt.close()
-        rospy.loginfo(f"Path visualization saved to {save_path}")
-    
-    def visualize_complete_path(self, complete_path, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path.png'):
-        """
-        可视化完整路径，并将其保存为图片。
-        :param complete_path: 完整路径点列表（像素坐标系）。
-        :param save_path: 保存图片的路径。
-        """
-        if not hasattr(self, 'slam_map'):
-            raise ValueError("SLAM map not loaded.")
-        
-        # 转换地图为灰度图
-        map_img = self.slam_map.copy()
-        map_img[map_img < 250] = 0  # 障碍物区域
-        map_img[map_img >= 250] = 255  # 可通行区域
-
-        # 绘制地图
-        plt.figure(figsize=(10, 10))
-        plt.imshow(map_img, cmap='gray', origin='upper')
-
-        # 转换路径点到图像坐标
-        img_path = [(p[0], p[1]) for p in complete_path]
-        path_x, path_y = zip(*img_path)
-
-        # 绘制路径
-        plt.plot(path_x, path_y, color='green', linewidth=2, label='Full Path')
-
-        # 标注起点和终点
-        img_start = self.gazebo_to_image_coords(*self.waypoints[0])
-        img_goal = self.gazebo_to_image_coords(*self.waypoints[-1])
-        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
-        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
-
-        # 添加图例和保存图片
-        plt.legend()
-        plt.title('Complete Path Visualization')
-        plt.savefig(save_path)
-        plt.close()
-        rospy.loginfo(f"Complete path visualization saved to {save_path}")
-
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, waypoint_list, waypoint_index, step=1):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
         open_set = [(img_start_x, img_start_y)]
         came_from = {}
         g_score = {open_set[0]: 0}
-        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y), waypoint_list[waypoint_index + 1], waypoint_list, waypoint_index)}
+        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y))}
 
         while open_set:
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
 
-            if current == (img_goal_x, img_goal_y):  # 到达当前目标点
-                path = self.reconstruct_path(came_from, current)
-                self.visualize_path(start_point, goal_point, path)  # 可视化路径
-                return path
+            # 如果到達目標，回溯路徑
+            if current == (img_goal_x, img_goal_y):
+                return self.reconstruct_path(came_from, current)
 
             open_set.remove(current)
             for neighbor in self.get_neighbors(current, step):
-                if not self.is_line_free(png_image, current, neighbor):  # 检查直线通行性
+                if not self.is_line_free(png_image, current, neighbor):  # 檢查是否可以直線通行
                     continue
 
                 tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
@@ -591,62 +507,88 @@ class GazeboEnv:
                     g_score[neighbor] = tentative_g_score
                     f_score[neighbor] = (
                         tentative_g_score +
-                        self.heuristic_cost(neighbor, (img_goal_x, img_goal_y), waypoint_list[waypoint_index + 1], waypoint_list, waypoint_index)
+                        self.heuristic_cost(neighbor, (img_goal_x, img_goal_y))  # 僅用全局目標計算
                     )
                     if neighbor not in open_set:
                         open_set.append(neighbor)
 
         rospy.logwarn(f"A* failed between {start_point} and {goal_point}.")
-        return [start_point, goal_point]
+        return [start_point, goal_point]  # 無法生成時直接連接
 
     def optimize_waypoints_with_a_star(self):
+        """
+        使用改進版 A* 規劃全局路徑。
+        """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Optimized waypoints already calculated. Skipping.")
             return
 
-        rospy.loginfo("Starting waypoint optimization with A*...")
-        optimized_waypoints = [self.waypoints[0]]  # 初始化路径，包含起点
-        complete_path = []  # 用于存储完整的路径点
+        rospy.loginfo("Starting global path optimization with A*...")
+        complete_path = []
 
         for i in range(len(self.waypoints) - 1):
             start = self.waypoints[i]
             goal = self.waypoints[i + 1]
+            rospy.loginfo(f"Optimizing segment {i}: {start} -> {goal}")
 
-            rospy.loginfo(f"Optimizing path segment {i}: Start {start} -> Goal {goal}")
+            # 計算該段的優化路徑
+            path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal)
+            if len(path_segment) > 2:
+                complete_path.extend(path_segment[:-1])  # 跳過重複點
+            complete_path.append(goal)
 
-            # 调用 A* 优化路径段
-            path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal, self.waypoints, i)
-
-            # 如果路径生成失败，保留直接连接路径点
-            if len(path_segment) <= 2:
-                rospy.logwarn(f"A* failed for segment {i}. Using direct connection.")
-                optimized_waypoints.append(goal)
-            else:
-                optimized_waypoints.extend(path_segment[1:])  # 跳过重复的起点
-                complete_path.extend(path_segment)  # 将路径段添加到完整路径中
-
-        self.optimized_waypoints = optimized_waypoints
-        self.waypoints = optimized_waypoints  # 更新为优化后的路径点
+        self.optimized_waypoints = [self.image_to_gazebo_coords(*p) for p in complete_path]
         self.optimized_waypoints_calculated = True
 
-        # 在优化完成后保存完整路径图像
+        # 替换原始路径为优化后的路径
+        self.waypoints = self.optimized_waypoints
+
+        # 可视化完整路徑
         self.visualize_complete_path(complete_path)
-        rospy.loginfo("Waypoint optimization complete.")
-    
-    def bezier_curve(self, waypoints, n_points=100):
-        waypoints = np.array(waypoints)
-        n = len(waypoints) - 1
+        rospy.loginfo("Global path optimization complete.")
 
-        def bernstein_poly(i, n, t):
-            return comb(n, i) * (t ** i) * ((1 - t) ** (n - i))
+    def visualize_complete_path(self, complete_path, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path.png'):
+        """
+        可视化完整路径，并将其保存为图片。
+        """
+        if not hasattr(self, 'slam_map'):
+            raise ValueError("SLAM map not loaded.")
 
-        t = np.linspace(0.0, 1.0, n_points)
-        curve = np.zeros((n_points, 2))
+        # 转换地图为灰度图
+        map_img = self.slam_map.copy()
+        map_img[map_img < 250] = 0  # 障碍物区域
+        map_img[map_img >= 250] = 255  # 可通行区域
 
-        for i in range(n + 1):
-            curve += np.outer(bernstein_poly(i, n, t), waypoints[i])
+        # 转换路径点到图像坐标
+        img_path = [self.gazebo_to_image_coords(p[0], p[1]) for p in complete_path]
 
-        return curve
+        # 绘制地图
+        plt.figure(figsize=(10, 10))
+        plt.imshow(map_img, cmap='gray', origin='upper')
+
+        # 验证路径点是否在地图范围内
+        valid_points = [(x, y) for x, y in img_path if 0 <= x < map_img.shape[1] and 0 <= y < map_img.shape[0]]
+        if valid_points:
+            # 绘制路径点
+            path_x, path_y = zip(*valid_points)
+            plt.plot(path_x, path_y, color='green', linewidth=2, label='Full Path')
+
+        # 标注起点和终点
+        img_start = self.gazebo_to_image_coords(*self.waypoints[0])
+        img_goal = self.gazebo_to_image_coords(*self.waypoints[-1])
+        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
+        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
+
+        # 设置绘图范围
+        plt.xlim(0, map_img.shape[1])
+        plt.ylim(map_img.shape[0], 0)  # 注意：图像坐标 y 轴是倒置的
+
+        # 添加图例并保存图片
+        plt.legend()
+        plt.title('Complete Path Visualization')
+        plt.savefig(save_path)
+        plt.close()
+        rospy.loginfo(f"Complete path visualization saved to {save_path}")
 
     def generate_imu_data(self):
         imu_data = Imu()
@@ -726,6 +668,31 @@ class GazeboEnv:
         occupancy_grid[2, :, :] = robot_y  # 機器人的y位置
 
         return occupancy_grid
+    
+    def check_no_progress(self, current_distance_to_goal):
+        """
+        檢查機器人是否長時間沒有進展。
+        """
+        current_time = rospy.get_time()
+        
+        # 初始化 previous_distance_to_goal
+        if self.previous_distance_to_goal is None:
+            self.previous_distance_to_goal = current_distance_to_goal
+            self.last_progress_time = current_time
+            return False
+
+        # 如果距離減少，則更新進展時間
+        if current_distance_to_goal < self.previous_distance_to_goal - 0.05:  # 容許微小浮動
+            self.last_progress_time = current_time
+            self.previous_distance_to_goal = current_distance_to_goal
+            return False
+
+        # 如果超過超時時間沒有進展，返回 True
+        if current_time - self.last_progress_time > self.progress_timeout:
+            rospy.logwarn("No progress detected. Triggering environment reset.")
+            return True
+
+        return False
 
     def step(self, action):
         reward = 0
@@ -735,6 +702,13 @@ class GazeboEnv:
         # 計算當前機器人位置與所有 waypoints 的距離，並找到距離最近的 waypoint 的索引
         distances = [np.linalg.norm([robot_x - wp_x, robot_y - wp_y]) for wp_x, wp_y in self.waypoints]
         closest_index = np.argmin(distances)
+        distance_to_goal = distances[closest_index]
+
+        # 無進展檢測
+        if self.check_no_progress(distance_to_goal):
+            self.done = True
+            reward -= 1000  # 對無進展情況給予懲罰
+            return self.state, reward, True, {}
 
         # 打印調試訊息
         print(f"Robot position: ({robot_x}, {robot_y})")
@@ -749,7 +723,6 @@ class GazeboEnv:
             print('Distance to goal reward:', reward)
 
         # 判斷是否達到目標點
-        distance_to_goal = distances[closest_index]
         if self.current_waypoint_index == len(self.waypoints) - 1 and distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
             print("Goal reached!")
             reward += 1000  # 給予額外獎勵
@@ -809,9 +782,9 @@ class GazeboEnv:
         rospy.sleep(0.5)
 
         # 確保使用優化過的路徑點
-        if not self.waypoints or any(wp is None for wp in self.waypoints):
-            rospy.logwarn("Waypoints are invalid during reset. Regenerating.")
-            self.waypoints = self.generate_waypoints()
+        if not self.optimized_waypoints_calculated:
+            rospy.logwarn("Waypoints optimization not yet completed. Generating optimized waypoints.")
+            self.optimize_waypoints_with_a_star()
 
         self.current_waypoint_index = 0
         self.done = False
@@ -824,7 +797,8 @@ class GazeboEnv:
 
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
-        self.previous_distance_to_goal = None
+        self.previous_distance_to_goal = None  # 重置距離目標的記錄
+        self.last_progress_time = rospy.get_time()  # 重置上次進展的時間
         self.collision_detected = False
 
         # 確保狀態是4D張量
@@ -834,7 +808,7 @@ class GazeboEnv:
             self.state = self.state.view(1, 3, 64, 64)
 
         return self.state
-
+    
     def calculate_reward(self, robot_x, robot_y, reward, state):
         done = False
         # 將機器人的座標轉換為地圖上的坐標
@@ -851,6 +825,7 @@ class GazeboEnv:
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
         obstacle_count = np.sum(occupancy_grid <= 190)  # 假設state[0]為佔據網格通道
+        print('obstacle_count',obstacle_count)
         reward += 300 - obstacle_count*3
 
         return reward, done
@@ -888,8 +863,8 @@ class GazeboEnv:
         min_distance = float('inf')
 
         # 尋找該範圍內的最近路徑點
-        for i in range(self.current_waypoint_index, len(self.waypoints)):
-            wp_x, wp_y = self.waypoints[i]
+        for i in range(self.current_waypoint_index, len(self.optimized_waypoints)):
+            wp_x, wp_y = self.optimized_waypoints[i]
             dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
             direction_to_wp = np.arctan2(wp_y - robot_y, wp_x - robot_x)
 
@@ -944,7 +919,6 @@ class GazeboEnv:
 
         return np.array([linear_speed, steer_angle])
 
-
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
@@ -969,37 +943,85 @@ class GazeboEnv:
         return kp, kd
 
 class ActorCritic(nn.Module):
-    def __init__(self, input_dim, action_dim):  # 確保 input_dim 與展平後的狀態匹配
+    def __init__(self, observation_space, action_space):
         super(ActorCritic, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)  # input_dim 是展平後的維度
-        self.fc2 = nn.Linear(128, 128)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
+        self.bn3 = nn.BatchNorm2d(128)
 
-        # Actor 和 Critic
-        self.actor = nn.Linear(128, action_dim)
-        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))  # 標準差參數
+        self._to_linear = self._get_conv_output_size(observation_space)
+
+        self.fc1 = nn.Linear(self._to_linear, 256)
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc2 = nn.Linear(256, 128)
+
+        self.actor = nn.Linear(128, action_space)
         self.critic = nn.Linear(128, 1)
+        self.actor_log_std = nn.Parameter(torch.zeros(1, action_space))
+        
+
+    def _get_conv_output_size(self, shape):
+        x = torch.zeros(1, *shape)
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = x.view(1, -1)
+        return x.size(1)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)  # 展平成 (batch_size, input_dim)
+        if len(x.shape) == 5:
+            x = x.squeeze(1)
+
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
         x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
+
         action_mean = self.actor(x)
         action_log_std = self.actor_log_std.expand_as(action_mean)
         action_std = torch.exp(action_log_std)
 
         value = self.critic(x)
+
         return action_mean, action_std, value
 
     def act(self, state):
+        # 確保 state 是 tensor，如果是 numpy，轉換為 tensor
+        if isinstance(state, np.ndarray):
+            state = torch.tensor(state, dtype=torch.float32).to(device)
+
+        # 去除多餘維度直到 <= 4
+        while state.dim() > 4:
+            state = state.squeeze(0)
+
+        # 添加缺少的維度直到 = 4
+        while state.dim() < 4:
+            state = state.unsqueeze(0)
+
+        # 最終確認 state 是 4D
+        if state.dim() != 4:
+            raise ValueError(f"Expected state to be 4D, but got {state.dim()}D")
+
         action_mean, action_std, _ = self(state)
-        action = action_mean + action_std * torch.randn_like(action_std)  # 採樣行動
-        return action.tanh()  # 使用 tanh 限制動作範圍
+        action = action_mean + action_std * torch.randn_like(action_std)
+        action = torch.tanh(action)
+        max_action = torch.tensor([2.0, 0.6], device=action.device)
+        min_action = torch.tensor([-2.0, -0.6], device=action.device)
+        action = min_action + (action + 1) * (max_action - min_action) / 2
+        return action.detach()
 
     def evaluate(self, state, action):
         action_mean, action_std, value = self(state)
         dist = torch.distributions.Normal(action_mean, action_std)
-        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)  # 動作的對數概率
-        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)  # 熵正則
+        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
+        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
         return action_log_probs, value, dist_entropy
 
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
@@ -1011,7 +1033,7 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             param_group['lr'] = adjusted_lr
 
         with torch.no_grad():
-            old_log_probs, _, _ = model.evaluate(state_batch.view(state_batch.size(0), -1), action_batch)
+            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
         old_log_probs = old_log_probs.detach()
 
         for _ in range(PPO_EPOCHS):
@@ -1049,83 +1071,58 @@ def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler):
             memory.update_priorities(indices, priorities)
 
 def main():
-    # 初始化環境
     env = GazeboEnv(None)
-
-    input_dim = np.prod(env.observation_space)  # 確保與展平後的維度一致
-    action_dim = env.action_space
-    model = ActorCritic(input_dim=input_dim, action_dim=action_dim).to(device)
+    model = ActorCritic(env.observation_space, env.action_space).to(device)
     env.model = model
-
-    # 初始化優化器和梯度縮放器
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
 
-    # 模型保存路徑
     model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
     best_model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
     
-    # 加載已有的模型（如果存在）
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         print("Loaded existing model.")
     else:
         print("Created new model.")
 
-    # 訓練參數
     num_episodes = 1000000
-    imitation_learning_episodes = 100  # 模仿學習的回合數
     best_test_reward = -np.inf
 
-    # 訓練循環
     for e in range(num_episodes):
-        # 更新階段進度
-        env.episode_counter = e
-
-        if e < imitation_learning_episodes:
-            print(f"Episode {e}: Imitation learning phase.")
-            env.use_rl_for_a_star = False  # 完全使用 A*
-        else:
-            print(f"Episode {e}: Mixed RL phase.")
-            env.use_rl_for_a_star = True  # 混合 RL
-
-        # 確保優化過的路徑點被使用
         if not env.optimized_waypoints_calculated:
             env.optimize_waypoints_with_a_star()
 
-        # 重置環境
         state = env.reset()
-        if not isinstance(state, torch.Tensor):  # 確保狀態是張量
+        # 檢查 state 是否是 torch.Tensor，如果不是，則先將其轉為 tensor
+        if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         state = state.clone().detach().unsqueeze(0).to(device)
 
         total_reward = 0
         start_time = time.time()
 
-        # 時間步進
         for time_step in range(1500):
-            # 使用模型計算動作
-            state_flattened = state.view(state.size(0), -1)  # 將狀態展平
-            action = model.act(state_flattened)
+            action = model.act(state)
             action_np = action.detach().cpu().numpy()
-
-            # 執行環境一步
+            
+            # 執行 step 並取得 next_state、reward 和 done
             next_state, reward, done, _ = env.step(action_np)
 
-            # 確保 next_state 是張量
+            # 檢查 next_state 是否是 torch.Tensor，如果不是，則先將其轉為 tensor
             if not isinstance(next_state, torch.Tensor):
                 next_state = torch.tensor(next_state, dtype=torch.float32)
             next_state = next_state.clone().detach().unsqueeze(0).to(device)
 
-            # 將數據存入記憶體
+            # 將數據添加到記憶體
             memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-
+            
             # 更新 state 和總分
             state = next_state
             total_reward += reward
 
-            # 檢查是否達到終止條件
+            # 檢查是否超過時間限制或達到終止條件
             elapsed_time = time.time() - start_time
             if done or elapsed_time > 240:
                 if elapsed_time > 240:
@@ -1133,11 +1130,10 @@ def main():
                     print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
                 break
 
-        # 更新 PPO 模型
+        # 更新 PPO 和清除記憶體
         ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler)
         memory.clear()
 
-        # 打印回合信息
         print(f"Episode {e}, Total Reward: {total_reward}")
 
         # 保存最佳模型
@@ -1146,16 +1142,16 @@ def main():
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with reward: {best_test_reward}")
 
-        # 每五次保存一次模型
+        # 每五次保存模型
         if e % 5 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved after {e} episodes.")
 
         rospy.sleep(1.0)
 
-    # 保存最終模型
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
+
 
 if __name__ == '__main__':
     main()
