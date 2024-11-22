@@ -22,6 +22,7 @@ import yaml
 from PIL import Image
 from skimage.draw import line
 import matplotlib.pyplot as plt
+from scipy.ndimage import distance_transform_edt
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -163,17 +164,17 @@ class GazeboEnv:
         self.optimize_waypoints_with_a_star()
         
     def load_slam_map(self, yaml_path):
-        # 讀取 YAML 檔案
         with open(yaml_path, 'r') as file:
             map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']  # 地圖原點
-            self.map_resolution = map_metadata['resolution']  # 地圖解析度
-            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
-            
-            # 使用 PIL 讀取PNG檔
+            self.map_origin = map_metadata['origin']
+            self.map_resolution = map_metadata['resolution']
+            png_path = map_metadata['image'].replace(".pgm", ".png")
             png_image = Image.open(png_path).convert('L')
-            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
+            self.slam_map = np.array(png_image)
 
+        # 计算距离变换：障碍物为0，其它区域为1
+        binary_map = (self.slam_map >= 250).astype(np.uint8)  # 可行区域设为1，障碍物设为0
+        self.distance_transform = distance_transform_edt(binary_map) * self.map_resolution
 
     def generate_waypoints(self):
         waypoints = [
@@ -363,12 +364,12 @@ class GazeboEnv:
 
     def heuristic_cost(self, current, goal, next_waypoint=None,
                    direction_weight=1.0, obstacle_weight=50.0, 
-                   global_goal_weight=1.0, turn_safety_weight=5.0):
+                   global_goal_weight=1.0, turn_safety_weight=5.0, smoothness_weight=2.0, safety_weight=100.0):
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
         obstacle_distance = self.calculate_obstacle_distance(current)
-        if obstacle_distance < 1e-3:  # 防止除以零
+        if obstacle_distance < 1e-3:
             obstacle_distance = 1e-3
-        obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)  # 加强障碍物影响
+        obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
         direction_penalty = 0
         if next_waypoint:
@@ -386,16 +387,39 @@ class GazeboEnv:
         turn_safety_penalty = 0
         if next_waypoint:
             dist_to_next_wp = np.linalg.norm(np.array(next_waypoint) - np.array(current))
-            if dist_to_next_wp < 2.0:  # 距离较短时，增加转弯代价
+            if dist_to_next_wp < 2.0:
                 turn_safety_penalty = turn_safety_weight * (1 / dist_to_next_wp)
 
+        smoothness_penalty = 0
+        if next_waypoint and self.previous_waypoint:
+            prev_to_current = np.array(current) - np.array(self.previous_waypoint)
+            current_to_next = np.array(next_waypoint) - np.array(current)
+            angle_change = np.arccos(
+                np.clip(
+                    np.dot(prev_to_current, current_to_next) /
+                    (np.linalg.norm(prev_to_current) * np.linalg.norm(current_to_next) + 1e-6),
+                    -1.0, 1.0
+                )
+            )
+            smoothness_penalty = smoothness_weight * angle_change
+
+        # 路径安全性：基于距离变换的安全性代价
+        img_x, img_y = int(current[0]), int(current[1])
+        if 0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]:
+            safety_penalty = -self.distance_transform[img_y, img_x] * safety_weight
+        else:
+            safety_penalty = 0
+
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50)
+        self.previous_waypoint = current
 
         return (
             dynamic_global_goal_weight * dist_to_goal +
             direction_penalty +
             obstacle_penalty +
-            turn_safety_penalty
+            turn_safety_penalty +
+            smoothness_penalty +
+            safety_penalty
         )
     
     def calculate_obstacle_distance(self, point):
@@ -539,7 +563,7 @@ class GazeboEnv:
         self.optimized_waypoints = [self.image_to_gazebo_coords(*p) for p in complete_path]
 
         # 添加间隔采样逻辑
-        self.optimized_waypoints = self.optimized_waypoints[::5]  # 每隔5个点取1个点
+        self.optimized_waypoints = self.optimized_waypoints[::3]  # 每隔5个点取1个点
         if self.optimized_waypoints[-1] != self.waypoints[-1]:
             self.optimized_waypoints.append(self.waypoints[-1])  # 确保终点被保留
 
@@ -860,69 +884,41 @@ class GazeboEnv:
 
     def calculate_action_pure_pursuit(self):
         robot_x, robot_y, robot_yaw = self.get_robot_position()
-
-        # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 2.0 + 1.5 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 2.0 + 0.5 * linear_speed
 
-        # 定義角度範圍，以當前車輛的yaw為中心
-        angle_range = np.deg2rad(40)  # ±40度的範圍
-        closest_index = None
-        min_distance = float('inf')
-
-        # 尋找該範圍內的最近路徑點
-        for i in range(self.current_waypoint_index, len(self.optimized_waypoints)):
-            wp_x, wp_y = self.optimized_waypoints[i]
-            dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
-            direction_to_wp = np.arctan2(wp_y - robot_y, wp_x - robot_x)
-
-            # 計算該點相對於當前車輛朝向的角度
-            yaw_diff = direction_to_wp - robot_yaw
-            yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))  # 確保角度在[-pi, pi]範圍內
-
-            # 如果點位於yaw ± 35度範圍內，並且距離更近
-            if np.abs(yaw_diff) < angle_range and dist_to_wp < min_distance:
-                min_distance = dist_to_wp
-                closest_index = i
-
-        # 如果沒有找到符合條件的點，則繼續使用原始最近點
-        if closest_index is None:
-            closest_index = self.find_closest_waypoint(robot_x, robot_y)
-
+        closest_index = self.find_closest_waypoint(robot_x, robot_y)
+        cumulative_distance = 0.0
         target_index = closest_index
 
-        # 根據前視距離選擇參考的路徑點
-        cumulative_distance = 0.0
         for i in range(closest_index, len(self.waypoints)):
             wp_x, wp_y = self.waypoints[i]
             dist_to_wp = np.linalg.norm([wp_x - robot_x, wp_y - robot_y])
             cumulative_distance += dist_to_wp
             if cumulative_distance >= lookahead_distance:
-                target_index = i
+                if i + 4 < len(self.waypoints):  # 提前选择更远的目标点
+                    target_index = i + 4
+                else:
+                    target_index = i
                 break
-        # 獲取前視點座標
-        target_x, target_y = self.waypoints[target_index]
 
-        # 計算前視點的方向
+        target_x, target_y = self.waypoints[target_index]
         direction_to_target = np.arctan2(target_y - robot_y, target_x - robot_x)
         yaw_error = direction_to_target - robot_yaw
-        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))  # 確保角度在[-pi, pi]範圍內
+        yaw_error = np.arctan2(np.sin(yaw_error), np.cos(yaw_error))
 
-        # 根據角度誤差調整速度
-        if np.abs(yaw_error) > 0.3:
-            linear_speed = 0.5
-        elif np.abs(yaw_error) > 0.1:
-            linear_speed = 1.0
+        if np.abs(yaw_error) > 0.5:
+            linear_speed = 1
+        elif np.abs(yaw_error) > 0.3:
+            linear_speed = 2
         else:
-            linear_speed = 1.5
+            linear_speed = 3
 
-        # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = yaw_error - previous_yaw_error
         steer_angle = kp * yaw_error + kd * current_yaw_error_rate
         steer_angle = np.clip(steer_angle, -0.6, 0.6)
-
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
