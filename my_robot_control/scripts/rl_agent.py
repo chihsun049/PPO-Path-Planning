@@ -368,33 +368,39 @@ class GazeboEnv:
     
     def heuristic_cost(self, current, goal, next_waypoint, waypoint_list, waypoint_index, direction_weight=5.0, obstacle_weight=1.0, dist_to_goal_weight=1.0):
         """
-        改進版啟發函數，新增障礙物遠離激勵。
+        综合启发函数，明确引导路径规划顺序。
+        - current: 当前点 (像素坐标)。
+        - goal: 当前子目标点 (像素坐标)。
+        - next_waypoint: 下一个目标路径点 (像素坐标)。
+        - waypoint_list: 路径点列表。
+        - waypoint_index: 当前路径点索引。
         """
-        # 距離目標的直線距離
+        # 距离目标点的直线距离
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
 
-        # 距離障礙物的懲罰和激勵
+        # 距离障碍物的惩罚
         obstacle_distance = self.calculate_obstacle_distance(current)
         obstacle_penalty = max(0, 10 / (obstacle_distance + 1e-6) - 1) if obstacle_distance < 10 else 0
-        obstacle_incentive = np.log(obstacle_distance + 1e-3) if obstacle_distance > 10 else 0
 
-        # 路徑方向懲罰（目標方向與當前方向的差異）
+        # 引导方向权重：偏离路径序列的方向会增加惩罚
         current_to_next = np.array(next_waypoint) - np.array(current)
         waypoint_direction = np.array(waypoint_list[waypoint_index + 1]) - np.array(next_waypoint)
+
+        # 计算当前点到下一个路径点的方向误差
         angle_error = np.arccos(
             np.clip(
-                np.dot(current_to_next, waypoint_direction) /
+                np.dot(current_to_next, waypoint_direction) / 
                 (np.linalg.norm(current_to_next) * np.linalg.norm(waypoint_direction) + 1e-6),
                 -1.0, 1.0
             )
         )
         direction_penalty = angle_error
 
-        # 綜合啟發值
+        # 综合启发值：距离、方向、障碍物
         return (
             dist_to_goal_weight * dist_to_goal +
             direction_weight * direction_penalty +
-            obstacle_weight * (obstacle_penalty - obstacle_incentive)  # 懲罰低障礙距離，激勵遠離障礙
+            obstacle_weight * obstacle_penalty
         )
     
     def calculate_obstacle_distance(self, point):
@@ -558,9 +564,6 @@ class GazeboEnv:
         rospy.loginfo(f"Complete path visualization saved to {save_path}")
 
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, waypoint_list, waypoint_index, step=1):
-        """
-        改進版 A*，考慮障礙物安全距離，並優化效率。
-        """
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
@@ -570,21 +573,18 @@ class GazeboEnv:
         f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y), waypoint_list[waypoint_index + 1], waypoint_list, waypoint_index)}
 
         while open_set:
-            # 從 open_set 中選擇 f_score 最小的節點
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
-            if current == (img_goal_x, img_goal_y):  # 抵達目標
+
+            if current == (img_goal_x, img_goal_y):  # 到达当前目标点
                 path = self.reconstruct_path(came_from, current)
-                self.visualize_path(start_point, goal_point, path)  # 可視化路徑
+                self.visualize_path(start_point, goal_point, path)  # 可视化路径
                 return path
 
             open_set.remove(current)
-
             for neighbor in self.get_neighbors(current, step):
-                # 檢查鄰居是否安全
-                if not self.is_line_free(png_image, current, neighbor):
+                if not self.is_line_free(png_image, current, neighbor):  # 检查直线通行性
                     continue
 
-                # 動態步長確保鄰居足夠遠離障礙物
                 tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     came_from[neighbor] = current
