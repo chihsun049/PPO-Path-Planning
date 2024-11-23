@@ -472,26 +472,7 @@ class GazeboEnv:
             return 10
         else:  # 非常接近障礙物
             return 1
-    
-    def calculate_target_direction(self, current_index, lookahead=5):
-        """
-        根據未來幾個路徑點計算大方向。
-        - current_index: 當前最近路徑點的索引
-        - lookahead: 考慮的未來路徑點數量
-        """
-        total_weight = 0
-        weighted_x, weighted_y = 0, 0
-        for i in range(current_index, min(len(self.waypoints), current_index + lookahead)):
-            weight = 1.0 / (i - current_index + 1)  # 越遠的點影響力越小
-            total_weight += weight
-            weighted_x += self.waypoints[i][0] * weight
-            weighted_y += self.waypoints[i][1] * weight
-        
-        # 計算加權平均
-        target_x = weighted_x / total_weight
-        target_y = weighted_y / total_weight
-        return target_x, target_y
-    
+
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
