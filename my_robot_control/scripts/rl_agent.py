@@ -367,10 +367,22 @@ class GazeboEnv:
                    global_goal_weight=1.0, turn_safety_weight=5.0, smoothness_weight=2.0, safety_weight=100.0):
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
         obstacle_distance = self.calculate_obstacle_distance(current)
-        if obstacle_distance < 1e-3:
-            obstacle_distance = 1e-3
+        
+        # 避免障礙物距離過小導致數值過大
+        obstacle_distance = max(obstacle_distance, 1e-3)
+        
+        # 代價: 與障礙物距離的平方反比
         obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
+        # 中心化代價: 偏向地圖中距離障礙物最遠的區域
+        img_x, img_y = int(current[0]), int(current[1])
+        if 0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]:
+            center_distance = self.distance_transform[img_y, img_x]  # 距離中心的值越高越好
+            center_reward = safety_weight * center_distance
+        else:
+            center_reward = 0
+
+        # 路徑方向懲罰: 偏離目標方向的懲罰
         direction_penalty = 0
         if next_waypoint:
             current_to_next = np.array(next_waypoint) - np.array(current)
@@ -403,23 +415,20 @@ class GazeboEnv:
             )
             smoothness_penalty = smoothness_weight * angle_change
 
-        # 路径安全性：基于距离变换的安全性代价
-        img_x, img_y = int(current[0]), int(current[1])
-        if 0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]:
-            safety_penalty = -self.distance_transform[img_y, img_x] * safety_weight
-        else:
-            safety_penalty = 0
-
+        # 動態調整全局目標權重
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50)
+
+        # 更新上一個路徑點
         self.previous_waypoint = current
 
+        # 返回綜合代價（中心偏好 + 全局目標 + 障礙物懲罰 + 方向與平滑性）
         return (
             dynamic_global_goal_weight * dist_to_goal +
             direction_penalty +
-            obstacle_penalty +
+            obstacle_penalty -
+            center_reward +  # 增加中心偏好的回報
             turn_safety_penalty +
-            smoothness_penalty +
-            safety_penalty
+            smoothness_penalty
         )
     
     def calculate_obstacle_distance(self, point):
@@ -491,13 +500,16 @@ class GazeboEnv:
 
     def dynamic_grid_size(self, current, neighbor):
         obstacle_distance = self.calculate_obstacle_distance(current)
-        if obstacle_distance > 50:  # 遠離障礙物
+        center_distance = self.distance_transform[int(current[1]), int(current[0])]
+
+        # 同時考慮障礙物距離和中心偏好，調整步長
+        if obstacle_distance > 50 and center_distance > 10:  # 遠離障礙物且靠近中心
             return 30
         elif obstacle_distance > 30:  # 中等距離
             return 20
-        elif obstacle_distance > 10:  # 中等距離
-            return 5
-        else:  # 靠近障礙物
+        elif obstacle_distance > 10:  # 靠近障礙物
+            return 10
+        else:  # 非常接近障礙物
             return 1
     
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
@@ -576,7 +588,7 @@ class GazeboEnv:
         self.visualize_complete_path(complete_path)
         rospy.loginfo("Global path optimization complete.")
 
-    def visualize_complete_path(self, complete_path, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path.png'):
+    def visualize_complete_path(self, complete_path, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
         可视化完整路径，并将其保存为图片。
         """
