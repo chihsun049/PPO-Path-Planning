@@ -364,7 +364,7 @@ class GazeboEnv:
 
     def heuristic_cost(self, current, goal, next_waypoint=None,
                    direction_weight=1.0, obstacle_weight=50.0, 
-                   global_goal_weight=1.0, turn_safety_weight=5.0, smoothness_weight=2.0, safety_weight=100.0):
+                   global_goal_weight=2.0, turn_safety_weight=5.0, smoothness_weight=2.0, safety_weight=100.0):
         dist_to_goal = np.linalg.norm(np.array(goal) - np.array(current))
         obstacle_distance = self.calculate_obstacle_distance(current)
         
@@ -382,53 +382,14 @@ class GazeboEnv:
         else:
             center_reward = 0
 
-        # 路徑方向懲罰: 偏離目標方向的懲罰
-        direction_penalty = 0
-        if next_waypoint:
-            current_to_next = np.array(next_waypoint) - np.array(current)
-            goal_direction = np.array(goal) - np.array(current)
-            angle_error = np.arccos(
-                np.clip(
-                    np.dot(current_to_next, goal_direction) /
-                    (np.linalg.norm(current_to_next) * np.linalg.norm(goal_direction) + 1e-6),
-                    -1.0, 1.0
-                )
-            )
-            direction_penalty = direction_weight * angle_error
-
-        turn_safety_penalty = 0
-        if next_waypoint:
-            dist_to_next_wp = np.linalg.norm(np.array(next_waypoint) - np.array(current))
-            if dist_to_next_wp < 2.0:
-                turn_safety_penalty = turn_safety_weight * (1 / dist_to_next_wp)
-
-        smoothness_penalty = 0
-        if next_waypoint and self.previous_waypoint:
-            prev_to_current = np.array(current) - np.array(self.previous_waypoint)
-            current_to_next = np.array(next_waypoint) - np.array(current)
-            angle_change = np.arccos(
-                np.clip(
-                    np.dot(prev_to_current, current_to_next) /
-                    (np.linalg.norm(prev_to_current) * np.linalg.norm(current_to_next) + 1e-6),
-                    -1.0, 1.0
-                )
-            )
-            smoothness_penalty = smoothness_weight * angle_change
-
         # 動態調整全局目標權重
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50)
 
-        # 更新上一個路徑點
-        self.previous_waypoint = current
-
-        # 返回綜合代價（中心偏好 + 全局目標 + 障礙物懲罰 + 方向與平滑性）
+        # 返回綜合代價（中心偏好 + 全局目標 + 障礙物懲罰）
         return (
             dynamic_global_goal_weight * dist_to_goal +
-            direction_penalty +
             obstacle_penalty -
-            center_reward +  # 增加中心偏好的回報
-            turn_safety_penalty +
-            smoothness_penalty
+            center_reward
         )
     
     def calculate_obstacle_distance(self, point):
@@ -513,16 +474,13 @@ class GazeboEnv:
             return 1
     
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
-        """
-        執行改進版的 A* 規劃。
-        """
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
         open_set = [(img_start_x, img_start_y)]
         came_from = {}
         g_score = {open_set[0]: 0}
-        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y))}
+        f_score = {open_set[0]: self.heuristic_cost(open_set[0], (img_goal_x, img_goal_y), global_goal_weight=2.0)}
 
         while open_set:
             current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
@@ -533,16 +491,20 @@ class GazeboEnv:
 
             open_set.remove(current)
             for neighbor in self.get_neighbors(current, step):
-                if not self.is_line_free(png_image, current, neighbor):  # 只檢查 current 到 neighbor 是否通暢
+                # 不再嚴格依賴 waypoints，而是讓障礙物和全局方向影響搜索
+                if not self.is_line_free(png_image, current, neighbor):
                     continue
 
                 tentative_g_score = g_score[current] + np.linalg.norm(np.array(current) - np.array(neighbor))
                 if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g_score
-                    f_score[neighbor] = (
-                        tentative_g_score +
-                        self.heuristic_cost(neighbor, (img_goal_x, img_goal_y))  # 僅用全局目標計算
+                    f_score[neighbor] = tentative_g_score + self.heuristic_cost(
+                        neighbor, 
+                        (img_goal_x, img_goal_y), 
+                        global_goal_weight=2.0, 
+                        obstacle_weight=50.0, 
+                        smoothness_weight=10.0
                     )
                     if neighbor not in open_set:
                         open_set.append(neighbor)
