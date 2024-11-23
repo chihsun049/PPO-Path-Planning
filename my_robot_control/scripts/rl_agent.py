@@ -8,12 +8,10 @@ import os
 from geometry_msgs.msg import Twist, PointStamped
 from sensor_msgs.msg import PointCloud2, Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState, ContactsState
+from gazebo_msgs.msg import ModelState
 import sensor_msgs.point_cloud2 as pc2
 from scipy.special import comb
 from collections import namedtuple
-import cv2
-import open3d as o3d
 import tf
 from tf.transformations import quaternion_from_euler
 import time
