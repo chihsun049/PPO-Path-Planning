@@ -138,6 +138,7 @@ class GazeboEnv:
         self.target_x = -5.3334
         self.target_y = -0.3768
         self.waypoints = self.generate_waypoints()
+        self.current_position = self.waypoints[0]  # 初始化为起点
         self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
@@ -457,6 +458,20 @@ class GazeboEnv:
 
         return True  # 通過檢查，返回可通行
 
+    def dynamic_grid_size(self, current, neighbor):
+        obstacle_distance = self.calculate_obstacle_distance(current)
+        center_distance = self.distance_transform[int(current[1]), int(current[0])]
+
+        # 同時考慮障礙物距離和中心偏好，調整步長
+        if obstacle_distance > 50 and center_distance > 10:  # 遠離障礙物且靠近中心
+            return 30
+        elif obstacle_distance > 30:  # 中等距離
+            return 20
+        elif obstacle_distance > 10:  # 靠近障礙物
+            return 10
+        else:  # 非常接近障礙物
+            return 1
+
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
@@ -498,75 +513,81 @@ class GazeboEnv:
 
     def optimize_waypoints_with_a_star(self):
         """
-        動態調整 waypoints，在 A* 規劃中跳過或新增中間點。
+        使用改进的 A* 规划全局路径，按照网格方式处理 waypoints。
         """
-        rospy.loginfo("Starting dynamic waypoint optimization with A*...")
+        if self.optimized_waypoints_calculated:
+            rospy.loginfo("Optimized waypoints already calculated. Skipping.")
+            return
+
+        rospy.loginfo("Starting global path optimization with A* and grids...")
         complete_path = []
 
-        for i in range(len(self.waypoints) - 1):
-            start = self.waypoints[i]
-            goal = self.waypoints[i + 1]
+        grid_size = 50  # 固定的网格大小
+        current_position = self.waypoints[0]  # 起点
 
-            # 如果起點或終點過於靠近障礙物，嘗試移動它們
-            start = self.adjust_waypoint_near_obstacle(start)
-            goal = self.adjust_waypoint_near_obstacle(goal)
+        # 不再逐对连接 waypoints，而是逐个处理网格
+        for i in range(1, len(self.waypoints)):
+            grid_center = self.waypoints[i]
+            grid_bounds = [
+                grid_center[0] - grid_size / 2, grid_center[0] + grid_size / 2,
+                grid_center[1] - grid_size / 2, grid_center[1] + grid_size / 2
+            ]
 
-            # 計算優化後的路徑段
-            path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal)
+            # 在网格内找到一个安全的目标点
+            target_point = self.find_safe_point_within_grid(grid_bounds)
 
-            # 動態插入中間點
-            if len(path_segment) > 10:
-                mid_point = path_segment[len(path_segment) // 2]
-                complete_path.append(mid_point)
+            # 规划从 current_position 到 target_point 的路径
+            path_segment = self.a_star_optimize_waypoint(self.slam_map, current_position, target_point)
 
             if len(path_segment) > 2:
-                complete_path.extend(path_segment[:-1])  # 跳過重複點
-            complete_path.append(goal)
+                complete_path.extend(path_segment[:-1])  # 跳过重复点
+            complete_path.append(target_point)
+
+            # 更新 current_position 为进入网格后的实际位置
+            current_position = target_point
+
+        # 最后一个 waypoint（终点）直接规划到目标点
+        final_target = self.waypoints[-1]
+        path_segment = self.a_star_optimize_waypoint(self.slam_map, current_position, final_target)
+        if len(path_segment) > 2:
+            complete_path.extend(path_segment[:-1])
+        complete_path.append(final_target)
 
         self.optimized_waypoints = [self.image_to_gazebo_coords(*p) for p in complete_path]
-        if self.optimized_waypoints[-1] != self.waypoints[-1]:
-            self.optimized_waypoints.append(self.waypoints[-1])  # 確保閉環
-
         self.optimized_waypoints_calculated = True
-        self.waypoints = self.optimized_waypoints
+
+        # 可视化完整路径
         self.visualize_complete_path(complete_path)
-        rospy.loginfo("Dynamic waypoint optimization complete.")
+        rospy.loginfo("Global path optimization complete.")
+    
+    def find_safe_point_within_grid(self, grid_bounds):
+        """
+        在指定的网格范围内寻找一个安全的点，避开障碍物。
+        """
+        x_min, x_max, y_min, y_max = grid_bounds
+        # 在网格内随机采样多个点，寻找距离障碍物最远的点
+        sample_points = []
+        for _ in range(100):
+            x = np.random.uniform(x_min, x_max)
+            y = np.random.uniform(y_min, y_max)
+            img_x, img_y = self.gazebo_to_image_coords(x, y)
+            if self.slam_map[img_y, img_x] >= 250:  # 可通行区域
+                distance = self.distance_transform[img_y, img_x]
+                sample_points.append((distance, (x, y)))
 
-    def adjust_waypoint_near_obstacle(self, waypoint):
-        """
-        將 waypoint 調整到距離障礙物更遠的位置（道路中間）。
-        """
-        img_x, img_y = self.gazebo_to_image_coords(*waypoint)
+        if sample_points:
+            # 选择距离障碍物最远的点
+            sample_points.sort(reverse=True)
+            return sample_points[0][1]
+        else:
+            # 如果未找到安全点，返回网格中心
+            grid_center_x = (x_min + x_max) / 2
+            grid_center_y = (y_min + y_max) / 2
+            return (grid_center_x, grid_center_y)
         
-        # 確保點在地圖範圍內
-        if not (0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]):
-            rospy.logwarn("Waypoint is out of map bounds, skipping adjustment.")
-            return waypoint
-
-        # 路徑中間偏移的搜索半徑
-        search_radius = 10  # 像素半徑，可根據地圖解析度調整
-
-        # 搜索半徑內所有點的障礙物距離
-        y_min = max(0, img_y - search_radius)
-        y_max = min(self.distance_transform.shape[0], img_y + search_radius + 1)
-        x_min = max(0, img_x - search_radius)
-        x_max = min(self.distance_transform.shape[1], img_x + search_radius + 1)
-
-        local_area = self.distance_transform[y_min:y_max, x_min:x_max]
-
-        # 找到距離障礙物最遠的像素點
-        max_distance = np.max(local_area)
-        max_positions = np.argwhere(local_area == max_distance)
-
-        if max_positions.size > 0:
-            # 將找到的最遠像素點轉換回地圖的全局座標
-            max_pos = max_positions[0]
-            adjusted_x = x_min + max_pos[1]
-            adjusted_y = y_min + max_pos[0]
-            return self.image_to_gazebo_coords(adjusted_x, adjusted_y)
-
-        # 如果找不到更好的點，返回原始 waypoint
-        return waypoint
+    def is_robot_in_grid(self, robot_x, robot_y, grid_bounds):
+        x_min, x_max, y_min, y_max = grid_bounds
+        return x_min <= robot_x <= x_max and y_min <= robot_y <= y_max
 
     def visualize_complete_path(self, complete_path, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
@@ -723,53 +744,63 @@ class GazeboEnv:
         robot_x, robot_y, robot_yaw = self.get_robot_position()
         self.state = self.generate_occupancy_grid(robot_x, robot_y)
 
-        # 計算當前機器人位置與所有 waypoints 的距離，並找到距離最近的 waypoint 的索引
-        distances = [np.linalg.norm([robot_x - wp_x, robot_y - wp_y]) for wp_x, wp_y in self.waypoints]
-        closest_index = np.argmin(distances)
-        distance_to_goal = distances[closest_index]
-
-        # 無進展檢測
+        # 无进展检测
         if self.check_no_progress():
             self.done = True
             reward -= 1000  # 给无进展惩罚
             return self.state, reward, True, {}
 
-        # 打印調試訊息
+        # 定义当前网格的范围
+        grid_size = 50  # 固定的网格大小
+        grid_half_size = grid_size / 2
+        current_waypoint = self.waypoints[self.current_waypoint_index]
+        grid_bounds = [
+            current_waypoint[0] - grid_half_size,
+            current_waypoint[0] + grid_half_size,
+            current_waypoint[1] - grid_half_size,
+            current_waypoint[1] + grid_half_size
+        ]
+
+        # 检查机器人是否进入了当前网格范围
+        if self.is_robot_in_grid(robot_x, robot_y, grid_bounds):
+            # 更新 current_waypoint_index
+            self.current_waypoint_index += 1
+            print(f"Entered grid of waypoint {self.current_waypoint_index - 1}")
+
+            # 如果还有下一个 waypoint，重新规划路径
+            if self.current_waypoint_index < len(self.waypoints):
+                # 更新 current_position 为当前位置
+                self.current_position = (robot_x, robot_y)
+                # 重新规划从当前位置信息到下一个 waypoint 所在网格的路径
+                self.optimize_waypoints_with_a_star()
+            else:
+                # 已经到达最后一个网格
+                print("Goal reached!")
+                reward += 1000  # 给予额外奖励
+                return self.state, reward, True, {}
+
+        # 打印调试信息
         print(f"Robot position: ({robot_x}, {robot_y})")
-        print(f"Closest waypoint index: {closest_index}, Distance to closest waypoint: {distances[closest_index]}")
         print(f"Current waypoint index: {self.current_waypoint_index}")
 
-        # 如果找到更近的路徑點，更新 current_waypoint_index 並給予獎勵
-        if closest_index > self.current_waypoint_index:
-            distance_reward = sum(self.waypoint_distances[self.current_waypoint_index:closest_index])
-            reward += distance_reward * 100
-            self.current_waypoint_index = closest_index
-            print('Distance to goal reward:', reward)
-
-        # 判斷是否達到目標點
-        if self.current_waypoint_index == len(self.waypoints) - 1 and distance_to_goal < REFERENCE_DISTANCE_TOLERANCE:
-            print("Goal reached!")
-            reward += 1000  # 給予額外獎勵
-            return self.state, reward, True, {}
-
-        # 計算行動
+        # 计算行动
         action = self.calculate_action_pure_pursuit()
         linear_speed = np.clip(action[0], -2.0, 3.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
 
-        # 發布速度指令
+        # 发布速度指令
         twist = Twist()
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
         self.pub_cmd_vel.publish(twist)
 
-        # 更新 IMU 資料
+        # 更新 IMU 数据
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
 
         rospy.sleep(0.1)
 
-        # 計算獎勵（例如考慮障礙物或路徑平滑性）
+        # 计算奖励（例如考虑障碍物或路径平滑性）
         reward, done = self.calculate_reward(robot_x, robot_y, reward, self.state)
         return self.state, reward, done, {}
 
