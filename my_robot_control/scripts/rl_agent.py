@@ -457,20 +457,6 @@ class GazeboEnv:
 
         return True  # 通過檢查，返回可通行
 
-    def dynamic_grid_size(self, current, neighbor):
-        obstacle_distance = self.calculate_obstacle_distance(current)
-        center_distance = self.distance_transform[int(current[1]), int(current[0])]
-
-        # 同時考慮障礙物距離和中心偏好，調整步長
-        if obstacle_distance > 50 and center_distance > 10:  # 遠離障礙物且靠近中心
-            return 30
-        elif obstacle_distance > 30:  # 中等距離
-            return 20
-        elif obstacle_distance > 10:  # 靠近障礙物
-            return 10
-        else:  # 非常接近障礙物
-            return 1
-
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, step=1):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
@@ -512,41 +498,75 @@ class GazeboEnv:
 
     def optimize_waypoints_with_a_star(self):
         """
-        使用改進版 A* 規劃全局路徑。
+        動態調整 waypoints，在 A* 規劃中跳過或新增中間點。
         """
-        if self.optimized_waypoints_calculated:
-            rospy.loginfo("Optimized waypoints already calculated. Skipping.")
-            return
-
-        rospy.loginfo("Starting global path optimization with A*...")
+        rospy.loginfo("Starting dynamic waypoint optimization with A*...")
         complete_path = []
 
         for i in range(len(self.waypoints) - 1):
             start = self.waypoints[i]
             goal = self.waypoints[i + 1]
-            rospy.loginfo(f"Optimizing segment {i}: {start} -> {goal}")
 
-            # 計算該段的優化路徑
+            # 如果起點或終點過於靠近障礙物，嘗試移動它們
+            start = self.adjust_waypoint_near_obstacle(start)
+            goal = self.adjust_waypoint_near_obstacle(goal)
+
+            # 計算優化後的路徑段
             path_segment = self.a_star_optimize_waypoint(self.slam_map, start, goal)
+
+            # 動態插入中間點
+            if len(path_segment) > 10:
+                mid_point = path_segment[len(path_segment) // 2]
+                complete_path.append(mid_point)
+
             if len(path_segment) > 2:
                 complete_path.extend(path_segment[:-1])  # 跳過重複點
             complete_path.append(goal)
 
         self.optimized_waypoints = [self.image_to_gazebo_coords(*p) for p in complete_path]
-
-        # 添加间隔采样逻辑
-        self.optimized_waypoints = self.optimized_waypoints[::3]  # 每隔5个点取1个点
         if self.optimized_waypoints[-1] != self.waypoints[-1]:
-            self.optimized_waypoints.append(self.waypoints[-1])  # 确保终点被保留
+            self.optimized_waypoints.append(self.waypoints[-1])  # 確保閉環
 
         self.optimized_waypoints_calculated = True
-
-        # 替换原始路径为优化后的路径
         self.waypoints = self.optimized_waypoints
-
-        # 可视化完整路徑
         self.visualize_complete_path(complete_path)
-        rospy.loginfo("Global path optimization complete.")
+        rospy.loginfo("Dynamic waypoint optimization complete.")
+
+    def adjust_waypoint_near_obstacle(self, waypoint):
+        """
+        將 waypoint 調整到距離障礙物更遠的位置（道路中間）。
+        """
+        img_x, img_y = self.gazebo_to_image_coords(*waypoint)
+        
+        # 確保點在地圖範圍內
+        if not (0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]):
+            rospy.logwarn("Waypoint is out of map bounds, skipping adjustment.")
+            return waypoint
+
+        # 路徑中間偏移的搜索半徑
+        search_radius = 10  # 像素半徑，可根據地圖解析度調整
+
+        # 搜索半徑內所有點的障礙物距離
+        y_min = max(0, img_y - search_radius)
+        y_max = min(self.distance_transform.shape[0], img_y + search_radius + 1)
+        x_min = max(0, img_x - search_radius)
+        x_max = min(self.distance_transform.shape[1], img_x + search_radius + 1)
+
+        local_area = self.distance_transform[y_min:y_max, x_min:x_max]
+
+        # 找到距離障礙物最遠的像素點
+        max_distance = np.max(local_area)
+        max_positions = np.argwhere(local_area == max_distance)
+
+        if max_positions.size > 0:
+            # 將找到的最遠像素點轉換回地圖的全局座標
+            max_pos = max_positions[0]
+            adjusted_x = x_min + max_pos[1]
+            adjusted_y = y_min + max_pos[0]
+            return self.image_to_gazebo_coords(adjusted_x, adjusted_y)
+
+        # 如果找不到更好的點，返回原始 waypoint
+        return waypoint
 
     def visualize_complete_path(self, complete_path, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
