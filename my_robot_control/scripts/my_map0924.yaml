@@ -1,4 +1,4 @@
-image: /home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.pgm
+image: /home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.png
 resolution: 0.050000
 origin: [-100.000000, -100.000000, 0.000000]
 negate: 0
