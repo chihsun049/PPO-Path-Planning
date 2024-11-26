@@ -1276,16 +1276,22 @@ def _adjust_dimensions(state_batch, next_state_batch):
     print(f"[DEBUG] After adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
     return state_batch, next_state_batch
 
-def select_action_with_exploration(state, model, epsilon=0.4):
+def select_action_with_exploration(env, state, model, epsilon=1.0, dwa=None, obstacles=None):
     if random.random() < epsilon:
-        # 隨機選擇動作
-        action = torch.tensor([
-            random.uniform(-2.0, 2.0),  # 隨機線速度
-            random.uniform(-0.6, 0.6)  # 隨機角速度
-        ]).to(device)
-        print("[Exploration] Taking a random action:", action)
+        if dwa is None or obstacles is None:
+            raise ValueError("DWA controller or obstacles is not provided")
+        print("[Exploration] Using DWA for action generation. ")
+
+        robot_x, robot_y, robot_yaw = env.get_robot_position()
+        current_speed = env.last_twist.linear.x
+        current_omega = env.last_twist.angular.z
+
+        state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
+        action, _ = dwa.plan(state, obstacles)  
+        action = torch.tensor(action, dtype=torch.float32).to(device)  # 確保格式正確
     else:
         # 使用模型的動作
+        print('action by RL')
         action = model.act(state)
     return action
 
@@ -1357,6 +1363,7 @@ def main():
             obstacles = grid_filter(obstacles, grid_size=0.7)
 
             lookahead_index = min(env.current_waypoint_index + 5, len(env.waypoint_distances)-1)
+            print('current waypoint', env.current_waypoint_index)
             dwa.goal = env.waypoints[lookahead_index]
 
             # 根据是否使用 RL 控制，决定动作
