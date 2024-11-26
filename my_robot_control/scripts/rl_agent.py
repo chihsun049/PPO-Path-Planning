@@ -6,11 +6,10 @@ import torch.nn as nn
 import torch.optim as optim
 import os
 from geometry_msgs.msg import Twist, PointStamped
-from sensor_msgs.msg import PointCloud2, Imu
+from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState, ContactsState
+from gazebo_msgs.msg import ModelState
 import sensor_msgs.point_cloud2 as pc2
-from scipy.special import comb
 from collections import namedtuple
 import tf
 from tf.transformations import quaternion_from_euler
@@ -538,7 +537,7 @@ class GazeboEnv:
 
         self.optimized_waypoints_calculated = True
 
-        # 替换原始路径为优化后的路径
+        # 更新到新的路徑
         self.waypoints = self.optimized_waypoints
 
         # 更新 current_waypoint_index 的範圍
@@ -547,7 +546,7 @@ class GazeboEnv:
         # 重新初始化 waypoint_failures
         self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
 
-        # 可视化完整路徑
+        # 可視化完整路徑
         self.visualize_complete_path(complete_path)
         rospy.loginfo("Global path optimization complete.")
 
@@ -685,16 +684,16 @@ class GazeboEnv:
             raise ValueError("NaN or Inf detected in occupancy_grid!")
         return occupancy_grid
 
+
     def step(self, action):
         reward = 0
         robot_x, robot_y, robot_yaw = self.get_robot_position()
 
         # 确保 action 是一维数组
         action = np.squeeze(action)
-        linear_speed = np.clip(action[0], -2.0, 3.0)
+        linear_speed = np.clip(action[0], -2.0, 2.0)
         steer_angle = np.clip(action[1], -0.6, 0.6)
         print("linear speed = ", linear_speed, " steer angle = ", steer_angle)
-
 
         # 更新状态
         self.state = self.generate_occupancy_grid(robot_x, robot_y, linear_speed, steer_angle)
@@ -718,7 +717,6 @@ class GazeboEnv:
             distance_to_wp = np.linalg.norm([robot_x - current_wp[0], robot_y - current_wp[1]])
             if distance_to_wp < 0.5:  # 假設通過 waypoint 的距離閾值為 0.5
                 reward += 2  # 通過 waypoint 獎勵
-                print(f"[Reward] Waypoint {self.current_waypoint_index} reached, reward: {reward}")
 
         # 更新机器人位置
         if self.previous_robot_position is not None:
@@ -735,8 +733,8 @@ class GazeboEnv:
 
         # 检查是否需要使用 RL 控制
         failure_range = range(
-            max(0, self.current_waypoint_index - 3),
-            min(len(self.waypoints), self.current_waypoint_index + 4)
+            max(0, self.current_waypoint_index - 5),
+            min(len(self.waypoints), self.current_waypoint_index + 3)
         )
         use_deep_rl_control = any(
             self.waypoint_failures.get(i, 0) > 1 for i in failure_range
@@ -766,6 +764,7 @@ class GazeboEnv:
         twist.linear.x = linear_speed
         twist.angular.z = steer_angle
         self.pub_cmd_vel.publish(twist)
+        self.last_twist = twist
 
         imu_data = self.generate_imu_data()
         self.pub_imu.publish(imu_data)
@@ -849,10 +848,8 @@ class GazeboEnv:
         done = False
         # 將機器人的座標轉換為地圖上的坐標
         
-        print(state.shape)
         if isinstance(state, torch.Tensor):
             state = state.cpu().numpy()
-        print(state.ndim)
         if state.ndim == 4:
             # 对于 4 维情况，取第一个批次数据中的第一层
             occupancy_grid = state[0, 0]
@@ -927,18 +924,6 @@ class GazeboEnv:
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
-    
-    def adjust_control_params(self, linear_speed):
-        if linear_speed <= 0.5:
-            kp = 0.5
-            kd = 0.4
-        elif linear_speed <= 1.0:
-            kp = 0.4
-            kd = 0.3
-        else:
-            kp = 0.3
-            kd = 0.2
-        return kp, kd
 
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
@@ -950,6 +935,18 @@ class GazeboEnv:
                 min_distance = dist
                 closest_index = i
         return closest_index
+    
+    def adjust_control_params(self, linear_speed):
+        if linear_speed <= 0.5:
+            kp = 0.5
+            kd = 0.2
+        elif linear_speed <= 1.0:
+            kp = 0.4
+            kd = 0.3
+        else:
+            kp = 0.3
+            kd = 0.4
+        return kp, kd
 
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
@@ -1043,7 +1040,7 @@ class ActorCritic(nn.Module):
 
         action_mean, action_std, _ = self(state)
 
-        noise = torch.randn_like(action_std)*0.2
+        noise = torch.randn_like(action_std)*0.01
         noisy_action = action_mean + action_std*noise
 
         noisy_action = torch.tanh(noisy_action)
@@ -1168,7 +1165,7 @@ class DWA:
         # print("goal score = ", goal_score, "safety score = ", clearance_score, "speed score = ", speed_score)
         print(f"v: {v}, omega: {omega}, Total score: {total_score}")
         return best_control, best_trajectory
-    
+
 def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler, batch_size):
     print(f"[DEBUG] Starting PPO update with batch size: {batch_size}")
 
@@ -1276,6 +1273,15 @@ def _adjust_dimensions(state_batch, next_state_batch):
     print(f"[DEBUG] After adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
     return state_batch, next_state_batch
 
+def _check_for_nan(tensors, error_message):
+    for tensor in tensors:
+        if tensor is not None and torch.isnan(tensor).any():
+            raise ValueError(error_message)
+        
+def _check_for_invalid_values(tensor, name):
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        raise ValueError(f"[PPO Update] {name} contains invalid values (NaN or Inf).")
+
 def select_action_with_exploration(env, state, model, epsilon=1.0, dwa=None, obstacles=None):
     if random.random() < epsilon:
         if dwa is None or obstacles is None:
@@ -1303,6 +1309,7 @@ def grid_filter(obstacles, grid_size=0.5):
     unique_indices = np.unique(grid_indices, axis=0)
     # 返回网格中心点
     filtered_points = unique_indices * grid_size + grid_size / 2
+    return filtered_points
 
 def main():
     env = GazeboEnv(None)
@@ -1363,7 +1370,6 @@ def main():
             obstacles = grid_filter(obstacles, grid_size=0.7)
 
             lookahead_index = min(env.current_waypoint_index + 5, len(env.waypoint_distances)-1)
-            print('current waypoint', env.current_waypoint_index)
             dwa.goal = env.waypoints[lookahead_index]
 
             # 根据是否使用 RL 控制，决定动作
