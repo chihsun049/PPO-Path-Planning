@@ -375,31 +375,54 @@ class GazeboEnv:
 
     def heuristic_cost(self, current, goal, next_waypoint=None,
                    direction_weight=1.0, obstacle_weight=50.0, 
-                   global_goal_weight=2.0, turn_safety_weight=5.0, smoothness_weight=2.0, safety_weight=100.0):
+                   global_goal_weight=2.0, turn_safety_weight=5.0, 
+                   smoothness_weight=2.0, safety_weight=100.0):
         current = np.array(current, dtype=np.float64)
         goal = np.array(goal, dtype=np.float64)
-        dist_to_goal = np.linalg.norm(goal - current)  # 使用浮點數計算距離
-        
-        obstacle_distance = self.calculate_obstacle_distance(current)
-        
-        # 避免障礙物距離過小導致數值過大
-        obstacle_distance = max(obstacle_distance, 1e-3)
-        
+        dist_to_goal = np.linalg.norm(goal - current)  # 與目標距離的代價
+
+        # 計算方向一致性代價（與全局目標方向的偏移）
+        direction_cost = 0.0
+        turn_safety_cost = 0.0
+        smoothness_penalty = 0.0
+
+        if next_waypoint is not None:
+            current_to_goal_vec = goal - current
+            current_to_next_vec = next_waypoint - current
+
+            # 計算方向一致性代價（方向代價，cos_theta 越接近 1 越好）
+            cos_theta = np.dot(current_to_goal_vec, current_to_next_vec) / (
+                np.linalg.norm(current_to_goal_vec) * np.linalg.norm(current_to_next_vec) + 1e-5
+            )
+            direction_cost = direction_weight * (1 - cos_theta)  # 偏離目標方向的代價
+
+            # 計算急轉彎代價（限制角度過大）
+            angle_diff = np.arccos(cos_theta)
+            if angle_diff > np.pi / 4:  # 假設 45 度為急轉的判斷閾值
+                turn_safety_cost = turn_safety_weight * angle_diff
+
+            # 計算平滑性代價（與下一點的方向一致性）
+            smoothness_penalty = (1 - cos_theta) * smoothness_weight
+
         # 障礙物懲罰: 與障礙物距離的平方成反比
+        obstacle_distance = self.calculate_obstacle_distance(current)
+        obstacle_distance = max(obstacle_distance, 1e-3)  # 避免數值過大
         obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
         # 中心化代價: 偏向距離障礙物最遠的區域
-        center_distance = self.get_distance_transform_value(current)  # 浮點運算
+        center_distance = self.get_distance_transform_value(current)
         center_reward = safety_weight * center_distance
 
         # 動態調整全局目標權重
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50.0)
 
-        # 綜合計算代價
         return (
-            dynamic_global_goal_weight * dist_to_goal +
-            obstacle_penalty -
-            center_reward
+            dynamic_global_goal_weight * dist_to_goal +  # 與目標距離的代價
+            direction_cost +                            # 方向代價
+            turn_safety_cost +                          # 急轉懲罰代價
+            smoothness_penalty +                        # 平滑性代價
+            obstacle_penalty -                          # 障礙物懲罰
+            center_reward                               # 距離障礙物越遠越好
         )
     
     def get_distance_transform_value(self, point):
