@@ -373,49 +373,41 @@ class GazeboEnv:
         gazebo_y = (2000.0 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal, previous_point=None, obstacle_weight=50.0,
-                   global_goal_weight=1.0, smoothness_weight=20.0, safety_weight=100.0):
+    def heuristic_cost(self, current, goal, previous_point=None, obstacle_weight=100.0,
+                   global_goal_weight=1.0, smoothness_weight=50.0, safety_weight=200.0):
         current = np.array(current, dtype=np.float64)
         goal = np.array(goal, dtype=np.float64)
-        dist_to_goal = np.linalg.norm(goal - current)  # Cost for distance to goal
+        dist_to_goal = np.linalg.norm(goal - current)  # 距离目标点的代价
 
-        # Initialize costs
-        direction_cost = 0.0
         smoothness_penalty = 0.0
-
         if previous_point is not None:
             prev_point = np.array(previous_point, dtype=np.float64)
             current_to_goal_vec = goal - current
             prev_to_current_vec = current - prev_point
 
-            # Compute cosine of the angle between vectors
+            # 计算方向的平滑性（转角代价）
             cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
                 np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
             )
             cos_theta = np.clip(cos_theta, -1.0, 1.0)
             angle = np.arccos(cos_theta)
-
-            # Penalize sharp turns
             smoothness_penalty = smoothness_weight * (angle ** 2)
 
-        # Obstacle penalty: inversely proportional to the square of the distance to the nearest obstacle
+        # 障碍物代价（与最近障碍物的反比平方）
         obstacle_distance = self.calculate_obstacle_distance(current)
-        obstacle_distance = max(obstacle_distance, 1e-3)  # Avoid division by zero
+        obstacle_distance = max(obstacle_distance, 1e-3)  # 防止除以零
         obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
-        # Reward for being far from obstacles
+        # 路径的安全性代价：奖励远离障碍物的点
         center_distance = self.get_distance_transform_value(current)
         center_reward = safety_weight * center_distance
 
-        # Dynamic adjustment of the global goal weight
-        dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50.0)
-
+        # 总成本
         total_cost = (
-            dynamic_global_goal_weight * dist_to_goal +  # Distance to goal cost
-            direction_cost +                            # Direction cost
-            smoothness_penalty +                        # Smoothness penalty
-            obstacle_penalty -                          # Obstacle penalty (added to cost)
-            center_reward                               # Center reward (subtracted from cost)
+            global_goal_weight * dist_to_goal +  # 目标方向的代价
+            smoothness_penalty +                # 平滑性代价
+            obstacle_penalty -                  # 障碍物代价（越接近越高）
+            center_reward                       # 安全性奖励
         )
         return total_cost
     
@@ -525,10 +517,7 @@ class GazeboEnv:
         ]
         return neighbors
 
-    def smooth_path_with_segmentation(self, waypoints, weight_data=0.1, weight_smooth=0.9, tolerance=1e-6):
-        """
-        分段平滑路徑，分別處理直線和彎道段。
-        """
+    def smooth_path_with_segmentation(self, waypoints, weight_data=0.05, weight_smooth=0.7, tolerance=1e-6):
         def calculate_curvature(p1, p2, p3):
             dx1, dy1 = p2[0] - p1[0], p2[1] - p1[1]
             dx2, dy2 = p3[0] - p2[0], p3[1] - p2[1]
@@ -539,9 +528,7 @@ class GazeboEnv:
         def smooth_segment(segment, weight_data, weight_smooth):
             new_segment = [list(p) for p in segment]
             change = tolerance
-            iteration = 0
-            max_iterations = 1000
-            while change >= tolerance and iteration < max_iterations:
+            while change >= tolerance:
                 change = 0.0
                 for i in range(1, len(segment) - 1):
                     for j in range(2):
@@ -549,7 +536,6 @@ class GazeboEnv:
                         new_segment[i][j] += weight_data * (segment[i][j] - new_segment[i][j]) + \
                                             weight_smooth * (new_segment[i - 1][j] + new_segment[i + 1][j] - 2 * new_segment[i][j])
                         change += abs(aux - new_segment[i][j])
-                iteration += 1
             return new_segment
 
         curvatures = [0]
@@ -557,19 +543,22 @@ class GazeboEnv:
             curvatures.append(calculate_curvature(waypoints[i - 1], waypoints[i], waypoints[i + 1]))
         curvatures.append(0)
 
+        # 动态区分直线段与弯道段
+        curvature_threshold = 0.05  # 设定曲率阈值
         smoothed_path = []
         segment = [waypoints[0]]
+
         for i in range(1, len(waypoints)):
-            if curvatures[i] < 0.05:
+            if curvatures[i] < curvature_threshold:  # 直线段
                 segment.append(waypoints[i])
-            else:
+            else:  # 弯道段
                 if len(segment) > 1:
-                    smoothed_segment = smooth_segment(segment, weight_data=0.05, weight_smooth=0.1)
+                    smoothed_segment = smooth_segment(segment, weight_data=0.1, weight_smooth=0.1)
                     smoothed_path.extend(smoothed_segment[:-1])
                 segment = [waypoints[i - 1], waypoints[i]]
 
         if len(segment) > 1:
-            smoothed_segment = smooth_segment(segment, weight_data=0.1, weight_smooth=0.9)
+            smoothed_segment = smooth_segment(segment, weight_data=0.05, weight_smooth=0.9)
             smoothed_path.extend(smoothed_segment)
 
         smoothed_path.append(waypoints[-1])
