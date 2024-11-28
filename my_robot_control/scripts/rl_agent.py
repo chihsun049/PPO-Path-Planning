@@ -375,7 +375,7 @@ class GazeboEnv:
 
     def heuristic_cost(self, current, goal, previous_point=None,
                    direction_weight=1.0, obstacle_weight=50.0,
-                   global_goal_weight=2.0, smoothness_weight=2.0, safety_weight=100.0):
+                   global_goal_weight=1.0, smoothness_weight=10.0, safety_weight=100.0):
         current = np.array(current, dtype=np.float64)
         goal = np.array(goal, dtype=np.float64)
         dist_to_goal = np.linalg.norm(goal - current)  # 与目标距离的代价
@@ -507,12 +507,16 @@ class GazeboEnv:
         
         return distances.min()  # 返回最近障碍物的距离
     
-    def get_neighbors(self, current, step=1.0):
-        x, y = map(float, current)  # 保證輸入是浮點數
-        directions = [
-            (step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step),  # 上下左右
-            (step, step), (step, -step), (-step, step), (-step, -step)  # 對角線
-        ]
+    def get_neighbors(self, current, step=0.5):
+        x, y = map(float, current)  # 保证输入是浮点数
+        directions = []
+        num_directions = 16  # 考虑16个方向
+        for i in range(num_directions):
+            angle_rad = 2 * np.pi * i / num_directions
+            dx = step * np.cos(angle_rad)
+            dy = step * np.sin(angle_rad)
+            directions.append((dx, dy))
+
         neighbors = [
             (x + dx, y + dy)
             for dx, dy in directions

@@ -90,7 +90,7 @@
     <model name='floor'>
       <link name='base_link'>
         <inertial>
-          <pose>25.8 5 -93.89 0 -0.025663 0</pose>
+          <pose>25.8 5 -93.89 0 -0.025663 -0.0053</pose>
           <mass>8.0192e+06</mass>
           <inertia>
             <ixx>1</ixx>
@@ -102,7 +102,7 @@
           </inertia>
         </inertial>
         <collision name='base_link_collision'>
-          <pose>25.8 5 -93.89 0 -0.025663 0</pose>
+          <pose>25.8 5 -93.89 0 -0.025663 -0.0053</pose>
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
@@ -124,7 +124,7 @@
           <max_contacts>10</max_contacts>
         </collision>
         <visual name='base_link_visual'>
-          <pose>25.8 5 -93.89 0 -0.025663 0</pose>
+          <pose>25.8 5 -93.89 0 -0.025663 -0.0053</pose>
           <geometry>
             <mesh>
               <scale>1 1 1</scale>
