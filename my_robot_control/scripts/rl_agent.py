@@ -373,14 +373,13 @@ class GazeboEnv:
         gazebo_y = (2000.0 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal, previous_point=None,
-                   direction_weight=1.0, obstacle_weight=50.0,
-                   global_goal_weight=1.0, smoothness_weight=10.0, safety_weight=100.0):
+    def heuristic_cost(self, current, goal, previous_point=None, obstacle_weight=50.0,
+                   global_goal_weight=1.0, smoothness_weight=20.0, safety_weight=100.0):
         current = np.array(current, dtype=np.float64)
         goal = np.array(goal, dtype=np.float64)
-        dist_to_goal = np.linalg.norm(goal - current)  # 与目标距离的代价
+        dist_to_goal = np.linalg.norm(goal - current)  # Cost for distance to goal
 
-        # 计算方向一致性代价（与上一点的方向偏差）
+        # Initialize costs
         direction_cost = 0.0
         smoothness_penalty = 0.0
 
@@ -389,34 +388,36 @@ class GazeboEnv:
             current_to_goal_vec = goal - current
             prev_to_current_vec = current - prev_point
 
-            # 计算方向一致性代价（方向代价，cos_theta 越接近 1 越好）
+            # Compute cosine of the angle between vectors
             cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
                 np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
             )
-            direction_cost = direction_weight * (1 - cos_theta)  # 偏离目标方向的代价
+            cos_theta = np.clip(cos_theta, -1.0, 1.0)
+            angle = np.arccos(cos_theta)
 
-            # 计算平滑性代价（与上一点的方向一致性）
-            smoothness_penalty = (1 - cos_theta) * smoothness_weight
+            # Penalize sharp turns
+            smoothness_penalty = smoothness_weight * (angle ** 2)
 
-        # 障碍物惩罚: 与障碍物距离的平方成反比
+        # Obstacle penalty: inversely proportional to the square of the distance to the nearest obstacle
         obstacle_distance = self.calculate_obstacle_distance(current)
-        obstacle_distance = max(obstacle_distance, 1e-3)  # 避免数值过大
+        obstacle_distance = max(obstacle_distance, 1e-3)  # Avoid division by zero
         obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
-        # 中心化代价: 偏向距离障碍物最远的区域
+        # Reward for being far from obstacles
         center_distance = self.get_distance_transform_value(current)
         center_reward = safety_weight * center_distance
 
-        # 动态调整全局目标权重
+        # Dynamic adjustment of the global goal weight
         dynamic_global_goal_weight = global_goal_weight * (0.5 + dist_to_goal / 50.0)
 
-        return (
-            dynamic_global_goal_weight * dist_to_goal +  # 与目标距离的代价
-            direction_cost +                            # 方向代价
-            smoothness_penalty +                        # 平滑性代价
-            obstacle_penalty -                          # 障碍物惩罚
-            center_reward                               # 距离障碍物越远越好
+        total_cost = (
+            dynamic_global_goal_weight * dist_to_goal +  # Distance to goal cost
+            direction_cost +                            # Direction cost
+            smoothness_penalty +                        # Smoothness penalty
+            obstacle_penalty -                          # Obstacle penalty (added to cost)
+            center_reward                               # Center reward (subtracted from cost)
         )
+        return total_cost
     
     def find_best_point_in_grid(self, waypoint, previous_waypoint=None, grid_size=50):
         """
@@ -507,10 +508,10 @@ class GazeboEnv:
         
         return distances.min()  # 返回最近障碍物的距离
     
-    def get_neighbors(self, current, step=0.5):
-        x, y = map(float, current)  # 保证输入是浮点数
+    def get_neighbors(self, current, step=0.1):
+        x, y = map(float, current)  # Ensure the inputs are floats
         directions = []
-        num_directions = 16  # 考虑16个方向
+        num_directions = 32  # Increase the number of directions for finer movement
         for i in range(num_directions):
             angle_rad = 2 * np.pi * i / num_directions
             dx = step * np.cos(angle_rad)
@@ -523,6 +524,56 @@ class GazeboEnv:
             if 0.0 <= x + dx < self.slam_map.shape[1] and 0.0 <= y + dy < self.slam_map.shape[0]
         ]
         return neighbors
+
+    def smooth_path_with_segmentation(self, waypoints, weight_data=0.1, weight_smooth=0.9, tolerance=1e-6):
+        """
+        分段平滑路徑，分別處理直線和彎道段。
+        """
+        def calculate_curvature(p1, p2, p3):
+            dx1, dy1 = p2[0] - p1[0], p2[1] - p1[1]
+            dx2, dy2 = p3[0] - p2[0], p3[1] - p2[1]
+            cross_product = abs(dx1 * dy2 - dy1 * dx2)
+            dot_product = (dx1 ** 2 + dy1 ** 2) ** 0.5 * (dx2 ** 2 + dy2 ** 2) ** 0.5
+            return cross_product / (dot_product + 1e-6)
+
+        def smooth_segment(segment, weight_data, weight_smooth):
+            new_segment = [list(p) for p in segment]
+            change = tolerance
+            iteration = 0
+            max_iterations = 1000
+            while change >= tolerance and iteration < max_iterations:
+                change = 0.0
+                for i in range(1, len(segment) - 1):
+                    for j in range(2):
+                        aux = new_segment[i][j]
+                        new_segment[i][j] += weight_data * (segment[i][j] - new_segment[i][j]) + \
+                                            weight_smooth * (new_segment[i - 1][j] + new_segment[i + 1][j] - 2 * new_segment[i][j])
+                        change += abs(aux - new_segment[i][j])
+                iteration += 1
+            return new_segment
+
+        curvatures = [0]
+        for i in range(1, len(waypoints) - 1):
+            curvatures.append(calculate_curvature(waypoints[i - 1], waypoints[i], waypoints[i + 1]))
+        curvatures.append(0)
+
+        smoothed_path = []
+        segment = [waypoints[0]]
+        for i in range(1, len(waypoints)):
+            if curvatures[i] < 0.05:
+                segment.append(waypoints[i])
+            else:
+                if len(segment) > 1:
+                    smoothed_segment = smooth_segment(segment, weight_data=0.05, weight_smooth=0.1)
+                    smoothed_path.extend(smoothed_segment[:-1])
+                segment = [waypoints[i - 1], waypoints[i]]
+
+        if len(segment) > 1:
+            smoothed_segment = smooth_segment(segment, weight_data=0.1, weight_smooth=0.9)
+            smoothed_path.extend(smoothed_segment)
+
+        smoothed_path.append(waypoints[-1])
+        return smoothed_path
     
     def reconstruct_path(self, came_from, current):
         path = [tuple(np.array(current, dtype=np.float64))]  # 保證浮點數精度
@@ -589,7 +640,7 @@ class GazeboEnv:
 
     def optimize_waypoints_with_a_star(self):
         """
-        使用改进的 A* 算法，针对每个路径点在其周围的网格内寻找最佳的目标点。
+        Use an improved A* algorithm to find the optimal target point around each waypoint in its grid.
         """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Optimized waypoints already calculated. Skipping.")
@@ -602,24 +653,27 @@ class GazeboEnv:
             waypoint = self.waypoints[i]
             rospy.loginfo(f"Optimizing waypoint {i}: {waypoint}")
 
-            # 在以当前路径点为中心的网格内寻找最佳点
+            # Find the best point in the grid around the current waypoint
             previous_waypoint = self.waypoints[i - 1] if i > 0 else None
             optimized_point = self.find_best_point_in_grid(waypoint, previous_waypoint)
             optimized_waypoints.append(optimized_point)
 
-        self.optimized_waypoints = optimized_waypoints
+        # 改用分段平滑
+        self.optimized_waypoints = self.smooth_path_with_segmentation(
+            optimized_waypoints, weight_data=0.1, weight_smooth=0.9
+        )
         self.optimized_waypoints_calculated = True
 
-        # 更新到新的路径点
+        # Update the waypoints with the optimized and smoothed waypoints
         self.waypoints = self.optimized_waypoints
 
-        # 更新 current_waypoint_index 的范围
+        # Reset the current waypoint index
         self.current_waypoint_index = 0
 
-        # 重新初始化 waypoint_failures
+        # Reinitialize waypoint failures
         self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
 
-        # 可视化完整路径
+        # Visualize the complete path
         self.visualize_complete_path(self.optimized_waypoints)
         rospy.loginfo("Global path optimization complete.")
 
