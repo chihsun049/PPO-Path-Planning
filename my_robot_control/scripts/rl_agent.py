@@ -521,48 +521,90 @@ class GazeboEnv:
         def calculate_curvature(p1, p2, p3):
             dx1, dy1 = p2[0] - p1[0], p2[1] - p1[1]
             dx2, dy2 = p3[0] - p2[0], p3[1] - p2[1]
-            cross_product = abs(dx1 * dy2 - dy1 * dx2)
-            dot_product = (dx1 ** 2 + dy1 ** 2) ** 0.5 * (dx2 ** 2 + dy2 ** 2) ** 0.5
-            return cross_product / (dot_product + 1e-6)
+            cross_product = dx1 * dy2 - dy1 * dx2
+            dot_product = dx1 * dx2 + dy1 * dy2
+            curvature = abs(cross_product) / (np.sqrt(dot_product + 1e-6) + 1e-6)
+            return curvature
 
-        def smooth_segment(segment, weight_data, weight_smooth):
-            new_segment = [list(p) for p in segment]
-            change = tolerance
-            while change >= tolerance:
-                change = 0.0
-                for i in range(1, len(segment) - 1):
-                    for j in range(2):
-                        aux = new_segment[i][j]
-                        new_segment[i][j] += weight_data * (segment[i][j] - new_segment[i][j]) + \
-                                            weight_smooth * (new_segment[i - 1][j] + new_segment[i + 1][j] - 2 * new_segment[i][j])
-                        change += abs(aux - new_segment[i][j])
-            return new_segment
-
-        curvatures = [0]
-        for i in range(1, len(waypoints) - 1):
-            curvatures.append(calculate_curvature(waypoints[i - 1], waypoints[i], waypoints[i + 1]))
-        curvatures.append(0)
-
-        # 动态区分直线段与弯道段
-        curvature_threshold = 0.05  # 设定曲率阈值
-        smoothed_path = []
+        # 分段处理路径，区分直线段和弯道段
+        curvature_threshold = 0.01  # 调整曲率阈值，更好地区分直线和弯道
+        segments = []
         segment = [waypoints[0]]
+        curvatures = []
 
-        for i in range(1, len(waypoints)):
-            if curvatures[i] < curvature_threshold:  # 直线段
+        # 计算每个点的曲率
+        for i in range(1, len(waypoints) - 1):
+            curvature = calculate_curvature(waypoints[i - 1], waypoints[i], waypoints[i + 1])
+            curvatures.append(curvature)
+
+        # 根据曲率将路径分段
+        for i in range(1, len(waypoints) - 1):
+            if curvatures[i - 1] < curvature_threshold:
                 segment.append(waypoints[i])
-            else:  # 弯道段
-                if len(segment) > 1:
-                    smoothed_segment = smooth_segment(segment, weight_data=0.1, weight_smooth=0.1)
-                    smoothed_path.extend(smoothed_segment[:-1])
-                segment = [waypoints[i - 1], waypoints[i]]
+            else:
+                segment.append(waypoints[i])
+                segments.append(('straight', segment))
+                segment = [waypoints[i]]
+                # 处理弯道段
+                curve_segment = [waypoints[i - 1], waypoints[i], waypoints[i + 1]]
+                segments.append(('curve', curve_segment))
+                segment = [waypoints[i + 1]]
 
-        if len(segment) > 1:
-            smoothed_segment = smooth_segment(segment, weight_data=0.05, weight_smooth=0.9)
-            smoothed_path.extend(smoothed_segment)
+        # 添加最后的段
+        if segment:
+            segment_type = 'straight' if curvatures[-1] < curvature_threshold else 'curve'
+            segments.append((segment_type, segment))
+
+        # 对每个段进行平滑处理
+        smoothed_path = []
+        for segment_type, segment in segments:
+            if segment_type == 'straight':
+                # 对直线段进行轻微平滑
+                smoothed_segment = self.smooth_segment(segment, weight_data=0.1, weight_smooth=0.1, tolerance=tolerance)
+                smoothed_path.extend(smoothed_segment[:-1])
+            elif segment_type == 'curve':
+                # 对弯道段进行专门的优化，生成大曲率曲线
+                smoothed_segment = self.optimize_curve_segment(segment)
+                smoothed_path.extend(smoothed_segment[:-1])
 
         smoothed_path.append(waypoints[-1])
         return smoothed_path
+
+    def smooth_segment(self, segment, weight_data, weight_smooth, tolerance):
+        new_segment = [list(p) for p in segment]
+        change = tolerance
+        while change >= tolerance:
+            change = 0.0
+            for i in range(1, len(segment) - 1):
+                for j in range(2):
+                    aux = new_segment[i][j]
+                    new_segment[i][j] += weight_data * (segment[i][j] - new_segment[i][j]) + \
+                                        weight_smooth * (new_segment[i - 1][j] + new_segment[i + 1][j] - 2 * new_segment[i][j])
+                    change += abs(aux - new_segment[i][j])
+        return new_segment
+
+    def optimize_curve_segment(self, segment):
+        # 使用Bezier曲线对弯道段进行优化
+        if len(segment) < 3:
+            return segment
+
+        p0, p1, p2 = segment[0], segment[1], segment[-1]
+        # 控制点，调整以远离弯角
+        control_point = (
+            p1[0] + (p1[0] - (p0[0] + p2[0]) / 2) * 0.5,
+            p1[1] + (p1[1] - (p0[1] + p2[1]) / 2) * 0.5
+        )
+
+        bezier_points = self.generate_bezier_curve(p0, control_point, p2, num_points=10)
+        return bezier_points
+
+    def generate_bezier_curve(self, p0, p1, p2, num_points=10):
+        bezier_points = []
+        for t in np.linspace(0, 1, num_points):
+            x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+            y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+            bezier_points.append((x, y))
+        return bezier_points
     
     def reconstruct_path(self, came_from, current):
         path = [tuple(np.array(current, dtype=np.float64))]  # 保證浮點數精度
