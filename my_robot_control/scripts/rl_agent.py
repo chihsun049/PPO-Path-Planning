@@ -473,11 +473,12 @@ class GazeboEnv:
             return waypoint
     
     def get_distance_transform_value(self, point):
-        x, y = map(float, point)  # 保证使用浮点数
-        if 0 <= int(y) < self.distance_transform.shape[0] and 0 <= int(x) < self.distance_transform.shape[1]:
-            return self.distance_transform[int(y), int(x)]  # 使用距离变换矩阵的值
+        x, y = int(point[0]), int(point[1])
+        if 0 <= y < self.distance_transform.shape[0] and 0 <= x < self.distance_transform.shape[1]:
+            # 直接返回距离变换的值，单位为米
+            return self.distance_transform[y, x]
         else:
-            return 0.0  # 超出范围时返回0
+            return 0.0  # 超出范围返回0
 
     def calculate_obstacle_distance(self, point):
         x, y = map(float, point)  # 确保使用浮点数
@@ -584,17 +585,46 @@ class GazeboEnv:
         return new_segment
 
     def optimize_curve_segment(self, segment):
-        # 使用Bezier曲线对弯道段进行优化
+        # 使用 Bezier 曲线对弯道段进行优化
         if len(segment) < 3:
             return segment
 
         p0, p1, p2 = segment[0], segment[1], segment[-1]
-        # 控制点，调整以远离弯角
-        control_point = (
-            p1[0] + (p1[0] - (p0[0] + p2[0]) / 2) * 0.5,
-            p1[1] + (p1[1] - (p0[1] + p2[1]) / 2) * 0.5
-        )
 
+        # 将点转换为图像坐标
+        img_p0 = self.gazebo_to_image_coords(*p0)
+        img_p1 = self.gazebo_to_image_coords(*p1)
+        img_p2 = self.gazebo_to_image_coords(*p2)
+
+        # 获取距离变换值（到最近障碍物的距离）
+        dist_p1 = self.get_distance_transform_value(img_p1)
+
+        # 定义一个搜索范围，找到附近的最佳控制点
+        search_radius = int(10 / self.map_resolution)  # 搜索半径，单位为像素
+
+        best_control_point = img_p1
+        max_distance = dist_p1
+
+        for dx in range(-search_radius, search_radius + 1, 5):
+            for dy in range(-search_radius, search_radius + 1, 5):
+                candidate_point = (img_p1[0] + dx, img_p1[1] + dy)
+
+                # 检查候选点是否在地图范围内
+                if 0 <= candidate_point[0] < self.slam_map.shape[1] and 0 <= candidate_point[1] < self.slam_map.shape[0]:
+                    distance = self.get_distance_transform_value(candidate_point)
+                    # 优化目标：距离障碍物远，且路径平滑
+                    # 这里可以引入一个权重参数，平衡距离和路径偏离程度
+                    smoothness_penalty = np.linalg.norm(np.array(candidate_point) - np.array(img_p1))
+                    score = distance - 0.5 * smoothness_penalty  # 路径平滑权重为0.5，可根据需要调整
+
+                    if score > max_distance:
+                        max_distance = score
+                        best_control_point = candidate_point
+
+        # 将最佳控制点转换回 Gazebo 坐标
+        control_point = self.image_to_gazebo_coords(*best_control_point)
+
+        # 生成 Bezier 曲线
         bezier_points = self.generate_bezier_curve(p0, control_point, p2, num_points=10)
         return bezier_points
 
