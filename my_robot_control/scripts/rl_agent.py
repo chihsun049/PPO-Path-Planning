@@ -22,6 +22,7 @@ import cv2
 import datetime
 from torch.optim.lr_scheduler import StepLR
 from scipy.ndimage import distance_transform_edt
+import matplotlib.pyplot as plt
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -184,6 +185,38 @@ class GazeboEnv:
         # 计算距离变换：障碍物为0，其它区域为1
         binary_map = (self.slam_map >= 250).astype(np.uint8)  # 可行区域设为1，障碍物设为0
         self.distance_transform = distance_transform_edt(binary_map) * self.map_resolution
+        self.generate_costmap()
+    
+    def generate_costmap(self):
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
+
+        wall_color = np.array([100, 100, 100])
+        wall_color2 = np.array([120, 120, 120])
+        
+        img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR)
+        wall_mask = cv2.inRange(img, wall_color, wall_color2)
+        
+        self.cost_map = np.zeros_like(self.slam_map)
+        
+        inner_dilation = 7
+        outer_dilation = 15
+        
+        inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
+        inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
+        
+        outer_kernel = np.ones((outer_dilation * 2 + 1, outer_dilation * 2 + 1), np.uint8)
+        outer_dilated = cv2.dilate(wall_mask, outer_kernel, iterations=1)
+        
+        outer_only = cv2.subtract(outer_dilated, inner_dilated)
+        
+        self.cost_map[wall_mask > 0] = 254        # 障礙物設為最高代價
+        self.cost_map[inner_dilated > 0] = 190    # 內層膨脹區設為中高代價
+        self.cost_map[outer_only > 0] = 100        # 外層膨脹區設為中低代價
+        
+        rospy.loginfo("Costmap generated successfully.")
+        return True
 
     def generate_waypoints(self):
         waypoints = [(-6.4981, -1.0627),
@@ -384,114 +417,99 @@ class GazeboEnv:
 
     def calculate_heuristic(self, point, goal_point, png_image, cost_map, grid_size=50, weights=None):
         """
-        修改启发式函数，将路径点作为软约束。
+        計算啟發值，結合多種因素。
+        :param point: 當前節點 (x, y)
+        :param goal_point: 目標節點 (x, y)
+        :param png_image: 地圖影像
+        :param cost_map: 成本地圖
+        :param grid_size: 格子大小
+        :param weights: 權重字典，包括距離、障礙物和平滑度
+        :return: 啟發值
         """
-        current = np.array(current, dtype=np.float64)
+        img_x, img_y = point
+        goal_x, goal_y = goal_point
 
-        # 动态计算候选目标点中最佳的点
-        best_goal = None
-        lowest_cost = float('inf')
+        # 默認權重
+        if weights is None:
+            weights = {
+                "distance": 1.0,       # 距離的權重
+                "obstacle": 2.0,       # 障礙物的權重
+                "smoothness": 0.5,     # 平滑度的權重
+                "costmap": 3.0         # 成本地圖的權重
+            }
 
-        for goal in goal_candidates:
-            goal = np.array(goal, dtype=np.float64)
+        # 距離的啟發值
+        distance = np.sqrt((goal_x - img_x) ** 2 + (goal_y - img_y) ** 2)
 
-            # 与目标的距离代价
-            dist_to_goal = np.linalg.norm(goal - current)
-
-            # 平滑性代价
-            smoothness_penalty = 0.0
-            if previous_point is not None:
-                prev_point = np.array(previous_point, dtype=np.float64)
-                current_to_goal_vec = goal - current
-                prev_to_current_vec = current - prev_point
-
-                cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
-                    np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
-                )
-                angle = np.arccos(np.clip(cos_theta, -1.0, 1.0))
-                smoothness_penalty = smoothness_weight * (angle ** 2)
-
-            # 障碍物代价
-            obstacle_count = self.calculate_obstacle_count(goal)
-            obstacle_penalty = obstacle_weight * obstacle_count
-
-            # 距离路径点的偏离代价
-            waypoint_penalty = 0.0
-            if waypoint is not None:
-                waypoint = np.array(waypoint, dtype=np.float64)
-                dist_to_waypoint = np.linalg.norm(goal - waypoint)
-                waypoint_penalty = waypoint_weight * dist_to_waypoint
-
-            # 总成本
-            total_cost = dist_to_goal + smoothness_penalty + obstacle_penalty + waypoint_penalty
-            if total_cost < lowest_cost:
-                lowest_cost = total_cost
-                best_goal = goal
-
-        return lowest_cost, best_goal
-    
-    def find_best_point_in_grid(self, waypoint, previous_waypoint=None, grid_size=100, waypoint_weight=1.0):
-        img_x, img_y = self.gazebo_to_image_coords(*waypoint)
-        half_grid = grid_size // 2
-
-        # 限定搜索范围
-        min_x = max(0, img_x - half_grid)
-        max_x = min(self.slam_map.shape[1] - 1, img_x + half_grid)
-        min_y = max(0, img_y - half_grid)
-        max_y = min(self.slam_map.shape[0] - 1, img_y + half_grid)
-
-        grid = self.slam_map[min_y:max_y+1, min_x:max_x+1]
-        free_space = np.argwhere(grid >= 250)
-
-        if free_space.size == 0:
-            rospy.logwarn(f"No free space found around waypoint {waypoint}. Using original point.")
-            return waypoint
-
-        global_free_space = free_space + np.array([min_y, min_x])
-
-        # 获取候选点的全局坐标
-        goal_candidates = [self.image_to_gazebo_coords(x[1], x[0]) for x in global_free_space]
-
-        # 计算最佳的目标点
-        cost, best_point = self.heuristic_cost(
-            (img_x, img_y),
-            goal_candidates,
-            previous_point=self.gazebo_to_image_coords(*previous_waypoint) if previous_waypoint is not None else None,
-            waypoint=waypoint,
-            waypoint_weight=waypoint_weight
+        # 障礙物的權重
+        unwalkable_count = np.sum(
+            png_image[max(0, img_y - grid_size // 2):min(img_y + grid_size // 2, png_image.shape[0]),
+                    max(0, img_x - grid_size // 2):min(img_x + grid_size // 2, png_image.shape[1])] < 180
         )
 
-        if best_point is not None:
-            return best_point
-        else:
-            rospy.logwarn(f"No optimal point found around waypoint {waypoint}. Using original point.")
-            return waypoint
+        # 路徑平滑度（假設平滑的路徑更接近直線）
+        delta_x = abs(goal_x - img_x)
+        delta_y = abs(goal_y - img_y)
+        smoothness_penalty = abs(delta_x - delta_y)
 
-    def calculate_obstacle_count(self, point):
+        # 成本地圖的代價
+        costmap_penalty = cost_map[img_y, img_x] if 0 <= img_x < cost_map.shape[1] and 0 <= img_y < cost_map.shape[0] else float('inf')
+
+        # 結合多種權重
+        heuristic = (
+            weights["distance"] * distance +
+            weights["obstacle"] * unwalkable_count +
+            weights["smoothness"] * smoothness_penalty +
+            weights["costmap"] * costmap_penalty
+        )
+        return heuristic
+
+    def a_star_optimize_waypoint(self, png_image, cost_map, start_point, goal_point, grid_size=50):
         """
-        计算给定点周围障碍物的数量。
+        使用 A* 算法進行全局遍歷搜索，考慮多種權重：最短路徑、障礙物數量、路徑平滑度、成本地圖。
         """
-        x, y = map(float, point)  # 确保输入点是浮点数
-        search_range = 20  # 搜索范围（像素）
+        start_x, start_y = self.gazebo_to_image_coords(*start_point)
+        goal_x, goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        # 限制搜索范围在地图边界内
-        min_x = max(0, int(x - search_range))
-        max_x = min(self.slam_map.shape[1], int(x + search_range))
-        min_y = max(0, int(y - search_range))
-        max_y = min(self.slam_map.shape[0], int(y + search_range))
+        # A* 初始化
+        open_set = [(0, (start_x, start_y))]  # 優先隊列，儲存 (f_score, point)
+        came_from = {}  # 路徑追蹤
+        g_score = np.full(png_image.shape, float('inf'), dtype=np.float32)  # 將所有節點的 g_score 初始化為無窮大
+        g_score[start_y, start_x] = 0
 
-        # 找到障碍物点
-        obstacle_count = np.sum(self.slam_map[min_y:max_y, min_x:max_x] < 250)  # 障碍物像素值小于 250
+        while open_set:
+            # 選擇 f_score 最低的節點
+            _, current_point = min(open_set, key=lambda x: x[0])
+            open_set.remove((_, current_point))
+            current_x, current_y = current_point
 
-        return obstacle_count  # 返回障碍物点的数量
-    
-    def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
-        current = np.array(current, dtype=np.float64)
-        neighbor = np.array(neighbor, dtype=np.float64)
-        
-        # 使用 Bresenham 演算法生成 current 到 neighbor 的線段
-        rr, cc = line(int(round(current[1])), int(round(current[0])),
-                    int(round(neighbor[1])), int(round(neighbor[0])))
+            if current_point == (goal_x, goal_y):
+                # 路徑重建
+                path = []
+                while current_point in came_from:
+                    path.append(current_point)
+                    current_point = came_from[current_point]
+                path.reverse()
+
+                # 將路徑點轉換回 Gazebo 坐標
+                optimized_path = [self.image_to_gazebo_coords(x, y) for x, y in path]
+                return optimized_path[-1]
+
+            # 遍歷所有可能的鄰居點
+            for x in range(current_x - grid_size // 2, current_x + grid_size // 2):
+                for y in range(current_y - grid_size // 2, current_y + grid_size // 2):
+                    if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
+                        continue  # 確保節點在地圖範圍內
+
+                    tentative_g_score = g_score[current_y, current_x] + 1  # 假設移動到相鄰點的代價為1
+
+                    if tentative_g_score < g_score[y, x]:
+                        # 更新最優路徑
+                        came_from[(x, y)] = current_point
+                        g_score[y, x] = tentative_g_score
+                        f_score = tentative_g_score + self.calculate_heuristic((x, y), (goal_x, goal_y), png_image, cost_map, grid_size)
+                        if (x, y) not in [item[1] for item in open_set]:
+                            open_set.append((f_score, (x, y)))
 
         # 如果未找到路徑，返回初始目標點
         rospy.logwarn("A* failed to find a path.")
@@ -629,7 +647,8 @@ class GazeboEnv:
         # 保存圖片
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        rospy.loginfo(f"Path visualization saved to {save_path}")
+        
+        rospy.loginfo(f"Path visualization with cost map saved to {save_path}")
 
     def generate_imu_data(self):
         imu_data = Imu()
