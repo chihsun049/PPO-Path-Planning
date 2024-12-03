@@ -21,6 +21,7 @@ import random
 from skimage.draw import line
 import matplotlib.pyplot as plt
 from scipy.ndimage import distance_transform_edt
+import cv2
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -186,7 +187,39 @@ class GazeboEnv:
         # 计算距离变换：障碍物为0，其它区域为1
         binary_map = (self.slam_map >= 250).astype(np.uint8)  # 可行区域设为1，障碍物设为0
         self.distance_transform = distance_transform_edt(binary_map) * self.map_resolution
+        self.generate_costmap()
+    
+    def generate_costmap(self):
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
 
+        wall_color = np.array([100, 100, 100])
+        wall_color2 = np.array([120, 120, 120])
+        
+        img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR)
+        wall_mask = cv2.inRange(img, wall_color, wall_color2)
+        
+        self.cost_map = np.zeros_like(self.slam_map)
+        
+        inner_dilation = 7
+        outer_dilation = 15
+        
+        inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
+        inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
+        
+        outer_kernel = np.ones((outer_dilation * 2 + 1, outer_dilation * 2 + 1), np.uint8)
+        outer_dilated = cv2.dilate(wall_mask, outer_kernel, iterations=1)
+        
+        outer_only = cv2.subtract(outer_dilated, inner_dilated)
+        
+        self.cost_map[wall_mask > 0] = 254        # 障礙物設為最高代價
+        self.cost_map[inner_dilated > 0] = 190    # 內層膨脹區設為中高代價
+        self.cost_map[outer_only > 0] = 100        # 外層膨脹區設為中低代價
+        
+        rospy.loginfo("Costmap generated successfully.")
+        return True
+    
     def generate_waypoints(self):
         waypoints = [
             (-6.4981, -1.0627),
@@ -445,28 +478,50 @@ class GazeboEnv:
         max_y = min(self.slam_map.shape[0] - 1, img_y + half_grid)
 
         grid = self.slam_map[min_y:max_y+1, min_x:max_x+1]
-        free_space = np.argwhere(grid >= 250)
+        grid_costmap = self.cost_map[min_y:max_y+1, min_x:max_x+1]
+        
+        # 結合 SLAM map 和 costmap 的條件
+        valid_points = np.logical_and(
+            grid >= 250,  # SLAM map 中的可行區域
+            grid_costmap < 180  # costmap 中非牆壁區域
+        )
+        free_space = np.argwhere(valid_points)
+
 
         if free_space.size == 0:
             rospy.logwarn(f"No free space found around waypoint {waypoint}. Using original point.")
             return waypoint
 
         global_free_space = free_space + np.array([min_y, min_x])
+        best_point = None
+        lowest_cost = float('inf')
 
-        # 获取候选点的全局坐标
-        goal_candidates = [self.image_to_gazebo_coords(x[1], x[0]) for x in global_free_space]
+        if previous_waypoint is not None:
+            prev_img_x, prev_img_y = self.gazebo_to_image_coords(*previous_waypoint)
+        else:
+            prev_img_x, prev_img_y = None, None
 
-        # 计算最佳的目标点
-        cost, best_point = self.heuristic_cost(
-            (img_x, img_y),
-            goal_candidates,
-            previous_point=self.gazebo_to_image_coords(*previous_waypoint) if previous_waypoint is not None else None,
-            waypoint=waypoint,
-            waypoint_weight=waypoint_weight
-        )
+        for point in global_free_space:
+            x, y = point[1], point[0]
+
+            if previous_waypoint is not None:
+                if not self.is_line_free(self.slam_map, (prev_img_x, prev_img_y), (x, y)):
+                    continue
+
+            base_cost = self.heuristic_cost((x, y), (img_x, img_y), previous_point=(prev_img_x, prev_img_y))
+            costmap_cost = self.cost_map[y, x] / 254.0
+            distance_cost = np.sqrt((x - img_x)**2 + (y - img_y)**2) / grid_size
+            
+            # 綜合代價計算 增加了權重
+            w1, w2, w3 = 0.4, 0.4, 0.2  # 權重係數
+            total_cost = w1 * base_cost + w2 * costmap_cost + w3 * distance_cost
+
+            if total_cost < lowest_cost:
+                lowest_cost = total_cost
+                best_point = (x, y)
 
         if best_point is not None:
-            return best_point
+            return self.image_to_gazebo_coords(*best_point)
         else:
             rospy.logwarn(f"No optimal point found around waypoint {waypoint}. Using original point.")
             return waypoint
@@ -589,45 +644,64 @@ class GazeboEnv:
     
     def visualize_complete_path(self, waypoints, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
-        可视化路径点为单独的点，并保存为图片。
+        可视化路径点和当前位置，并在 costmap 上显示
         """
-        if not hasattr(self, 'slam_map'):
-            raise ValueError("SLAM map not loaded.")
+        if not hasattr(self, 'slam_map') or not hasattr(self, 'cost_map'):
+            raise ValueError("SLAM map or cost map not loaded.")
 
-        # 转换地图为灰度图
-        map_img = self.slam_map.copy()
-        map_img[map_img < 250] = 0  # 障碍物区域
-        map_img[map_img >= 250] = 255  # 可通行区域
+        # 創建一個 RGB 圖像來顯示 cost map
+        cost_map_rgb = np.zeros((self.cost_map.shape[0], self.cost_map.shape[1], 3), dtype=np.uint8)
+        
+        # 將不同代價值映射到不同顏色
+        cost_map_rgb[self.cost_map == 0] = [255, 255, 255]      # 空白區域為白色
+        cost_map_rgb[self.cost_map == 100] = [200, 200, 255]    # 外層膨脹區為淺藍色
+        cost_map_rgb[self.cost_map == 190] = [150, 150, 255]    # 內層膨脹區為中藍色
+        cost_map_rgb[self.cost_map == 254] = [100, 100, 100]    # 障礙物為灰色
 
-        # 转换路径点到图像坐标
+        # 獲取當前機器人位置
+        robot_x, robot_y, _ = self.get_robot_position()
+        robot_img_x, robot_img_y = self.gazebo_to_image_coords(robot_x, robot_y)
+
+        # 轉換路徑點到圖像坐標
         img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in waypoints]
 
-        # 绘制地图
-        plt.figure(figsize=(10, 10))
-        plt.imshow(map_img, cmap='gray', origin='upper')
+        # 創建圖像
+        plt.figure(figsize=(12, 12))
+        plt.imshow(cost_map_rgb)
 
-        # 绘制路径点为单独的点
-        for point in img_points:
-            if 0 <= point[0] < map_img.shape[1] and 0 <= point[1] < map_img.shape[0]:
-                plt.scatter(point[0], point[1], color='green', s=5)  # 单独的点，大小为5
+        # 繪製所有路徑點
+        for i, point in enumerate(img_points):
+            if 0 <= point[0] < cost_map_rgb.shape[1] and 0 <= point[1] < cost_map_rgb.shape[0]:
+                if i == self.current_waypoint_index:
+                    # 當前目標點用黃色標記
+                    plt.scatter(point[0], point[1], color='yellow', s=100, marker='*', label='Current Target')
+                else:
+                    # 其他路徑點用綠色標記
+                    plt.scatter(point[0], point[1], color='green', s=20)
 
-        # 标注起点和终点
+        # 標記起點和終點
         img_start = self.gazebo_to_image_coords(*waypoints[0])
         img_goal = self.gazebo_to_image_coords(*waypoints[-1])
-        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
-        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
+        plt.scatter(img_start[0], img_start[1], color='blue', s=100, marker='^', label='Start')
+        plt.scatter(img_goal[0], img_goal[1], color='red', s=100, marker='v', label='Goal')
 
-        # 设置绘图范围
-        plt.xlim(0, map_img.shape[1])
-        plt.ylim(map_img.shape[0], 0)  # 注意：图像坐标 y 轴是倒置的
+        # 標記當前機器人位置
+        plt.scatter(robot_img_x, robot_img_y, color='purple', s=150, marker='o', label='Robot')
 
-        # 添加图例并保存图片
-        plt.legend()
-        plt.title('Path Points Visualization')
-        plt.savefig(save_path)
+        # 添加圖例和標題
+        plt.legend(fontsize=12)
+        plt.title('Path Visualization with Cost Map', fontsize=14)
+        
+        # 設置軸的範圍
+        plt.xlim(0, cost_map_rgb.shape[1])
+        plt.ylim(cost_map_rgb.shape[0], 0)  # 注意：圖像坐標 y 軸是倒置的
+
+        # 保存圖片
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        rospy.loginfo(f"Path visualization saved to {save_path}")
-
+        
+        rospy.loginfo(f"Path visualization with cost map saved to {save_path}")
+    
     def generate_imu_data(self):
         imu_data = Imu()
         imu_data.header.stamp = rospy.Time.now()
