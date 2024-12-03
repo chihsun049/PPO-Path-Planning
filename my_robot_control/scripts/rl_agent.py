@@ -5,11 +5,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-from geometry_msgs.msg import Twist, PointStamped
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState
-import sensor_msgs.point_cloud2 as pc2
+from gazebo_msgs.msg import ModelState, ContactsState
 from collections import namedtuple
 import tf
 from tf.transformations import quaternion_from_euler
@@ -18,9 +17,12 @@ from torch.amp import GradScaler
 import yaml
 from PIL import Image
 import random
-from skimage.draw import line
-import matplotlib.pyplot as plt
+import csv
+import cv2
+import datetime
+from torch.optim.lr_scheduler import StepLR
 from scipy.ndimage import distance_transform_edt
+import matplotlib.pyplot as plt
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -33,8 +35,18 @@ CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+
+def grid_filter(obstacles, grid_size=0.5):
+    obstacles = np.array(obstacles)
+    # 按照 grid_size 取整
+    grid_indices = (obstacles // grid_size).astype(int)
+    # 找到唯一的网格
+    unique_indices = np.unique(grid_indices, axis=0)
+    # 返回网格中心点
+    filtered_points = unique_indices * grid_size + grid_size / 2
+    return filtered_points
 
 class PrioritizedMemory:
     def __init__(self, capacity):
@@ -43,29 +55,29 @@ class PrioritizedMemory:
         self.position = 0
         self.priorities = torch.zeros((capacity,), dtype=torch.float32).cuda()
         self.alpha = 0.6
-        self.epsilon = 1e-5
+        self.beta = 0.4
+        self.beta_increment = 0.001
+        self.epsilon = 1e-6
+        self.max_priority = 1.0
 
     def add(self, state, action, reward, done, next_state):
-        print(f"[Memory Add] Input State shape: {state.shape}, Next state shape: {next_state.shape}")
-
-        # 確保 state 和 next_state 的形狀統一
         if isinstance(state, np.ndarray):
             state = torch.tensor(state, dtype=torch.float32)
         if isinstance(next_state, np.ndarray):
             next_state = torch.tensor(next_state, dtype=torch.float32)
 
+        # Ensure states have the right shape (B, C, H, W)
         if state.dim() == 5:
             state = state.squeeze(1)
         if next_state.dim() == 5:
             next_state = next_state.squeeze(1)
 
-        print(f"[Memory Add] After adjusted State shape: {state.shape}, Next state shape: {next_state.shape}")
+        # Ensure states have 4 dimensions
+        if state.dim() == 3:
+            state = state.unsqueeze(0)
+        if next_state.dim() == 3:
+            next_state = next_state.unsqueeze(0)
 
-        if state.shape != next_state.shape:
-            raise ValueError(f"[Memory Add] State and next_state shapes do not match: {state.shape} vs {next_state.shape}")
-        
-        # 其餘操作保持不變
-        max_priority = self.priorities.max() if self.memory[self.position] is not None else torch.tensor(1.0, device=device)
         self.memory[self.position] = (
             state.to(device),
             torch.tensor(action, dtype=torch.float32, device=device),
@@ -73,63 +85,45 @@ class PrioritizedMemory:
             torch.tensor(done, dtype=torch.float32, device=device),
             next_state.to(device)
         )
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
-        print(f"[Memory Add] Added sample at position {self.position}. Total samples: {sum(1 for x in self.memory if x is not None)}")
 
-
-    def sample(self, batch_size, beta=0.4):
-        # 確保有效樣本數量足夠
-        valid_samples = [sample for sample in self.memory if sample is not None]
-        print(f"[Memory Sample] Valid samples: {len(valid_samples)}, Requested batch size: {batch_size}")
+    def sample(self, batch_size):
+        valid_samples = [i for i, x in enumerate(self.memory) if x is not None]
         if len(valid_samples) < batch_size:
-            print(f"Available samples: {len(valid_samples)}, requested batch size: {batch_size}")
-            raise ValueError("Sampled None from memory. Not enough valid samples.")
+            raise ValueError(f"Not enough valid samples. Have {len(valid_samples)}, need {batch_size}")
 
-        # 抽取樣本
-        priorities = self.priorities[:self.position] if self.position < self.capacity else self.priorities
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
+        # Update beta
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        
+        # Calculate sampling probabilities
+        priorities = self.priorities[:len(valid_samples)]
+        probs = priorities ** self.alpha
+        probs = probs / probs.sum()
 
-        indices = torch.multinomial(probabilities, batch_size, replacement=False).cuda()
-        print(f"[Memory Sample] Selected indices: {indices}")
-        samples = [self.memory[idx] for idx in indices if self.memory[idx] is not None]
+        # Sample indices
+        indices = torch.multinomial(probs, batch_size, replacement=False)
+        
+        # Calculate importance sampling weights
+        weights = (len(valid_samples) * probs[indices]) ** (-self.beta)
+        weights = weights / weights.max()
 
-        weights = (len(self.memory) * probabilities[indices]) ** (-beta)
-        weights /= weights.max()
+        # Get samples
+        batch = [self.memory[idx] for idx in indices]
+        states, actions, rewards, dones, next_states = zip(*batch)
 
-        batch = list(zip(*samples))
-        states, actions, rewards, dones, next_states = batch
-
-        # 確保數據形狀正確
-        states = torch.stack([state.squeeze(0) if state.dim() > 4 else state for state in states]).to(device)
-        next_states = torch.stack([next_state.squeeze(0) if next_state.dim() > 4 else next_state for next_state in next_states]).to(device)
+        # Stack and transfer to device
+        states = torch.stack(states).to(device)
+        next_states = torch.stack(next_states).to(device)
         actions = torch.stack(actions).to(device)
         rewards = torch.stack(rewards).to(device)
         dones = torch.stack(dones).to(device)
-        
-        print(f"[Memory Sample] State shape after stack: {states.shape}, Next state shape after stack: {next_states.shape}")
 
-        # 打印形狀以進一步檢查
-        print(f"[Memory Sample] Shapes - states: {states.shape}, next_states: {next_states.shape}, actions: {actions.shape}, rewards: {rewards.shape}, dones: {dones.shape}")
+        return states, actions, rewards, dones, next_states, indices, weights.to(device)
 
-        return (
-            states,
-            actions,
-            rewards,
-            dones,
-            next_states,
-            indices,
-            weights.to(device)
-        )
 
-    def update_priorities(self, batch_indices, batch_priorities):
-        # 確保每個 priority 是單一標量
-        for idx, priority in zip(batch_indices, batch_priorities):
-            # 如果 priority 是 numpy 陣列，檢查其 size
-            if priority.size > 1:
-                priority = priority[0]
-            self.priorities[idx] = priority.item() + self.epsilon
+    def update_priorities(self, indices, priorities):
+        priorities = priorities.abs().clamp(min=self.epsilon, max=100.0)
+        self.priorities[indices] = priorities
+        self.max_priority = max(self.max_priority, priorities.max().item())
 
     def clear(self):
         self.position = 0
@@ -150,9 +144,9 @@ class GazeboEnv:
         self.state = np.zeros(self.observation_space)
         self.done = False
         self.target_x = -7.2213
-        self.target_y = -1.7003
+        self.target_y = -1.7003  
         self.waypoints = self.generate_waypoints()
-        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器人要走的大致距離
+        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
@@ -174,22 +168,58 @@ class GazeboEnv:
 
         self.optimize_waypoints_with_a_star()
         
+        self.sub_contacts = rospy.Subscriber('/gazebo/contacts', ContactsState, self.collision_callback)
+    
     def load_slam_map(self, yaml_path):
+        # 讀取 YAML 檔案
         with open(yaml_path, 'r') as file:
             map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']
-            self.map_resolution = map_metadata['resolution']
-            png_path = map_metadata['image'].replace(".pgm", ".png")
-            png_image = Image.open(png_path).convert('L')
-            self.slam_map = np.array(png_image)
+            self.map_origin = map_metadata['origin']  # 地圖原點
+            self.map_resolution = map_metadata['resolution']  # 地圖解析度
+            png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
+            
+            # 使用 PIL 讀取PNG檔
+            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1203.png').convert('L')
+            self.slam_map = np.array(png_image)  # 轉為NumPy陣列
 
         # 计算距离变换：障碍物为0，其它区域为1
         binary_map = (self.slam_map >= 250).astype(np.uint8)  # 可行区域设为1，障碍物设为0
         self.distance_transform = distance_transform_edt(binary_map) * self.map_resolution
+        self.generate_costmap()
+    
+    def generate_costmap(self):
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
+
+        wall_color = np.array([100, 100, 100])
+        wall_color2 = np.array([120, 120, 120])
+        
+        img = cv2.cvtColor(self.slam_map, cv2.COLOR_GRAY2BGR)
+        wall_mask = cv2.inRange(img, wall_color, wall_color2)
+        
+        self.cost_map = np.zeros_like(self.slam_map)
+        
+        inner_dilation = 7
+        outer_dilation = 15
+        
+        inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
+        inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
+        
+        outer_kernel = np.ones((outer_dilation * 2 + 1, outer_dilation * 2 + 1), np.uint8)
+        outer_dilated = cv2.dilate(wall_mask, outer_kernel, iterations=1)
+        
+        outer_only = cv2.subtract(outer_dilated, inner_dilated)
+        
+        self.cost_map[wall_mask > 0] = 254        # 障礙物設為最高代價
+        self.cost_map[inner_dilated > 0] = 190    # 內層膨脹區設為中高代價
+        self.cost_map[outer_only > 0] = 100        # 外層膨脹區設為中低代價
+        
+        rospy.loginfo("Costmap generated successfully.")
+        return True
 
     def generate_waypoints(self):
-        waypoints = [
-            (-6.4981, -1.0627),
+        waypoints = [(-6.4981, -1.0627),
             (-5.4541, -1.0117),
             (-4.4041, -0.862),
             (-3.3692, -1.0294),
@@ -268,8 +298,8 @@ class GazeboEnv:
             (60.5688, 14.0568),
             (60.6266, 15.1571),
             (60.007, 15.9558),
-            (59.0539, 16.5128),
-            (57.9671, 16.526),
+            (59.0539, 17.0128),
+            (57.9671, 17.326),
             (56.9161, 16.7399),
             (55.9553, 17.0346),
             (54.9404, 17.0596),
@@ -360,7 +390,7 @@ class GazeboEnv:
             (-9.1283, -1.4767),
             (-8.1332, -1.2563),
             (self.target_x, self.target_y)
-        ]
+]
         return waypoints
     
     def calculate_waypoint_distances(self):
@@ -376,176 +406,149 @@ class GazeboEnv:
         return distances
 
     def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
-        img_x = 2000.0 + gazebo_x * 20.0
-        img_y = 2000.0 - gazebo_y * 20.0
+        img_x = 2000 + gazebo_x * 20
+        img_y = 2000 - gazebo_y * 20
         return int(img_x), int(img_y)
 
     def image_to_gazebo_coords(self, img_x, img_y):
-        gazebo_x = (img_x - 2000.0) / 20.0
-        gazebo_y = (2000.0 - img_y) / 20.0
+        gazebo_x = (img_x - 2000) / 20.0
+        gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal_candidates, previous_point=None, 
-                   waypoint=None, obstacle_weight=10.0, smoothness_weight=5.0, waypoint_weight=1.0):
+    def calculate_heuristic(self, point, goal_point, png_image, cost_map, grid_size=50, weights=None):
         """
-        修改启发式函数，将路径点作为软约束。
+        計算啟發值，結合多種因素。
+        :param point: 當前節點 (x, y)
+        :param goal_point: 目標節點 (x, y)
+        :param png_image: 地圖影像
+        :param cost_map: 成本地圖
+        :param grid_size: 格子大小
+        :param weights: 權重字典，包括距離、障礙物和平滑度
+        :return: 啟發值
         """
-        current = np.array(current, dtype=np.float64)
+        img_x, img_y = point
+        goal_x, goal_y = goal_point
 
-        # 动态计算候选目标点中最佳的点
-        best_goal = None
-        lowest_cost = float('inf')
+        # 默認權重
+        if weights is None:
+            weights = {
+                "distance": 1.0,       # 距離的權重
+                "obstacle": 2.0,       # 障礙物的權重
+                "smoothness": 0.5,     # 平滑度的權重
+                "costmap": 3.0         # 成本地圖的權重
+            }
 
-        for goal in goal_candidates:
-            goal = np.array(goal, dtype=np.float64)
+        # 距離的啟發值
+        distance = np.sqrt((goal_x - img_x) ** 2 + (goal_y - img_y) ** 2)
 
-            # 与目标的距离代价
-            dist_to_goal = np.linalg.norm(goal - current)
-
-            # 平滑性代价
-            smoothness_penalty = 0.0
-            if previous_point is not None:
-                prev_point = np.array(previous_point, dtype=np.float64)
-                current_to_goal_vec = goal - current
-                prev_to_current_vec = current - prev_point
-
-                cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
-                    np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
-                )
-                angle = np.arccos(np.clip(cos_theta, -1.0, 1.0))
-                smoothness_penalty = smoothness_weight * (angle ** 2)
-
-            # 障碍物代价
-            obstacle_count = self.calculate_obstacle_count(goal)
-            obstacle_penalty = obstacle_weight * obstacle_count
-
-            # 距离路径点的偏离代价
-            waypoint_penalty = 0.0
-            if waypoint is not None:
-                waypoint = np.array(waypoint, dtype=np.float64)
-                dist_to_waypoint = np.linalg.norm(goal - waypoint)
-                waypoint_penalty = waypoint_weight * dist_to_waypoint
-
-            # 总成本
-            total_cost = dist_to_goal + smoothness_penalty + obstacle_penalty + waypoint_penalty
-            if total_cost < lowest_cost:
-                lowest_cost = total_cost
-                best_goal = goal
-
-        return lowest_cost, best_goal
-    
-    def find_best_point_in_grid(self, waypoint, previous_waypoint=None, grid_size=100, waypoint_weight=1.0):
-        img_x, img_y = self.gazebo_to_image_coords(*waypoint)
-        half_grid = grid_size // 2
-
-        # 限定搜索范围
-        min_x = max(0, img_x - half_grid)
-        max_x = min(self.slam_map.shape[1] - 1, img_x + half_grid)
-        min_y = max(0, img_y - half_grid)
-        max_y = min(self.slam_map.shape[0] - 1, img_y + half_grid)
-
-        grid = self.slam_map[min_y:max_y+1, min_x:max_x+1]
-        free_space = np.argwhere(grid >= 250)
-
-        if free_space.size == 0:
-            rospy.logwarn(f"No free space found around waypoint {waypoint}. Using original point.")
-            return waypoint
-
-        global_free_space = free_space + np.array([min_y, min_x])
-
-        # 获取候选点的全局坐标
-        goal_candidates = [self.image_to_gazebo_coords(x[1], x[0]) for x in global_free_space]
-
-        # 计算最佳的目标点
-        cost, best_point = self.heuristic_cost(
-            (img_x, img_y),
-            goal_candidates,
-            previous_point=self.gazebo_to_image_coords(*previous_waypoint) if previous_waypoint is not None else None,
-            waypoint=waypoint,
-            waypoint_weight=waypoint_weight
+        # 障礙物的權重
+        unwalkable_count = np.sum(
+            png_image[max(0, img_y - grid_size // 2):min(img_y + grid_size // 2, png_image.shape[0]),
+                    max(0, img_x - grid_size // 2):min(img_x + grid_size // 2, png_image.shape[1])] < 180
         )
 
-        if best_point is not None:
-            return best_point
-        else:
-            rospy.logwarn(f"No optimal point found around waypoint {waypoint}. Using original point.")
-            return waypoint
+        # 路徑平滑度（假設平滑的路徑更接近直線）
+        delta_x = abs(goal_x - img_x)
+        delta_y = abs(goal_y - img_y)
+        smoothness_penalty = abs(delta_x - delta_y)
 
-    def calculate_obstacle_count(self, point):
+        # 成本地圖的代價
+        costmap_penalty = cost_map[img_y, img_x] if 0 <= img_x < cost_map.shape[1] and 0 <= img_y < cost_map.shape[0] else float('inf')
+
+        # 結合多種權重
+        heuristic = (
+            weights["distance"] * distance +
+            weights["obstacle"] * unwalkable_count +
+            weights["smoothness"] * smoothness_penalty +
+            weights["costmap"] * costmap_penalty
+        )
+        return heuristic
+
+    def a_star_optimize_waypoint(self, png_image, cost_map, start_point, goal_point, grid_size=50):
         """
-        计算给定点周围障碍物的数量。
+        使用 A* 算法進行全局遍歷搜索，考慮多種權重：最短路徑、障礙物數量、路徑平滑度、成本地圖。
         """
-        x, y = map(float, point)  # 确保输入点是浮点数
-        search_range = 20  # 搜索范围（像素）
+        start_x, start_y = self.gazebo_to_image_coords(*start_point)
+        goal_x, goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        # 限制搜索范围在地图边界内
-        min_x = max(0, int(x - search_range))
-        max_x = min(self.slam_map.shape[1], int(x + search_range))
-        min_y = max(0, int(y - search_range))
-        max_y = min(self.slam_map.shape[0], int(y + search_range))
+        # A* 初始化
+        open_set = [(0, (start_x, start_y))]  # 優先隊列，儲存 (f_score, point)
+        came_from = {}  # 路徑追蹤
+        g_score = np.full(png_image.shape, float('inf'), dtype=np.float32)  # 將所有節點的 g_score 初始化為無窮大
+        g_score[start_y, start_x] = 0
 
-        # 找到障碍物点
-        obstacle_count = np.sum(self.slam_map[min_y:max_y, min_x:max_x] < 250)  # 障碍物像素值小于 250
+        while open_set:
+            # 選擇 f_score 最低的節點
+            _, current_point = min(open_set, key=lambda x: x[0])
+            open_set.remove((_, current_point))
+            current_x, current_y = current_point
 
-        return obstacle_count  # 返回障碍物点的数量
-    
-    def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
-        current = np.array(current, dtype=np.float64)
-        neighbor = np.array(neighbor, dtype=np.float64)
-        
-        # 使用 Bresenham 演算法生成 current 到 neighbor 的線段
-        rr, cc = line(int(round(current[1])), int(round(current[0])),
-                    int(round(neighbor[1])), int(round(neighbor[0])))
+            if current_point == (goal_x, goal_y):
+                # 路徑重建
+                path = []
+                while current_point in came_from:
+                    path.append(current_point)
+                    current_point = came_from[current_point]
+                path.reverse()
 
-        # 遍歷線段上的每個像素點，檢查是否有障礙物
-        for r, c in zip(rr, cc):
-            if not (0 <= r < png_image.shape[0] and 0 <= c < png_image.shape[1]):
-                return False  # 超出地圖範圍，視為障礙
-            if png_image[r, c] < safe_threshold:
-                return False  # 障礙物
-        return True  # 通過檢查，返回可通行
+                # 將路徑點轉換回 Gazebo 坐標
+                optimized_path = [self.image_to_gazebo_coords(x, y) for x, y in path]
+                return optimized_path[-1]
+
+            # 遍歷所有可能的鄰居點
+            for x in range(current_x - grid_size // 2, current_x + grid_size // 2):
+                for y in range(current_y - grid_size // 2, current_y + grid_size // 2):
+                    if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
+                        continue  # 確保節點在地圖範圍內
+
+                    tentative_g_score = g_score[current_y, current_x] + 1  # 假設移動到相鄰點的代價為1
+
+                    if tentative_g_score < g_score[y, x]:
+                        # 更新最優路徑
+                        came_from[(x, y)] = current_point
+                        g_score[y, x] = tentative_g_score
+                        f_score = tentative_g_score + self.calculate_heuristic((x, y), (goal_x, goal_y), png_image, cost_map, grid_size)
+                        if (x, y) not in [item[1] for item in open_set]:
+                            open_set.append((f_score, (x, y)))
+
+        # 如果未找到路徑，返回初始目標點
+        rospy.logwarn("A* failed to find a path.")
+        return goal_point
 
     def optimize_waypoints_with_a_star(self):
-        rospy.loginfo("Starting global path optimization with A* (soft constraints)...")
+        """
+        使用擴展的 A* 啟發函數優化路徑點。
+        """
+        if self.optimized_waypoints_calculated:
+            rospy.loginfo("Using previously calculated optimized waypoints.")
+            self.waypoints = self.optimized_waypoints
+            return
+
+        rospy.loginfo("Calculating optimized waypoints for the first time using extended A*.")
         optimized_waypoints = []
-        last_valid_point = None
+        total_waypoints = len(self.waypoints) - 1  # 總共需要優化的段數
 
-        for i in range(len(self.waypoints)):
-            waypoint = self.waypoints[i]
-            rospy.loginfo(f"Optimizing waypoint {i}: {waypoint}")
+        for i in range(total_waypoints):
+            start_point = (self.waypoints[i][0], self.waypoints[i][1])
+            goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
 
-            # 使用当前路径点作为参考点（软约束）
-            previous_waypoint = self.waypoints[i - 1] if i > 0 else None
+            # 輸出當前進度
+            rospy.loginfo(f"Optimizing segment {i + 1}/{total_waypoints}: Start {start_point} -> Goal {goal_point}")
 
-            # 在启发函数中考虑软约束路径点
-            best_point = self.find_best_point_in_grid(
-                waypoint,
-                previous_waypoint,
-                waypoint_weight=3.0  # 调整路径点权重
-            )
+            # 優化當前段
+            optimized_point = self.a_star_optimize_waypoint(self.slam_map, self.cost_map, start_point, goal_point)
+            optimized_waypoints.append(optimized_point)
 
-            # 确保当前点不会往回或重复
-            if last_valid_point is not None:
-                dist_to_last = np.linalg.norm(np.array(best_point) - np.array(last_valid_point))
-                if dist_to_last < 0.5:  # 假设 0.5 米为阈值
-                    rospy.logwarn(f"Skipping waypoint {i} as it is too close to the last valid point.")
-                    continue
-
-            optimized_waypoints.append(best_point)
-            last_valid_point = best_point
-
+        optimized_waypoints.append(self.waypoints[-1])
         self.optimized_waypoints = optimized_waypoints
-        self.waypoints = self.optimized_waypoints
+        self.waypoints = optimized_waypoints
         self.optimized_waypoints_calculated = True
-        self.current_waypoint_index = 0
-        self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
-        rospy.loginfo("Global path optimization complete.")
 
-        # 最终优化路径可视化
+        # 最終優化路徑可視化
         save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
         self.visualize_complete_path(self.optimized_waypoints, save_path=save_path)
         rospy.loginfo(f"Global path optimization complete. Visualization saved to {save_path}.")
-
+    
     def visualize_original_path(self, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/original_path.png'):
         """
         可视化原始的参考路径点，并保存为图片。
@@ -589,44 +592,63 @@ class GazeboEnv:
     
     def visualize_complete_path(self, waypoints, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
-        可视化路径点为单独的点，并保存为图片。
+        可视化路径点和当前位置，并在 costmap 上显示
         """
-        if not hasattr(self, 'slam_map'):
-            raise ValueError("SLAM map not loaded.")
+        if not hasattr(self, 'slam_map') or not hasattr(self, 'cost_map'):
+            raise ValueError("SLAM map or cost map not loaded.")
 
-        # 转换地图为灰度图
-        map_img = self.slam_map.copy()
-        map_img[map_img < 250] = 0  # 障碍物区域
-        map_img[map_img >= 250] = 255  # 可通行区域
+        # 創建一個 RGB 圖像來顯示 cost map
+        cost_map_rgb = np.zeros((self.cost_map.shape[0], self.cost_map.shape[1], 3), dtype=np.uint8)
+        
+        # 將不同代價值映射到不同顏色
+        cost_map_rgb[self.cost_map == 0] = [255, 255, 255]      # 空白區域為白色
+        cost_map_rgb[self.cost_map == 100] = [200, 200, 255]    # 外層膨脹區為淺藍色
+        cost_map_rgb[self.cost_map == 190] = [150, 150, 255]    # 內層膨脹區為中藍色
+        cost_map_rgb[self.cost_map == 254] = [100, 100, 100]    # 障礙物為灰色
 
-        # 转换路径点到图像坐标
+        # 獲取當前機器人位置
+        robot_x, robot_y, _ = self.get_robot_position()
+        robot_img_x, robot_img_y = self.gazebo_to_image_coords(robot_x, robot_y)
+
+        # 轉換路徑點到圖像坐標
         img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in waypoints]
 
-        # 绘制地图
-        plt.figure(figsize=(10, 10))
-        plt.imshow(map_img, cmap='gray', origin='upper')
+        # 創建圖像
+        plt.figure(figsize=(12, 12))
+        plt.imshow(cost_map_rgb)
 
-        # 绘制路径点为单独的点
-        for point in img_points:
-            if 0 <= point[0] < map_img.shape[1] and 0 <= point[1] < map_img.shape[0]:
-                plt.scatter(point[0], point[1], color='green', s=5)  # 单独的点，大小为5
+        # 繪製所有路徑點
+        for i, point in enumerate(img_points):
+            if 0 <= point[0] < cost_map_rgb.shape[1] and 0 <= point[1] < cost_map_rgb.shape[0]:
+                if i == self.current_waypoint_index:
+                    # 當前目標點用黃色標記
+                    plt.scatter(point[0], point[1], color='yellow', s=100, marker='*', label='Current Target')
+                else:
+                    # 其他路徑點用綠色標記
+                    plt.scatter(point[0], point[1], color='green', s=20)
 
-        # 标注起点和终点
+        # 標記起點和終點
         img_start = self.gazebo_to_image_coords(*waypoints[0])
         img_goal = self.gazebo_to_image_coords(*waypoints[-1])
-        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
-        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
+        plt.scatter(img_start[0], img_start[1], color='blue', s=100, marker='^', label='Start')
+        plt.scatter(img_goal[0], img_goal[1], color='red', s=100, marker='v', label='Goal')
 
-        # 设置绘图范围
-        plt.xlim(0, map_img.shape[1])
-        plt.ylim(map_img.shape[0], 0)  # 注意：图像坐标 y 轴是倒置的
+        # 標記當前機器人位置
+        plt.scatter(robot_img_x, robot_img_y, color='purple', s=150, marker='o', label='Robot')
 
-        # 添加图例并保存图片
-        plt.legend()
-        plt.title('Path Points Visualization')
-        plt.savefig(save_path)
+        # 添加圖例和標題
+        plt.legend(fontsize=12)
+        plt.title('Path Visualization with Cost Map', fontsize=14)
+        
+        # 設置軸的範圍
+        plt.xlim(0, cost_map_rgb.shape[1])
+        plt.ylim(cost_map_rgb.shape[0], 0)  # 注意：圖像坐標 y 軸是倒置的
+
+        # 保存圖片
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
-        rospy.loginfo(f"Path visualization saved to {save_path}")
+        
+        rospy.loginfo(f"Path visualization with cost map saved to {save_path}")
 
     def generate_imu_data(self):
         imu_data = Imu()
@@ -650,42 +672,11 @@ class GazeboEnv:
 
         return imu_data
 
-    def is_valid_data(self, data):
-        for point in pc2.read_points(data, field_names=("x", "y", "z"), skip_nans=True):
-            if point[0] != 0.0 or point[1] != 0.0 or point[2] != 0.0:
-                return True
-        return False
-
-    def transform_point(self, point, from_frame, to_frame):
-        try:
-            now = rospy.Time.now()
-            self.listener.waitForTransform(to_frame, from_frame, now, rospy.Duration(1.0))
-            
-            point_stamped = PointStamped()
-            point_stamped.header.frame_id = from_frame
-            point_stamped.header.stamp = now
-            point_stamped.point.x = point[0]
-            point_stamped.point.y = point[1]
-            point_stamped.point.z = point[2]
-            
-            point_transformed = self.listener.transformPoint(to_frame, point_stamped)
-            return [point_transformed.point.x, point_transformed.point.y, point_transformed.point.z]
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            rospy.logerr(f"Transform failed: {e}")
-            return [point[0], point[1], point[2]]
-
-    def convert_open3d_to_ros(self, cloud):
-        header = rospy.Header()
-        header.stamp = rospy.Time.now()
-        header.frame_id = 'velodyne'
-        points = np.asarray(cloud.points)
-        return pc2.create_cloud_xyz32(header, points)
-
-    def generate_occupancy_grid(self, robot_x, robot_y, linear_speed, steer_angle, grid_size=0.05, map_size=50):
+    def generate_occupancy_grid(self, robot_x, robot_y, linear_speed, steer_angle, grid_size=0.05, map_size=100):
         # 将机器人的坐标转换为地图上的像素坐标
 
         linear_speed = np.clip(linear_speed, -2.0, 2.0)
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
+        steer_angle = np.clip(steer_angle, -0.5, 0.5)
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
 
@@ -713,21 +704,20 @@ class GazeboEnv:
         occupancy_grid[1, :, :] = (linear_speed + 2.0)/4
 
         # 第三层：归一化角度到 [0, 1]
-        occupancy_grid[2, :, :] = (steer_angle + 0.6)/1.2 
+        occupancy_grid[2, :, :] = (steer_angle + 0.5)/1.0
 
         if np.isnan(occupancy_grid).any() or np.isinf(occupancy_grid).any():
             raise ValueError("NaN or Inf detected in occupancy_grid!")
         return occupancy_grid
 
-
-    def step(self, action):
+    def step(self, action, obstacles):
         reward = 0
         robot_x, robot_y, robot_yaw = self.get_robot_position()
 
         # 确保 action 是一维数组
         action = np.squeeze(action)
         linear_speed = np.clip(action[0], -2.0, 2.0)
-        steer_angle = np.clip(action[1], -0.6, 0.6)
+        steer_angle = np.clip(action[1], -0.5, 0.5)
         print("linear speed = ", linear_speed, " steer angle = ", steer_angle)
 
         # 更新状态
@@ -743,7 +733,7 @@ class GazeboEnv:
 
         if distance_to_goal < 0.5:  # 设定阈值为0.5米，可根据需要调整
             print('Robot has reached the goal!')
-            reward += 10 # 给一个大的正向奖励
+            reward += 20.0 # 给一个大的正向奖励
             self.reset()
             return self.state, reward, True, {}  # 重置环境
 
@@ -751,7 +741,7 @@ class GazeboEnv:
             current_wp = self.waypoints[self.current_waypoint_index]
             distance_to_wp = np.linalg.norm([robot_x - current_wp[0], robot_y - current_wp[1]])
             if distance_to_wp < 0.5:  # 假設通過 waypoint 的距離閾值為 0.5
-                reward += 2  # 通過 waypoint 獎勵
+                reward += 1.0  # 通過 waypoint 獎勵
 
         # 更新机器人位置
         if self.previous_robot_position is not None:
@@ -760,7 +750,7 @@ class GazeboEnv:
                 robot_y - self.previous_robot_position[1]
             ])
             reward += distance_moved*5  # 根据移动距离奖励
-            print("reward by distance_moved +", distance_moved)
+            # print("reward by distance_moved +", distance_moved)
         else:
             distance_moved = 0
 
@@ -768,15 +758,26 @@ class GazeboEnv:
 
         # 检查是否需要使用 RL 控制
         failure_range = range(
-            max(0, self.current_waypoint_index - 5),
-            min(len(self.waypoints), self.current_waypoint_index + 3)
+            max(0, self.current_waypoint_index - 6),
+            min(len(self.waypoints), self.current_waypoint_index + 2)
         )
         use_deep_rl_control = any(
             self.waypoint_failures.get(i, 0) > 1 for i in failure_range
         )
+
+        collision = detect_collision(robot_x, robot_y, robot_yaw, obstacles)
+        if not use_deep_rl_control:
+            if collision:
+                self.waypoint_failures[self.current_waypoint_index] += 1
+                print('touch the obstacles')
+                reward -= 10.0
+                self.reset()
+                return self.state, reward, True, {}
+        
         # 处理无进展的情况
         if distance_moved < 0.05:
             self.no_progress_steps += 1
+            reward -= 0.3
             if self.no_progress_steps >= self.max_no_progress_steps:
                 if use_deep_rl_control:
                     print('failure at point', self.current_waypoint_index)
@@ -793,7 +794,12 @@ class GazeboEnv:
                     return self.state, reward, True, {}
         else:
             self.no_progress_steps = 0
-
+        
+        if self.collision_detected:
+            rospy.loginfo('collision detectd! resetting')
+            reward -= 10.0
+            self.reset()
+            return self.state, reward, True, {}
         # 发布控制命令
         twist = Twist()
         twist.linear.x = linear_speed
@@ -815,6 +821,7 @@ class GazeboEnv:
         return self.state, reward, self.done, {}
 
     def reset(self):
+
         robot_x, robot_y,_ = self.get_robot_position()
         self.state = self.generate_occupancy_grid(robot_x, robot_y, linear_speed=0, steer_angle=0)
 
@@ -852,11 +859,6 @@ class GazeboEnv:
         else:
             rospy.loginfo("No optimized waypoints found, generating new waypoints.")
             self.waypoints = self.generate_waypoints()
-        
-        # 確保使用優化過的路徑點
-        if not self.optimized_waypoints_calculated:
-            rospy.logwarn("Waypoints optimization not yet completed. Generating optimized waypoints.")
-            self.optimize_waypoints_with_a_star()
 
         self.current_waypoint_index = 0
         self.done = False
@@ -879,6 +881,7 @@ class GazeboEnv:
             self.state = self.state.unsqueeze(0)
         return self.state
 
+
     def calculate_reward(self, robot_x, robot_y, reward, state):
         done = False
         # 將機器人的座標轉換為地圖上的坐標
@@ -894,8 +897,7 @@ class GazeboEnv:
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
         obstacle_count = np.sum(occupancy_grid <= 190/255.0)  # 假設state[0]為佔據網格通道
-        print('obstacle_count',obstacle_count)
-        reward += 3 - obstacle_count*3/100.0
+        reward += 5 - obstacle_count*3/100.0
 
         return reward, done
 
@@ -924,10 +926,10 @@ class GazeboEnv:
 
         # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 2.0 + 0.5 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 1.2 + 0.5 * linear_speed  # 根據速度調整前視距離
 
         # 定義角度範圍，以當前車輛的yaw為中心
-        angle_range = np.deg2rad(40)  # ±40度的範圍
+        angle_range = np.deg2rad(30)  # ±40度的範圍
         closest_index = None
         min_distance = float('inf')
 
@@ -971,28 +973,29 @@ class GazeboEnv:
 
         # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
-            linear_speed = 1.0
+            linear_speed = 0.5
         elif np.abs(yaw_error) > 0.1:
-            linear_speed = 2.0
+            linear_speed = 1.0
         else:
-            linear_speed = 3.0
+            linear_speed = 3
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
         previous_yaw_error = getattr(self, 'previous_yaw_error', 0)
         current_yaw_error_rate = yaw_error - previous_yaw_error
         steer_angle = kp * yaw_error + kd * current_yaw_error_rate
-        steer_angle = np.clip(steer_angle, -0.6, 0.6)
+        steer_angle = np.clip(steer_angle, -0.5, 0.5)
 
         self.previous_yaw_error = yaw_error
 
         return np.array([linear_speed, steer_angle])
 
+
     def find_closest_waypoint(self, x, y):
+        # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
-        closest_index = self.current_waypoint_index  # 从当前索引开始搜索
-        for i in range(self.current_waypoint_index, len(self.waypoints)):  # 从当前索引向后搜索
-            wp_x, wp_y = self.waypoints[i]
+        closest_index = 0
+        for i, (wp_x, wp_y) in enumerate(self.waypoints):
             dist = np.linalg.norm([wp_x - x, wp_y - y])
             if dist < min_distance:
                 min_distance = dist
@@ -1014,22 +1017,22 @@ class GazeboEnv:
 class ActorCritic(nn.Module):
     def __init__(self, observation_space, action_space):
         super(ActorCritic, self).__init__()
-        # 初始化网络层
         self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2)
         self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
         self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
         self.bn3 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=2)
+        self.bn4 = nn.BatchNorm2d(256)
 
         self.fc1 = nn.Linear(self._get_conv_output_size(observation_space), 256)
-        self.fc2 = nn.Linear(256, 128)
+        self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True)
 
-        self.actor = nn.Linear(128, action_space)
+        self.actor_mean = nn.Linear(128, action_space)
+        self.actor_std = nn.Linear(128, action_space)  # 动态方差
         self.critic = nn.Linear(128, 1)
-        self.actor_log_std = nn.Parameter(torch.ones(1,action_space)* -1.0)
 
-        # 初始化权重
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -1052,112 +1055,86 @@ class ActorCritic(nn.Module):
         x = torch.relu(self.bn1(self.conv1(x)))
         x = torch.relu(self.bn2(self.conv2(x)))
         x = torch.relu(self.bn3(self.conv3(x)))
+        x = torch.relu(self.bn4(self.conv4(x)))
         x = x.view(1, -1)
         return x.size(1)
 
     def forward(self, x):
-        print("Input shape to forward:", x.shape)
-
-    # 检查输入是否包含异常值
-        if torch.isnan(x).any():
-            print("Error: NaN detected in input")
-            raise ValueError("NaN detected in input")
-
-        # 正常 forward 逻辑
         x = torch.relu(self.bn1(self.conv1(x)))
         x = torch.relu(self.bn2(self.conv2(x)))
         x = torch.relu(self.bn3(self.conv3(x)))
+        x = torch.relu(self.bn4(self.conv4(x)))
         x = x.view(x.size(0), -1)
         x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
 
-        action_mean = self.actor(x)
-        action_log_std = self.actor_log_std.expand_as(action_mean)
-        action_log_std = torch.clamp(action_log_std, min=-3, max=1)
-        action_std = torch.exp(action_log_std)
+        x, _ = self.lstm(x.unsqueeze(0))  # 时间序列处理
+        x = x.squeeze(0)
+
+        action_mean = self.actor_mean(x)
+        action_std = torch.clamp(torch.exp(self.actor_std(x)), min=1e-3, max=2.0)  # 限制标准差范围
         value = self.critic(x)
-
-        if torch.isnan(action_mean).any() or torch.isnan(action_std).any():
-            raise ValueError("NaN detected in action_mean or action_std")
-        if torch.isnan(value).any():
-            raise ValueError("NaN detected in value")
 
         return action_mean, action_std, value
 
+
     def act(self, state):
-        # 確保 state 是 tensor，如果是 numpy，轉換為 tensor
         if isinstance(state, np.ndarray):
             state = torch.tensor(state, dtype=torch.float32).to(device)
-
-        # 去除多餘維度直到 <= 4
+        
+        # Ensure proper dimensions
         while state.dim() > 4:
             state = state.squeeze(0)
-
-        # 添加缺少的維度直到 = 4
         while state.dim() < 4:
             state = state.unsqueeze(0)
-
-        # 最終確認 state 是 4D
-        if state.dim() != 4:
-            raise ValueError(f"Expected state to be 4D, but got {state.dim()}D")
-
+        
         action_mean, action_std, _ = self(state)
+        
+        # Define action bounds
+        action_space = torch.tensor([
+            [0.5, -0.5],  # min values
+            [2.0, 0.5]    # max values
+        ], device=device)
+        
+        # Scale actions to proper range
+        scaled_mean = action_space[0] + (torch.tanh(action_mean) + 1.0) * (action_space[1] - action_space[0]) / 2.0
+        
+        if self.training:
+            # Add bounded noise during training
+            noise = torch.clamp(torch.randn_like(action_std) * action_std, -0.5, 0.5)
+            action = torch.clamp(scaled_mean + noise, action_space[0], action_space[1])
 
-        noise = torch.randn_like(action_std)*0.01
-        noisy_action = action_mean + action_std*noise
-
-        noisy_action = torch.tanh(noisy_action)
-        max_action = torch.tensor([2.0, 0.6], device=noisy_action.device)
-        min_action = torch.tensor([-2.0, -0.6], device=noisy_action.device)
-        action = min_action + (noisy_action + 1) * (max_action - min_action) / 2
-
-        if torch.isnan(action).any():
-            raise ValueError("Nan detected in action output")
+        else:
+            action = scaled_mean
+                
         return action.detach()
 
     def evaluate(self, state, action):
         action_mean, action_std, value = self(state)
-
-        # 添加檢查輸出的代碼
-        if torch.isnan(action_mean).any() or torch.isnan(action_std).any():
-            print("Error: NaN in action_mean or action_std")
-            print("action_mean:", action_mean)
-            print("action_std:", action_std)
-            raise ValueError("NaN detected in model output")
-
-        if torch.any(action_std <= 0):
-            print("Error: Invalid action_std <= 0")
-            print("action_std:", action_std)
-            raise ValueError("Invalid action_std detected")
-
+        
+        # Ensure proper bounds for action_std
+        action_std = torch.clamp(action_std, min=1e-6, max=1.0)
+        
+        # Create normal distribution
         dist = torch.distributions.Normal(action_mean, action_std)
+        
+        # Calculate log probabilities
         action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
         dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
+        
         return action_log_probs, value, dist_entropy
 
 class DWA:
     def __init__(self, goal):
         self.max_speed = 2
-        self.max_yaw_rate = 0.6
-        self.max_accel = 1
-        self.max_dyaw_rate = 0.3
-        self.dt = 0.1
+        self.max_yaw_rate = 0.5
+        self.dt = 0.2
         self.predict_time = 3.0
         self.goal = goal
-        self.robot_radius = 1.0
+        self.robot_radius = 0.3
 
     def calc_dynamic_window(self, state):
         # 當前速度限制
         vs = [0, self.max_speed, -self.max_yaw_rate, self.max_yaw_rate]
-
-        # 動力學限制
-        vd = [
-            state[3] - self.max_accel * self.dt,
-            state[3] + self.max_accel * self.dt,
-            state[4] - self.max_dyaw_rate * self.dt,
-            state[4] + self.max_dyaw_rate * self.dt
-        ]
-
         dw = vs
         return dw
 
@@ -1169,7 +1146,6 @@ class DWA:
         next_theta = theta + omega * self.dt
         next_v = control[0]
         next_omega = control[1]
-        # print(f"State: {state}, Control: {control}, Next state: {[next_x, next_y, next_theta, next_v, next_omega]}")
         return [next_x, next_y, next_theta, next_v, next_omega]
 
     def calc_trajectory(self, state, control):
@@ -1178,7 +1154,6 @@ class DWA:
         for _ in range(int(self.predict_time / self.dt)):
             state = self.motion(state, control)
             trajectory.append(state)
-        # print("Trajectory points:", trajectory)
         return np.array(trajectory)
 
     def calc_score(self, trajectory, obstacles):
@@ -1193,7 +1168,7 @@ class DWA:
             for ox, oy in obstacles:
                 dist = np.sqrt((ox - tx) ** 2 + (oy - ty) ** 2)
                 if dist < self.robot_radius:
-                    return goal_score, -float('inf'), 0.0  # 如果发生碰撞，直接返回最低分
+                    return goal_score, -100.0, 0.0  # 如果发生碰撞，直接返回最低分
                 clearance_score = min(clearance_score, dist)
 
         # 速度分数
@@ -1203,13 +1178,14 @@ class DWA:
     def plan(self, state, obstacles):
         print("dwa goal: ", self.goal)
         # 獲取動態窗口
+        obstacles = [(ox, oy) for ox, oy in obstacles]
         dw = self.calc_dynamic_window(state)  # 速度 角度限制
         # 遍歷動態窗口中的所有控制
         best_trajectory = None
-        best_score = -float('inf')
+        best_score = -100.0
         best_control = [0.0, 0.0]
         # print("Dynamic Window", dw)
-        for v in np.arange(dw[0], dw[1], 0.1):  # 線速度範圍
+        for v in np.arange(dw[0], dw[1], 0.2):  # 線速度範圍
             for omega in np.arange(dw[2], dw[3], 0.1):  # 角速度範圍
 
                 # 模擬軌跡
@@ -1217,123 +1193,153 @@ class DWA:
                 trajectory = self.calc_trajectory(state, control)
                 # 計算評分函數
                 goal_score, clearance_score, speed_score = self.calc_score(trajectory, obstacles)
-                total_score = goal_score * 0.55 + clearance_score * 0.35  + speed_score * 0.1
+                total_score = goal_score * 0.5 + clearance_score * 0.45  + speed_score * 0.05
 
                 # 找到最佳控制
                 if total_score > best_score:
                     best_score = total_score
                     best_trajectory = trajectory
                     best_control = control
-
-        # print("goal score = ", goal_score, "safety score = ", clearance_score, "speed score = ", speed_score)
-        print(f"v: {v}, omega: {omega}, Total score: {total_score}")
+        print(f"v: {v}, omega: {omega}, goal_score: {goal_score}, clearance_score: {clearance_score}, speed_score: {speed_score}")
         return best_control, best_trajectory
 
-def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler, batch_size):
-    print(f"[DEBUG] Starting PPO update with batch size: {batch_size}")
-
-    # 檢查記憶庫是否有足夠樣本
+def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler, batch_size, scheduler):
     valid_samples = len([x for x in memory.memory if x is not None])
     if valid_samples < batch_size:
-        print(f"[PPO Update] Skipping update. Not enough valid samples in memory. Current memory size: {valid_samples}")
         return
 
-    print(f"[PPO Update] Starting PPO update with {ppo_epochs} epochs and batch size {batch_size}.")
-    batch_size = min(batch_size, valid_samples)
+    accumulation_steps = 4
+    warmup_epochs = 10
+    optimizer.zero_grad()
 
     for epoch in range(ppo_epochs):
-        # 動態調整學習率
-        adjusted_lr = LEARNING_RATE * (1 / (1 + epoch * 0.001))
+        # Warmup learning rate
+        progress = min(1.0, epoch / warmup_epochs)
+        adjusted_lr = LEARNING_RATE * progress * (1 / (1 + epoch * 0.001))
         for param_group in optimizer.param_groups:
             param_group['lr'] = adjusted_lr
 
-        # 抽取樣本
-        try:
-            state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(batch_size)
-        except ValueError as e:
-            print(f"[PPO Update] Sampling failed: {str(e)}")
-            return
-
-        print(f"[DEBUG] Sampled state_batch shape: {state_batch.shape}, next_state_batch shape: {next_state_batch.shape}")
-        
-        # 調整維度
+        # Sample batch
+        state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(batch_size)
         state_batch, next_state_batch = _adjust_dimensions(state_batch, next_state_batch)
+        
+        # Normalize rewards
+        reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-8)
+        reward_batch = torch.clamp(reward_batch, -10.0, 10.0)
 
-        print(f"[DEBUG] State batch after adjustment: {state_batch.shape}, Next state batch after adjustment: {next_state_batch.shape}")
-
-        # 標準化和裁剪 reward
-        reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-5)
-        reward_batch = torch.clamp(reward_batch, -1.0, 1.0)
-
-        # 檢查是否有 NaN
-        if torch.isnan(state_batch).any() or torch.isnan(action_batch).any():
-            raise ValueError("[PPO Update] NaN detected in sampled state or action batch.")
-
-        # 計算舊 log_probs 和狀態價值
+        # Calculate advantages
         with torch.no_grad():
             old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
-            _, _, next_state_values = model(next_state_batch)
-            _, _, state_values = model(state_batch)
+            _, _, next_values = model(next_state_batch)
+            _, _, values = model(state_batch)
 
-        if torch.isnan(old_log_probs).any() or torch.isnan(next_state_values).any() or torch.isnan(state_values).any():
-            raise ValueError("[PPO Update] NaN detected in model evaluation outputs.")
+        # Compute target values and advantages
+        target_values = reward_batch + (1 - done_batch) * GAMMA * next_values
+        advantages = (target_values - values).detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = torch.clamp(advantages, -10.0, 10.0)
 
-        # 計算 target values 和優勢 (advantages)
-        target_values = reward_batch + (1 - done_batch) * GAMMA * next_state_values
-        advantages = target_values - state_values
-
-        # 標準化 advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-        advantages = torch.clamp(advantages, -10, 10)
-
-        if torch.isnan(advantages).any():
-            raise ValueError("[PPO Update] NaN detected in advantages.")
-
-        # 更新策略與價值網絡
+        # PPO update steps
         for _ in range(PPO_EPOCHS):
-            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type="cuda"):  # 混合精度
-                log_probs, state_values, dist_entropy = model.evaluate(state_batch, action_batch)
+            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type="cuda"):
+                log_probs, values, dist_entropy = model.evaluate(state_batch, action_batch)
+                action_mean, action_std, _ = model(state_batch)
+                
                 ratio = (log_probs - old_log_probs).exp()
+                ratio = torch.clamp(ratio, 0.0, 10.0)
+                
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
 
-                # 計算損失
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = nn.MSELoss()(state_values, target_values)
-                entropy_loss = -0.1 * dist_entropy.mean()  # 熵正則項
+                # Calculate losses
+                actor_loss = -(weights * torch.min(surr1, surr2)).mean()
+                critic_loss = 0.5 * (weights * (values - target_values).pow(2)).mean()
+                entropy_loss = -0.01 * (weights * dist_entropy).mean()
+                
+                loss = (actor_loss + critic_loss + entropy_loss) / accumulation_steps
 
-                loss = actor_loss + 0.5 * critic_loss + entropy_loss
-                print(f"[PPO Update] Losses - Actor: {actor_loss.item()}, Critic: {critic_loss.item()}, Entropy: {entropy_loss.item()}")
+                # Backward pass with gradient accumulation
+                scaler.scale(loss).backward()
+                
+                if (_ + 1) % accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
-            if torch.isnan(loss).any():
-                raise ValueError("[PPO Update] NaN detected in loss.")
-
-            # 反向傳播與更新
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-        # 更新優先級
-        priorities = (advantages.abs() + 1e-5).detach().cpu().numpy()
+        # Update priorities in memory
+        priorities = advantages.abs().detach().cpu().numpy()
         memory.update_priorities(indices, priorities)
-        memory.clear()
-        print(f"[PPO Update] Epoch {epoch} completed successfully.")
+
+    # Clear memory after all updates
+    memory.clear()
+
+def calculate_bounding_box(robot_x, robot_y, robot_yaw):
+
+    # 机器人中心到边界的相对距离
+    half_length = 0.25
+    half_width = 0.25
+
+    # 矩形的局部坐标系下的 4 个角点
+    corners = np.array([
+        [half_length, half_width],
+        [half_length, -half_width],
+        [-half_length, -half_width],
+        [-half_length, half_width]
+    ])
+
+    # 旋转矩阵
+    rotation_matrix = np.array([
+        [np.cos(robot_yaw), -np.sin(robot_yaw)],
+        [np.sin(robot_yaw), np.cos(robot_yaw)]
+    ])
+
+    # 全局坐标系下的角点
+    global_corners = np.dot(corners, rotation_matrix.T) + np.array([robot_x, robot_y])
+    return global_corners
+
+def is_point_in_polygon(point, polygon):
+    x, y = point
+    n = len(polygon)
+    inside = False
+
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+
+        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
+            inside = not inside
+    return inside
+
+def detect_collision(robot_x, robot_y, robot_yaw, obstacles):
+    # 计算边界框
+    bounding_box = calculate_bounding_box(robot_x, robot_y, robot_yaw,)
+
+    # 遍历障碍物
+    for obstacle in obstacles:
+        # 检查是否在边界内
+        if is_point_in_polygon(obstacle, bounding_box):
+            return True
+    return False
+
 
 def _adjust_dimensions(state_batch, next_state_batch):
-    print(f"[DEBUG] Before adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
+    # Remove extra dimension from state_batch if present
+    if state_batch.dim() == 5:
+        state_batch = state_batch.squeeze(1)
     
-    # 如果多了一個額外的維度，移除它
-    if state_batch.dim() == 5 and state_batch.shape[1] == 1:
-        state_batch = state_batch.squeeze(1)  # 移除第二個維度
-    if next_state_batch.dim() == 5 and next_state_batch.shape[1] == 1:
+    # Remove extra dimension from next_state_batch if present
+    if next_state_batch.dim() == 5:
         next_state_batch = next_state_batch.squeeze(1)
-
-    # 再次檢查形狀
-    if state_batch.dim() != 4 or next_state_batch.dim() != 4:
-        raise ValueError(f"[PPO Update] Invalid batch shapes: state_batch: {state_batch.shape}, next_state_batch: {next_state_batch.shape}")
-
-    print(f"[DEBUG] After adjustment - State shape: {state_batch.shape}, Next state shape: {next_state_batch.shape}")
+        
+    # Verify final shapes
+    if state_batch.dim() != 4:
+        raise ValueError(f"State batch should be 4D, got shape: {state_batch.shape}")
+    if next_state_batch.dim() != 4:
+        raise ValueError(f"Next state batch should be 4D, got shape: {next_state_batch.shape}")
+        
     return state_batch, next_state_batch
 
 def _check_for_nan(tensors, error_message):
@@ -1345,41 +1351,41 @@ def _check_for_invalid_values(tensor, name):
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         raise ValueError(f"[PPO Update] {name} contains invalid values (NaN or Inf).")
 
-def select_action_with_exploration(env, state, model, epsilon=1.0, dwa=None, obstacles=None):
+def select_action_with_exploration(env, state, model, epsilon, dwa=None, obstacles=None):
     if random.random() < epsilon:
         if dwa is None or obstacles is None:
             raise ValueError("DWA controller or obstacles is not provided")
-        print("[Exploration] Using DWA for action generation. ")
+        print("[Exploration] Using DWA for action generation.")
 
         robot_x, robot_y, robot_yaw = env.get_robot_position()
         current_speed = env.last_twist.linear.x
         current_omega = env.last_twist.angular.z
 
+        print('robot x = ', robot_x, 'robot_y = ', robot_y)
         state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
         action, _ = dwa.plan(state, obstacles)  
-        action = torch.tensor(action, dtype=torch.float32).to(device)  # 確保格式正確
+        action = torch.tensor(action, dtype=torch.float32).to(device)
     else:
-        # 使用模型的動作
         print('action by RL')
         action = model.act(state)
     return action
 
-def grid_filter(obstacles, grid_size=0.5):
-    obstacles = np.array(obstacles)
-    # 按照 grid_size 取整
-    grid_indices = (obstacles // grid_size).astype(int)
-    # 找到唯一的网格
-    unique_indices = np.unique(grid_indices, axis=0)
-    # 返回网格中心点
-    filtered_points = unique_indices * grid_size + grid_size / 2
-    return filtered_points
+def save_movement_log_to_csv(movement_log, filename= f"/home/chihsun/catkin_ws/src/my_robot_control/new_waypoint/move_log{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"):
+    with open(filename,mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['x', 'y', 'yaw'])
+        for log in movement_log:
+            writer.writerow(log)
+    print(f"Movement log saved to {filename}")
 
 def main():
     env = GazeboEnv(None)
-    dwa = DWA(goal=env.waypoints[env.current_waypoint_index + 5])
+    dwa = DWA(goal=env.waypoints[env.current_waypoint_index + 3])
     model = ActorCritic(env.observation_space, env.action_space).to(device)
     env.model = model
+
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    scheduler = StepLR(optimizer, step_size=100, gamma=0.95)  # 每1000次調整學習率
     scaler = GradScaler('cuda')
     memory = PrioritizedMemory(MEMORY_SIZE)
 
@@ -1391,13 +1397,15 @@ def main():
         print("Loaded existing model.")
     else:
         print("Created new model.")
+    
+    env.visualize_original_path()
 
     num_episodes = 1000000
     best_test_reward = -np.inf
+    
+    last_recorded_position = None
 
-    env.visualize_original_path()
-
-    # init the obstacle information
+    # Initialize obstacles
     static_obstacles = []
     for y in range(env.slam_map.shape[0]):
         for x in range(env.slam_map.shape[1]):
@@ -1406,55 +1414,57 @@ def main():
                 static_obstacles.append((ox, oy))
  
     for e in range(num_episodes):
+        movement_log = []
         if not env.optimized_waypoints_calculated:
             env.optimize_waypoints_with_a_star()
 
-        state = env.reset()   # 更新車子到初始點
+        state = env.reset()
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         state = state.clone().detach().unsqueeze(0).to(device)
 
         total_reward = 0
         start_time = time.time()
+        use_rl = False  # Flag to determine if RL is used in this episode
 
-        for time_step in range(1500):  # there will be no greater than 1500 actions per episode
-            
-            # twist = Twist()
-            # twist.linear.x = env.last_twist.linear.x
-            # twist.angular.z = env.last_twist.angular.z
-            # env.pub_cmd_vel.publish(twist)
-
-            step_start_time = time.time()
-
+        for time_step in range(1500):
             robot_x, robot_y, robot_yaw = env.get_robot_position()
+
+            if last_recorded_position is None or np.linalg.norm(
+                [robot_x - last_recorded_position[0], robot_y - last_recorded_position[1]]
+            ) >= 1.0386:
+                movement_log.append((robot_x, robot_y, robot_yaw))
+                last_recorded_position = (robot_x, robot_y)
 
             obstacles = [
                 (ox, oy) for ox, oy in static_obstacles
-                if np.sqrt((ox-robot_x)**2 + (oy - robot_y)**2) < 8.0  # 限制只取機器當前位置8米範圍的障礙物 
+                if np.sqrt((ox-robot_x)**2 + (oy - robot_y)**2) < 4.0
             ]
             obstacles = grid_filter(obstacles, grid_size=0.7)
 
-            lookahead_index = min(env.current_waypoint_index + 5, len(env.waypoint_distances)-1)
+            lookahead_index = min(env.current_waypoint_index + 3, len(env.waypoint_distances)-1)
             dwa.goal = env.waypoints[lookahead_index]
 
-            # 根据是否使用 RL 控制，决定动作
             failure_range = range(
-                max(0, env.current_waypoint_index - 5),
-                min(len(env.waypoints), env.current_waypoint_index + 3)
+                max(0, env.current_waypoint_index - 6),
+                min(len(env.waypoints), env.current_waypoint_index + 2)
             )
+            failure_counts = {i: env.waypoint_failures.get(i, 0) for i in failure_range}
+
             use_deep_rl_control = any(
                 env.waypoint_failures.get(i, 0) > 1 for i in failure_range
             )
 
             if use_deep_rl_control:
-                action = select_action_with_exploration(env, state, model, dwa=dwa, obstacles=obstacles)
+                use_rl = True  # Mark this episode as using RL
+                action = select_action_with_exploration(env, state, model, epsilon=0.6 , dwa=dwa, obstacles=obstacles)
                 action_np = action.detach().cpu().numpy().flatten()
                 print(f"RL Action at waypoint {env.current_waypoint_index}: {action_np}")
             else:
                 action_np = env.calculate_action_pure_pursuit()
                 print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
 
-            next_state, reward, done, _ = env.step(action_np)
+            next_state, reward, done, _ = env.step(action_np, obstacles=obstacles)
 
             if not isinstance(next_state, torch.Tensor):
                 next_state = torch.tensor(next_state, dtype=torch.float32)
@@ -1462,12 +1472,11 @@ def main():
 
             if use_deep_rl_control:
                 memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-                print(f"[Main] Memory size after adding sample: {sum(1 for x in memory.memory if x is not None)}")
+                total_reward += reward
 
             state = next_state
-            total_reward += reward
 
-            state = (state - state.min()) / (state.max() - state.min() + 1e-5)  # 正規化到 [0, 1]
+            state = (state - state.min()) / (state.max() - state.min() + 1e-5)
 
             elapsed_time = time.time() - start_time
             if done or elapsed_time > 240:
@@ -1475,30 +1484,28 @@ def main():
                     reward -= 10.0
                     print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
                 break
-            
-            step_elapsed_time = time.time() - step_start_time  # 计算单步运行时间
-            print(f"Time step {time_step} execution time: {step_elapsed_time:.3f} seconds")
 
-        # 仅在使用 RL 控制时更新策略
-        if use_deep_rl_control and len(memory.memory) > BATCH_SIZE:
-            curren_batch_size = min(BATCH_SIZE, len(memory.memory))
-            ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler,batch_size = curren_batch_size)
+        if use_rl and len(memory.memory) > BATCH_SIZE:
+            print(123456)
+            current_batch_size = min(BATCH_SIZE, len(memory.memory))
+            ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler, batch_size=current_batch_size,scheduler=scheduler)
 
-        print(f"Episode {e}, Total Reward: {total_reward}")
+        print(f"Episode {e}, Total Reward: {total_reward}, LR: {scheduler.get_last_lr()[0]}")
 
         if total_reward > best_test_reward:
             best_test_reward = total_reward
             torch.save(model.state_dict(), best_model_path)
             print(f"New best model saved with reward: {best_test_reward}")
+            # save_movement_log_to_csv(movement_log)
 
         if e % 5 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved after {e} episodes.")
-
         rospy.sleep(1.0)
 
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
+
 
 if __name__ == '__main__':
     main()
