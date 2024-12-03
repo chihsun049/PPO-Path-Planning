@@ -386,7 +386,7 @@ class GazeboEnv:
         return gazebo_x, gazebo_y
 
     def heuristic_cost(self, current, goal, previous_point=None, obstacle_weight=100.0,
-                   global_goal_weight=1.0, smoothness_weight=50.0, safety_weight=200.0):
+                   global_goal_weight=1.0, smoothness_weight=50.0):
         current = np.array(current, dtype=np.float64)
         goal = np.array(goal, dtype=np.float64)
         dist_to_goal = np.linalg.norm(goal - current)  # 距离目标点的代价
@@ -410,16 +410,11 @@ class GazeboEnv:
         obstacle_distance = max(obstacle_distance, 1e-3)  # 防止除以零
         obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
 
-        # 路径的安全性代价：奖励远离障碍物的点
-        center_distance = self.get_distance_transform_value(current)
-        center_reward = safety_weight * center_distance
-
         # 总成本
         total_cost = (
             global_goal_weight * dist_to_goal +  # 目标方向的代价
             smoothness_penalty +                # 平滑性代价
-            obstacle_penalty -                  # 障碍物代价（越接近越高）
-            center_reward                       # 安全性奖励
+            obstacle_penalty                   # 障碍物代价（越接近越高）
         )
         return total_cost
     
@@ -465,14 +460,6 @@ class GazeboEnv:
         else:
             rospy.logwarn(f"No optimal point found around waypoint {waypoint}. Using original point.")
             return waypoint
-    
-    def get_distance_transform_value(self, point):
-        x, y = int(point[0]), int(point[1])
-        if 0 <= y < self.distance_transform.shape[0] and 0 <= x < self.distance_transform.shape[1]:
-            # 直接返回距离变换的值，单位为米
-            return self.distance_transform[y, x]
-        else:
-            return 0.0  # 超出范围返回0
 
     def calculate_obstacle_distance(self, point):
         x, y = map(float, point)  # 确保使用浮点数
@@ -494,124 +481,6 @@ class GazeboEnv:
         distances = np.linalg.norm(obstacle_coords - np.array([y, x]), axis=1)  # 使用浮点数计算距离
         
         return distances.min()  # 返回最近障碍物的距离
-
-    def smooth_path_with_segmentation(self, waypoints, weight_data=0.05, weight_smooth=0.7, tolerance=1e-6):
-        def calculate_curvature(p1, p2, p3):
-            dx1, dy1 = p2[0] - p1[0], p2[1] - p1[1]
-            dx2, dy2 = p3[0] - p2[0], p3[1] - p2[1]
-            cross_product = dx1 * dy2 - dy1 * dx2
-            dot_product = dx1 * dx2 + dy1 * dy2
-            curvature = abs(cross_product) / (np.sqrt(dot_product + 1e-6) + 1e-6)
-            return curvature
-
-        # 分段处理路径，区分直线段和弯道段
-        curvature_threshold = 0.3  # 调整曲率阈值，更好地区分直线和弯道
-        segments = []
-        segment = [waypoints[0]]
-        curvatures = []
-
-        # 计算每个点的曲率
-        for i in range(1, len(waypoints) - 1):
-            curvature = calculate_curvature(waypoints[i - 1], waypoints[i], waypoints[i + 1])
-            curvatures.append(curvature)
-
-        # 根据曲率将路径分段
-        for i in range(1, len(waypoints) - 1):
-            if curvatures[i - 1] < curvature_threshold:
-                segment.append(waypoints[i])
-            else:
-                segment.append(waypoints[i])
-                segments.append(('straight', segment))
-                segment = [waypoints[i]]
-                # 处理弯道段
-                curve_segment = [waypoints[i - 1], waypoints[i], waypoints[i + 1]]
-                segments.append(('curve', curve_segment))
-                segment = [waypoints[i + 1]]
-
-        # 添加最后的段
-        if segment:
-            segment_type = 'straight' if curvatures[-1] < curvature_threshold else 'curve'
-            segments.append((segment_type, segment))
-
-        # 对每个段进行平滑处理
-        smoothed_path = []
-        for segment_type, segment in segments:
-            if segment_type == 'straight':
-                # 对直线段进行轻微平滑
-                smoothed_segment = self.smooth_segment(segment, weight_data=0.1, weight_smooth=0.1, tolerance=tolerance)
-                smoothed_path.extend(smoothed_segment[:-1])
-            elif segment_type == 'curve':
-                # 对弯道段进行专门的优化，生成大曲率曲线
-                smoothed_segment = self.optimize_curve_segment(segment)
-                smoothed_path.extend(smoothed_segment[:-1])
-
-        smoothed_path.append(waypoints[-1])
-        return smoothed_path
-
-    def smooth_segment(self, segment, weight_data, weight_smooth, tolerance):
-        new_segment = [list(p) for p in segment]
-        change = tolerance
-        while change >= tolerance:
-            change = 0.0
-            for i in range(1, len(segment) - 1):
-                for j in range(2):
-                    aux = new_segment[i][j]
-                    new_segment[i][j] += weight_data * (segment[i][j] - new_segment[i][j]) + \
-                                        weight_smooth * (new_segment[i - 1][j] + new_segment[i + 1][j] - 2 * new_segment[i][j])
-                    change += abs(aux - new_segment[i][j])
-        return new_segment
-
-    def optimize_curve_segment(self, segment):
-        # 使用 Bezier 曲线对弯道段进行优化
-        if len(segment) < 3:
-            return segment
-
-        p0, p1, p2 = segment[0], segment[1], segment[-1]
-
-        # 将点转换为图像坐标
-        img_p0 = self.gazebo_to_image_coords(*p0)
-        img_p1 = self.gazebo_to_image_coords(*p1)
-        img_p2 = self.gazebo_to_image_coords(*p2)
-
-        # 获取距离变换值（到最近障碍物的距离）
-        dist_p1 = self.get_distance_transform_value(img_p1)
-
-        # 定义一个搜索范围，找到附近的最佳控制点
-        search_radius = int(10 / self.map_resolution)  # 搜索半径，单位为像素
-
-        best_control_point = img_p1
-        max_distance = dist_p1
-
-        for dx in range(-search_radius, search_radius + 1, 5):
-            for dy in range(-search_radius, search_radius + 1, 5):
-                candidate_point = (img_p1[0] + dx, img_p1[1] + dy)
-
-                # 检查候选点是否在地图范围内
-                if 0 <= candidate_point[0] < self.slam_map.shape[1] and 0 <= candidate_point[1] < self.slam_map.shape[0]:
-                    distance = self.get_distance_transform_value(candidate_point)
-                    # 优化目标：距离障碍物远，且路径平滑
-                    # 这里可以引入一个权重参数，平衡距离和路径偏离程度
-                    smoothness_penalty = np.linalg.norm(np.array(candidate_point) - np.array(img_p1))
-                    score = distance - 0.5 * smoothness_penalty  # 路径平滑权重为0.5，可根据需要调整
-
-                    if score > max_distance:
-                        max_distance = score
-                        best_control_point = candidate_point
-
-        # 将最佳控制点转换回 Gazebo 坐标
-        control_point = self.image_to_gazebo_coords(*best_control_point)
-
-        # 生成 Bezier 曲线
-        bezier_points = self.generate_bezier_curve(p0, control_point, p2, num_points=10)
-        return bezier_points
-
-    def generate_bezier_curve(self, p0, p1, p2, num_points=10):
-        bezier_points = []
-        for t in np.linspace(0, 1, num_points):
-            x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
-            y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
-            bezier_points.append((x, y))
-        return bezier_points
     
     def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
         current = np.array(current, dtype=np.float64)
