@@ -385,43 +385,60 @@ class GazeboEnv:
         gazebo_y = (2000.0 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def heuristic_cost(self, current, goal, previous_point=None, obstacle_weight=100.0,
-                   global_goal_weight=1.0, smoothness_weight=50.0):
+    def heuristic_cost(self, current, goal_candidates, previous_point=None, 
+                   waypoint=None, obstacle_weight=10.0, smoothness_weight=5.0, waypoint_weight=1.0):
+        """
+        修改启发式函数，将路径点作为软约束。
+        """
         current = np.array(current, dtype=np.float64)
-        goal = np.array(goal, dtype=np.float64)
-        dist_to_goal = np.linalg.norm(goal - current)  # 距离目标点的代价
 
-        smoothness_penalty = 0.0
-        if previous_point is not None:
-            prev_point = np.array(previous_point, dtype=np.float64)
-            current_to_goal_vec = goal - current
-            prev_to_current_vec = current - prev_point
+        # 动态计算候选目标点中最佳的点
+        best_goal = None
+        lowest_cost = float('inf')
 
-            # 计算方向的平滑性（转角代价）
-            cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
-                np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
-            )
-            cos_theta = np.clip(cos_theta, -1.0, 1.0)
-            angle = np.arccos(cos_theta)
-            smoothness_penalty = smoothness_weight * (angle ** 2)
+        for goal in goal_candidates:
+            goal = np.array(goal, dtype=np.float64)
 
-        # 障碍物代价（与最近障碍物的反比平方）
-        obstacle_distance = self.calculate_obstacle_distance(current)
-        obstacle_distance = max(obstacle_distance, 1e-3)  # 防止除以零
-        obstacle_penalty = obstacle_weight / (obstacle_distance ** 2)
+            # 与目标的距离代价
+            dist_to_goal = np.linalg.norm(goal - current)
 
-        # 总成本
-        total_cost = (
-            global_goal_weight * dist_to_goal +  # 目标方向的代价
-            smoothness_penalty +                # 平滑性代价
-            obstacle_penalty                   # 障碍物代价（越接近越高）
-        )
-        return total_cost
+            # 平滑性代价
+            smoothness_penalty = 0.0
+            if previous_point is not None:
+                prev_point = np.array(previous_point, dtype=np.float64)
+                current_to_goal_vec = goal - current
+                prev_to_current_vec = current - prev_point
+
+                cos_theta = np.dot(current_to_goal_vec, prev_to_current_vec) / (
+                    np.linalg.norm(current_to_goal_vec) * np.linalg.norm(prev_to_current_vec) + 1e-5
+                )
+                angle = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+                smoothness_penalty = smoothness_weight * (angle ** 2)
+
+            # 障碍物代价
+            obstacle_count = self.calculate_obstacle_count(goal)
+            obstacle_penalty = obstacle_weight * obstacle_count
+
+            # 距离路径点的偏离代价
+            waypoint_penalty = 0.0
+            if waypoint is not None:
+                waypoint = np.array(waypoint, dtype=np.float64)
+                dist_to_waypoint = np.linalg.norm(goal - waypoint)
+                waypoint_penalty = waypoint_weight * dist_to_waypoint
+
+            # 总成本
+            total_cost = dist_to_goal + smoothness_penalty + obstacle_penalty + waypoint_penalty
+            if total_cost < lowest_cost:
+                lowest_cost = total_cost
+                best_goal = goal
+
+        return lowest_cost, best_goal
     
-    def find_best_point_in_grid(self, waypoint, previous_waypoint=None, grid_size=100):
+    def find_best_point_in_grid(self, waypoint, previous_waypoint=None, grid_size=100, waypoint_weight=1.0):
         img_x, img_y = self.gazebo_to_image_coords(*waypoint)
         half_grid = grid_size // 2
 
+        # 限定搜索范围
         min_x = max(0, img_x - half_grid)
         max_x = min(self.slam_map.shape[1] - 1, img_x + half_grid)
         min_y = max(0, img_y - half_grid)
@@ -435,52 +452,42 @@ class GazeboEnv:
             return waypoint
 
         global_free_space = free_space + np.array([min_y, min_x])
-        best_point = None
-        lowest_cost = float('inf')
 
-        if previous_waypoint is not None:
-            prev_img_x, prev_img_y = self.gazebo_to_image_coords(*previous_waypoint)
-        else:
-            prev_img_x, prev_img_y = None, None
+        # 获取候选点的全局坐标
+        goal_candidates = [self.image_to_gazebo_coords(x[1], x[0]) for x in global_free_space]
 
-        for point in global_free_space:
-            x, y = point[1], point[0]
-
-            if previous_waypoint is not None:
-                if not self.is_line_free(self.slam_map, (prev_img_x, prev_img_y), (x, y)):
-                    continue  # 如果两点之间有障碍物，跳过该点
-
-            cost = self.heuristic_cost((x, y), (img_x, img_y), previous_point=(prev_img_x, prev_img_y))
-            if cost < lowest_cost:
-                lowest_cost = cost
-                best_point = (x, y)
+        # 计算最佳的目标点
+        cost, best_point = self.heuristic_cost(
+            (img_x, img_y),
+            goal_candidates,
+            previous_point=self.gazebo_to_image_coords(*previous_waypoint) if previous_waypoint is not None else None,
+            waypoint=waypoint,
+            waypoint_weight=waypoint_weight
+        )
 
         if best_point is not None:
-            return self.image_to_gazebo_coords(*best_point)
+            return best_point
         else:
             rospy.logwarn(f"No optimal point found around waypoint {waypoint}. Using original point.")
             return waypoint
 
-    def calculate_obstacle_distance(self, point):
-        x, y = map(float, point)  # 确保使用浮点数
+    def calculate_obstacle_count(self, point):
+        """
+        计算给定点周围障碍物的数量。
+        """
+        x, y = map(float, point)  # 确保输入点是浮点数
         search_range = 20  # 搜索范围（像素）
-        
+
         # 限制搜索范围在地图边界内
         min_x = max(0, int(x - search_range))
         max_x = min(self.slam_map.shape[1], int(x + search_range))
         min_y = max(0, int(y - search_range))
         max_y = min(self.slam_map.shape[0], int(y + search_range))
-        
-        # 找到障碍物坐标
-        obstacle_coords = np.argwhere(self.slam_map[min_y:max_y, min_x:max_x] < 250)
-        if len(obstacle_coords) == 0:
-            return float('inf')  # 如果周围无障碍物，返回无穷大
-        
-        # 计算障碍物的全局像素坐标
-        obstacle_coords = obstacle_coords + [min_y, min_x]
-        distances = np.linalg.norm(obstacle_coords - np.array([y, x]), axis=1)  # 使用浮点数计算距离
-        
-        return distances.min()  # 返回最近障碍物的距离
+
+        # 找到障碍物点
+        obstacle_count = np.sum(self.slam_map[min_y:max_y, min_x:max_x] < 250)  # 障碍物像素值小于 250
+
+        return obstacle_count  # 返回障碍物点的数量
     
     def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
         current = np.array(current, dtype=np.float64)
@@ -497,101 +504,88 @@ class GazeboEnv:
             if png_image[r, c] < safe_threshold:
                 return False  # 障礙物
         return True  # 通過檢查，返回可通行
-    
-    def offset_waypoints_to_road_center(self):
-        """
-        偏移所有路径点，使其尽可能位于道路中间，并一次性输出。
-        """
-        rospy.loginfo("Offsetting all waypoints to road center at once...")
-        adjusted_waypoints = []
-
-        for waypoint in self.waypoints:
-            img_x, img_y = self.gazebo_to_image_coords(*waypoint)
-
-            # 获取距离变换值和方向
-            if 0 <= img_x < self.distance_transform.shape[1] and 0 <= img_y < self.distance_transform.shape[0]:
-                dist_to_obstacle = self.distance_transform[img_y, img_x]
-                grad_y, grad_x = np.gradient(self.distance_transform)
-
-                # 确保索引在范围内
-                if (
-                    0 <= img_x < grad_x.shape[1] and 0 <= img_y < grad_x.shape[0]
-                    and 0 <= img_x < grad_y.shape[1] and 0 <= img_y < grad_y.shape[0]
-                ):
-                    direction = np.array([grad_x[img_y, img_x], grad_y[img_y, img_x]])
-                    direction /= (np.linalg.norm(direction) + 1e-5)
-
-                    # 偏移路径点到道路中心
-                    offset_distance = dist_to_obstacle / 2.0  # 偏移到中间
-                    offset_vector = direction * offset_distance
-                    img_x_new = img_x + offset_vector[0]
-                    img_y_new = img_y + offset_vector[1]
-
-                    # 转换回 Gazebo 坐标
-                    adjusted_waypoint = self.image_to_gazebo_coords(img_x_new, img_y_new)
-                    adjusted_waypoints.append(adjusted_waypoint)
-                else:
-                    rospy.logwarn(f"Gradient index out of bounds for waypoint: {waypoint}. Using original.")
-                    adjusted_waypoints.append(waypoint)
-            else:
-                rospy.logwarn(f"Waypoint {waypoint} out of distance transform bounds. Using original.")
-                adjusted_waypoints.append(waypoint)
-
-        self.waypoints = adjusted_waypoints
-        rospy.loginfo("All waypoints offset to road center.")
-
-        # 可视化完成的路径
-        save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/offset_complete_path.png'
-        self.visualize_complete_path(self.waypoints, save_path=save_path)
-        rospy.loginfo(f"Visualization of offset waypoints saved to {save_path}.")
 
     def optimize_waypoints_with_a_star(self):
-        """
-        Use an improved A* algorithm to find the optimal target point around each waypoint in its grid.
-        """
-        if self.optimized_waypoints_calculated:
-            rospy.loginfo("Optimized waypoints already calculated. Skipping.")
-            return
-
-        # 偏移路径点到道路中间
-        self.offset_waypoints_to_road_center()
-
-        rospy.loginfo("Starting global path optimization with A*...")
+        rospy.loginfo("Starting global path optimization with A* (soft constraints)...")
         optimized_waypoints = []
+        last_valid_point = None
 
         for i in range(len(self.waypoints)):
             waypoint = self.waypoints[i]
             rospy.loginfo(f"Optimizing waypoint {i}: {waypoint}")
 
-            # Find the best point in the grid around the current waypoint
+            # 使用当前路径点作为参考点（软约束）
             previous_waypoint = self.waypoints[i - 1] if i > 0 else None
-            optimized_point = self.find_best_point_in_grid(waypoint, previous_waypoint)
-            optimized_waypoints.append(optimized_point)
+
+            # 在启发函数中考虑软约束路径点
+            best_point = self.find_best_point_in_grid(
+                waypoint,
+                previous_waypoint,
+                waypoint_weight=3.0  # 调整路径点权重
+            )
+
+            # 确保当前点不会往回或重复
+            if last_valid_point is not None:
+                dist_to_last = np.linalg.norm(np.array(best_point) - np.array(last_valid_point))
+                if dist_to_last < 0.5:  # 假设 0.5 米为阈值
+                    rospy.logwarn(f"Skipping waypoint {i} as it is too close to the last valid point.")
+                    continue
+
+            optimized_waypoints.append(best_point)
+            last_valid_point = best_point
 
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = self.optimized_waypoints
         self.optimized_waypoints_calculated = True
         self.current_waypoint_index = 0
         self.waypoint_failures = {i: 0 for i in range(len(self.waypoints))}
-        
+        rospy.loginfo("Global path optimization complete.")
+
         # 最终优化路径可视化
         save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
         self.visualize_complete_path(self.optimized_waypoints, save_path=save_path)
         rospy.loginfo(f"Global path optimization complete. Visualization saved to {save_path}.")
 
-    def filter_waypoints(self, waypoints, step=0):
+    def visualize_original_path(self, save_path='/home/chihsun/catkin_ws/src/my_robot_control/scripts/original_path.png'):
         """
-        筛选路径点：每 step 个点取一个，同时保留起点和终点。
+        可视化原始的参考路径点，并保存为图片。
         """
-        if not waypoints:
-            return []
+        if not hasattr(self, 'slam_map'):
+            raise ValueError("SLAM map not loaded.")
 
-        filtered_waypoints = [waypoints[0]]  # 保留起点
-        for i in range(step, len(waypoints) - 1, step):
-            filtered_waypoints.append(waypoints[i])
-        filtered_waypoints.append(waypoints[-1])  # 保留终点
+        # 转换地图为灰度图
+        map_img = self.slam_map.copy()
+        map_img[map_img < 250] = 0  # 障碍物区域
+        map_img[map_img >= 250] = 255  # 可通行区域
 
-        return filtered_waypoints
+        # 转换路径点到图像坐标
+        img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in self.generate_waypoints()]  # 使用原始路径点
+
+        # 绘制地图
+        plt.figure(figsize=(10, 10))
+        plt.imshow(map_img, cmap='gray', origin='upper')
+
+        # 绘制路径点为单独的点
+        for point in img_points:
+            if 0 <= point[0] < map_img.shape[1] and 0 <= point[1] < map_img.shape[0]:
+                plt.scatter(point[0], point[1], color='orange', s=5)  # 单独的点，大小为5
+
+        # 标注起点和终点
+        img_start = self.gazebo_to_image_coords(*self.generate_waypoints()[0])
+        img_goal = self.gazebo_to_image_coords(*self.generate_waypoints()[-1])
+        plt.scatter(img_start[0], img_start[1], color='red', label='Start', s=50)
+        plt.scatter(img_goal[0], img_goal[1], color='blue', label='Goal', s=50)
+
+        # 设置绘图范围
+        plt.xlim(0, map_img.shape[1])
+        plt.ylim(map_img.shape[0], 0)  # 注意：图像坐标 y 轴是倒置的
+
+        # 添加图例并保存图片
+        plt.legend()
+        plt.title('Original Path Points Visualization')
+        plt.savefig(save_path)
+        plt.close()
+        rospy.loginfo(f"Original path visualization saved to {save_path}")
     
     def visualize_complete_path(self, waypoints, save_path = f'/home/chihsun/catkin_ws/src/my_robot_control/scripts/full_path_{time.time()}.png'):
         """
@@ -995,10 +989,10 @@ class GazeboEnv:
         return np.array([linear_speed, steer_angle])
 
     def find_closest_waypoint(self, x, y):
-        # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
-        closest_index = 0
-        for i, (wp_x, wp_y) in enumerate(self.waypoints):
+        closest_index = self.current_waypoint_index  # 从当前索引开始搜索
+        for i in range(self.current_waypoint_index, len(self.waypoints)):  # 从当前索引向后搜索
+            wp_x, wp_y = self.waypoints[i]
             dist = np.linalg.norm([wp_x - x, wp_y - y])
             if dist < min_distance:
                 min_distance = dist
@@ -1400,6 +1394,8 @@ def main():
 
     num_episodes = 1000000
     best_test_reward = -np.inf
+
+    env.visualize_original_path()
 
     # init the obstacle information
     static_obstacles = []
