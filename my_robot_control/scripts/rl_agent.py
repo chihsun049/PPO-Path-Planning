@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 import rospy
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import os
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
@@ -13,14 +9,12 @@ from collections import namedtuple
 import tf
 from tf.transformations import quaternion_from_euler
 import time
-from torch.amp import GradScaler
 import yaml
 from PIL import Image
 import random
 import csv
 import cv2
 import datetime
-from torch.optim.lr_scheduler import StepLR
 from scipy.ndimage import distance_transform_edt
 import matplotlib.pyplot as plt
 
@@ -35,7 +29,7 @@ CLIP_PARAM = 0.2
 PREDICTION_HORIZON = 400
 CONTROL_HORIZON = 10
 
-device = torch.device("cpu")
+# device = torch.device("cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
 def grid_filter(obstacles, grid_size=0.5):
@@ -47,88 +41,6 @@ def grid_filter(obstacles, grid_size=0.5):
     # 返回网格中心点
     filtered_points = unique_indices * grid_size + grid_size / 2
     return filtered_points
-
-class PrioritizedMemory:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = [None] * capacity
-        self.position = 0
-        self.priorities = torch.zeros((capacity,), dtype=torch.float32).cuda()
-        self.alpha = 0.6
-        self.beta = 0.4
-        self.beta_increment = 0.001
-        self.epsilon = 1e-6
-        self.max_priority = 1.0
-
-    def add(self, state, action, reward, done, next_state):
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32)
-        if isinstance(next_state, np.ndarray):
-            next_state = torch.tensor(next_state, dtype=torch.float32)
-
-        # Ensure states have the right shape (B, C, H, W)
-        if state.dim() == 5:
-            state = state.squeeze(1)
-        if next_state.dim() == 5:
-            next_state = next_state.squeeze(1)
-
-        # Ensure states have 4 dimensions
-        if state.dim() == 3:
-            state = state.unsqueeze(0)
-        if next_state.dim() == 3:
-            next_state = next_state.unsqueeze(0)
-
-        self.memory[self.position] = (
-            state.to(device),
-            torch.tensor(action, dtype=torch.float32, device=device),
-            torch.tensor(reward, dtype=torch.float32, device=device),
-            torch.tensor(done, dtype=torch.float32, device=device),
-            next_state.to(device)
-        )
-
-    def sample(self, batch_size):
-        valid_samples = [i for i, x in enumerate(self.memory) if x is not None]
-        if len(valid_samples) < batch_size:
-            raise ValueError(f"Not enough valid samples. Have {len(valid_samples)}, need {batch_size}")
-
-        # Update beta
-        self.beta = min(1.0, self.beta + self.beta_increment)
-        
-        # Calculate sampling probabilities
-        priorities = self.priorities[:len(valid_samples)]
-        probs = priorities ** self.alpha
-        probs = probs / probs.sum()
-
-        # Sample indices
-        indices = torch.multinomial(probs, batch_size, replacement=False)
-        
-        # Calculate importance sampling weights
-        weights = (len(valid_samples) * probs[indices]) ** (-self.beta)
-        weights = weights / weights.max()
-
-        # Get samples
-        batch = [self.memory[idx] for idx in indices]
-        states, actions, rewards, dones, next_states = zip(*batch)
-
-        # Stack and transfer to device
-        states = torch.stack(states).to(device)
-        next_states = torch.stack(next_states).to(device)
-        actions = torch.stack(actions).to(device)
-        rewards = torch.stack(rewards).to(device)
-        dones = torch.stack(dones).to(device)
-
-        return states, actions, rewards, dones, next_states, indices, weights.to(device)
-
-
-    def update_priorities(self, indices, priorities):
-        priorities = priorities.abs().clamp(min=self.epsilon, max=100.0)
-        self.priorities[indices] = priorities
-        self.max_priority = max(self.max_priority, priorities.max().item())
-
-    def clear(self):
-        self.position = 0
-        self.memory = [None] * self.capacity
-        self.priorities = torch.zeros((self.capacity,), dtype=torch.float32).cuda()
 
 class GazeboEnv:
     def __init__(self, model):
@@ -761,37 +673,30 @@ class GazeboEnv:
             max(0, self.current_waypoint_index - 6),
             min(len(self.waypoints), self.current_waypoint_index + 2)
         )
-        use_deep_rl_control = any(
-            self.waypoint_failures.get(i, 0) > 1 for i in failure_range
-        )
+        # use_deep_rl_control = any(
+            # self.waypoint_failures.get(i, 0) > 1 for i in failure_range
+        # )
 
         collision = detect_collision(robot_x, robot_y, robot_yaw, obstacles)
-        if not use_deep_rl_control:
-            if collision:
-                self.waypoint_failures[self.current_waypoint_index] += 1
-                print('touch the obstacles')
-                reward -= 10.0
-                self.reset()
-                return self.state, reward, True, {}
+        # if not use_deep_rl_control:
+        if collision:
+            self.waypoint_failures[self.current_waypoint_index] += 1
+            print('touch the obstacles')
+            reward -= 10.0
+            self.reset()
+            return self.state, reward, True, {}
         
         # 处理无进展的情况
         if distance_moved < 0.05:
             self.no_progress_steps += 1
             reward -= 0.3
             if self.no_progress_steps >= self.max_no_progress_steps:
-                if use_deep_rl_control:
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward -= 10.0
-                    self.reset()
-                    return self.state, reward, True, {}
-                else:
-                    self.waypoint_failures[self.current_waypoint_index] += 1
-                    print('failure at point', self.current_waypoint_index)
-                    rospy.loginfo("No progress detected, resetting environment.")
-                    reward -= 10.0
-                    self.reset()
-                    return self.state, reward, True, {}
+                self.waypoint_failures[self.current_waypoint_index] += 1
+                print('failure at point', self.current_waypoint_index)
+                rospy.loginfo("No progress detected, resetting environment.")
+                reward -= 10.0
+                self.reset()
+                return self.state, reward, True, {}
         else:
             self.no_progress_steps = 0
         
@@ -812,9 +717,7 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        if isinstance(self.state, np.ndarray):
-            self.state = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0).to(device)  # 增加 batch 维度
-        elif self.state.dim() != 4:
+        if self.state.dim() != 4:
             self.state = self.state.unsqueeze(0)  # 增加 batch 维度
         reward, _ = self.calculate_reward(robot_x, robot_y, reward, self.state)
         print('reward = ',reward)
@@ -874,10 +777,7 @@ class GazeboEnv:
         self.previous_distance_to_goal = None
         self.collision_detected = False
 
-        # Ensure the state is 4D tensor
-        if isinstance(self.state, np.ndarray):
-            self.state = torch.tensor(self.state, dtype=torch.float32).unsqueeze(0).to(device)
-        elif self.state.dim() != 4:
+        if self.state.dim() != 4:
             self.state = self.state.unsqueeze(0)
         return self.state
 
@@ -886,8 +786,6 @@ class GazeboEnv:
         done = False
         # 將機器人的座標轉換為地圖上的坐標
         
-        if isinstance(state, torch.Tensor):
-            state = state.cpu().numpy()
         if state.ndim == 4:
             # 对于 4 维情况，取第一个批次数据中的第一层
             occupancy_grid = state[0, 0]
@@ -990,7 +888,6 @@ class GazeboEnv:
 
         return np.array([linear_speed, steer_angle])
 
-
     def find_closest_waypoint(self, x, y):
         # 找到與當前位置最接近的路徑點
         min_distance = float('inf')
@@ -1013,115 +910,6 @@ class GazeboEnv:
             kp = 0.3
             kd = 0.4
         return kp, kd
-
-class ActorCritic(nn.Module):
-    def __init__(self, observation_space, action_space):
-        super(ActorCritic, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=2)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, stride=2)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=2)
-        self.bn4 = nn.BatchNorm2d(256)
-
-        self.fc1 = nn.Linear(self._get_conv_output_size(observation_space), 256)
-        self.lstm = nn.LSTM(input_size=256, hidden_size=128, batch_first=True)
-
-        self.actor_mean = nn.Linear(128, action_space)
-        self.actor_std = nn.Linear(128, action_space)  # 动态方差
-        self.critic = nn.Linear(128, 1)
-
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        
-
-    def _get_conv_output_size(self, shape):
-        x = torch.zeros(1, *shape)
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = torch.relu(self.bn3(self.conv3(x)))
-        x = torch.relu(self.bn4(self.conv4(x)))
-        x = x.view(1, -1)
-        return x.size(1)
-
-    def forward(self, x):
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = torch.relu(self.bn3(self.conv3(x)))
-        x = torch.relu(self.bn4(self.conv4(x)))
-        x = x.view(x.size(0), -1)
-        x = torch.relu(self.fc1(x))
-
-        x, _ = self.lstm(x.unsqueeze(0))  # 时间序列处理
-        x = x.squeeze(0)
-
-        action_mean = self.actor_mean(x)
-        action_std = torch.clamp(torch.exp(self.actor_std(x)), min=1e-3, max=2.0)  # 限制标准差范围
-        value = self.critic(x)
-
-        return action_mean, action_std, value
-
-
-    def act(self, state):
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float32).to(device)
-        
-        # Ensure proper dimensions
-        while state.dim() > 4:
-            state = state.squeeze(0)
-        while state.dim() < 4:
-            state = state.unsqueeze(0)
-        
-        action_mean, action_std, _ = self(state)
-        
-        # Define action bounds
-        action_space = torch.tensor([
-            [0.5, -0.5],  # min values
-            [2.0, 0.5]    # max values
-        ], device=device)
-        
-        # Scale actions to proper range
-        scaled_mean = action_space[0] + (torch.tanh(action_mean) + 1.0) * (action_space[1] - action_space[0]) / 2.0
-        
-        if self.training:
-            # Add bounded noise during training
-            noise = torch.clamp(torch.randn_like(action_std) * action_std, -0.5, 0.5)
-            action = torch.clamp(scaled_mean + noise, action_space[0], action_space[1])
-
-        else:
-            action = scaled_mean
-                
-        return action.detach()
-
-    def evaluate(self, state, action):
-        action_mean, action_std, value = self(state)
-        
-        # Ensure proper bounds for action_std
-        action_std = torch.clamp(action_std, min=1e-6, max=1.0)
-        
-        # Create normal distribution
-        dist = torch.distributions.Normal(action_mean, action_std)
-        
-        # Calculate log probabilities
-        action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
-        dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
-        
-        return action_log_probs, value, dist_entropy
 
 class DWA:
     def __init__(self, goal):
@@ -1203,79 +991,6 @@ class DWA:
         print(f"v: {v}, omega: {omega}, goal_score: {goal_score}, clearance_score: {clearance_score}, speed_score: {speed_score}")
         return best_control, best_trajectory
 
-def ppo_update(ppo_epochs, env, model, optimizer, memory, scaler, batch_size, scheduler):
-    valid_samples = len([x for x in memory.memory if x is not None])
-    if valid_samples < batch_size:
-        return
-
-    accumulation_steps = 4
-    warmup_epochs = 10
-    optimizer.zero_grad()
-
-    for epoch in range(ppo_epochs):
-        # Warmup learning rate
-        progress = min(1.0, epoch / warmup_epochs)
-        adjusted_lr = LEARNING_RATE * progress * (1 / (1 + epoch * 0.001))
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = adjusted_lr
-
-        # Sample batch
-        state_batch, action_batch, reward_batch, done_batch, next_state_batch, indices, weights = memory.sample(batch_size)
-        state_batch, next_state_batch = _adjust_dimensions(state_batch, next_state_batch)
-        
-        # Normalize rewards
-        reward_batch = (reward_batch - reward_batch.mean()) / (reward_batch.std() + 1e-8)
-        reward_batch = torch.clamp(reward_batch, -10.0, 10.0)
-
-        # Calculate advantages
-        with torch.no_grad():
-            old_log_probs, _, _ = model.evaluate(state_batch, action_batch)
-            _, _, next_values = model(next_state_batch)
-            _, _, values = model(state_batch)
-
-        # Compute target values and advantages
-        target_values = reward_batch + (1 - done_batch) * GAMMA * next_values
-        advantages = (target_values - values).detach()
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        advantages = torch.clamp(advantages, -10.0, 10.0)
-
-        # PPO update steps
-        for _ in range(PPO_EPOCHS):
-            with torch.amp.autocast(enabled=True, dtype=torch.float16, device_type="cuda"):
-                log_probs, values, dist_entropy = model.evaluate(state_batch, action_batch)
-                action_mean, action_std, _ = model(state_batch)
-                
-                ratio = (log_probs - old_log_probs).exp()
-                ratio = torch.clamp(ratio, 0.0, 10.0)
-                
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1 - CLIP_PARAM, 1 + CLIP_PARAM) * advantages
-
-                # Calculate losses
-                actor_loss = -(weights * torch.min(surr1, surr2)).mean()
-                critic_loss = 0.5 * (weights * (values - target_values).pow(2)).mean()
-                entropy_loss = -0.01 * (weights * dist_entropy).mean()
-                
-                loss = (actor_loss + critic_loss + entropy_loss) / accumulation_steps
-
-                # Backward pass with gradient accumulation
-                scaler.scale(loss).backward()
-                
-                if (_ + 1) % accumulation_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    scheduler.step()
-
-        # Update priorities in memory
-        priorities = advantages.abs().detach().cpu().numpy()
-        memory.update_priorities(indices, priorities)
-
-    # Clear memory after all updates
-    memory.clear()
-
 def calculate_bounding_box(robot_x, robot_y, robot_yaw):
 
     # 机器人中心到边界的相对距离
@@ -1324,33 +1039,6 @@ def detect_collision(robot_x, robot_y, robot_yaw, obstacles):
             return True
     return False
 
-
-def _adjust_dimensions(state_batch, next_state_batch):
-    # Remove extra dimension from state_batch if present
-    if state_batch.dim() == 5:
-        state_batch = state_batch.squeeze(1)
-    
-    # Remove extra dimension from next_state_batch if present
-    if next_state_batch.dim() == 5:
-        next_state_batch = next_state_batch.squeeze(1)
-        
-    # Verify final shapes
-    if state_batch.dim() != 4:
-        raise ValueError(f"State batch should be 4D, got shape: {state_batch.shape}")
-    if next_state_batch.dim() != 4:
-        raise ValueError(f"Next state batch should be 4D, got shape: {next_state_batch.shape}")
-        
-    return state_batch, next_state_batch
-
-def _check_for_nan(tensors, error_message):
-    for tensor in tensors:
-        if tensor is not None and torch.isnan(tensor).any():
-            raise ValueError(error_message)
-        
-def _check_for_invalid_values(tensor, name):
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        raise ValueError(f"[PPO Update] {name} contains invalid values (NaN or Inf).")
-
 def select_action_with_exploration(env, state, model, epsilon, dwa=None, obstacles=None):
     if random.random() < epsilon:
         if dwa is None or obstacles is None:
@@ -1364,7 +1052,7 @@ def select_action_with_exploration(env, state, model, epsilon, dwa=None, obstacl
         print('robot x = ', robot_x, 'robot_y = ', robot_y)
         state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
         action, _ = dwa.plan(state, obstacles)  
-        action = torch.tensor(action, dtype=torch.float32).to(device)
+        # action = torch.tensor(action, dtype=torch.float32).to(device)
     else:
         print('action by RL')
         action = model.act(state)
@@ -1381,27 +1069,11 @@ def save_movement_log_to_csv(movement_log, filename= f"/home/chihsun/catkin_ws/s
 def main():
     env = GazeboEnv(None)
     dwa = DWA(goal=env.waypoints[env.current_waypoint_index + 3])
-    model = ActorCritic(env.observation_space, env.action_space).to(device)
-    env.model = model
 
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = StepLR(optimizer, step_size=100, gamma=0.95)  # 每1000次調整學習率
-    scaler = GradScaler('cuda')
-    memory = PrioritizedMemory(MEMORY_SIZE)
-
-    model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/saved_model_ppo.pth"
-    best_model_path = "/home/chihsun/catkin_ws/src/my_robot_control/scripts/best_model.pth"
-    
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        print("Loaded existing model.")
-    else:
-        print("Created new model.")
-    
     env.visualize_original_path()
 
     num_episodes = 1000000
-    best_test_reward = -np.inf
+    # best_test_reward = -np.inf
     
     last_recorded_position = None
 
@@ -1419,9 +1091,6 @@ def main():
             env.optimize_waypoints_with_a_star()
 
         state = env.reset()
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32)
-        state = state.clone().detach().unsqueeze(0).to(device)
 
         total_reward = 0
         start_time = time.time()
@@ -1451,28 +1120,10 @@ def main():
             )
             failure_counts = {i: env.waypoint_failures.get(i, 0) for i in failure_range}
 
-            use_deep_rl_control = any(
-                env.waypoint_failures.get(i, 0) > 1 for i in failure_range
-            )
-
-            if use_deep_rl_control:
-                use_rl = True  # Mark this episode as using RL
-                action = select_action_with_exploration(env, state, model, epsilon=0.6 , dwa=dwa, obstacles=obstacles)
-                action_np = action.detach().cpu().numpy().flatten()
-                print(f"RL Action at waypoint {env.current_waypoint_index}: {action_np}")
-            else:
-                action_np = env.calculate_action_pure_pursuit()
-                print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
+            action_np = env.calculate_action_pure_pursuit()
+            print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
 
             next_state, reward, done, _ = env.step(action_np, obstacles=obstacles)
-
-            if not isinstance(next_state, torch.Tensor):
-                next_state = torch.tensor(next_state, dtype=torch.float32)
-            next_state = next_state.clone().detach().unsqueeze(0).to(device)
-
-            if use_deep_rl_control:
-                memory.add(state.cpu().numpy(), action_np, reward, done, next_state.cpu().numpy())
-                total_reward += reward
 
             state = next_state
 
@@ -1484,28 +1135,6 @@ def main():
                     reward -= 10.0
                     print(f"Episode {e} failed at time step {time_step}: time exceeded 240 sec.")
                 break
-
-        if use_rl and len(memory.memory) > BATCH_SIZE:
-            print(123456)
-            current_batch_size = min(BATCH_SIZE, len(memory.memory))
-            ppo_update(PPO_EPOCHS, env, model, optimizer, memory, scaler, batch_size=current_batch_size,scheduler=scheduler)
-
-        print(f"Episode {e}, Total Reward: {total_reward}, LR: {scheduler.get_last_lr()[0]}")
-
-        if total_reward > best_test_reward:
-            best_test_reward = total_reward
-            torch.save(model.state_dict(), best_model_path)
-            print(f"New best model saved with reward: {best_test_reward}")
-            # save_movement_log_to_csv(movement_log)
-
-        if e % 5 == 0:
-            torch.save(model.state_dict(), model_path)
-            print(f"Model saved after {e} episodes.")
-        rospy.sleep(1.0)
-
-    torch.save(model.state_dict(), model_path)
-    print("Final model saved.")
-
 
 if __name__ == '__main__':
     main()
