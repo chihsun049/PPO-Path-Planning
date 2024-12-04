@@ -79,8 +79,6 @@ class GazeboEnv:
         self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
 
         self.optimize_waypoints_with_a_star()
-        
-        self.sub_contacts = rospy.Subscriber('/gazebo/contacts', ContactsState, self.collision_callback)
     
     def load_slam_map(self, yaml_path):
         # 讀取 YAML 檔案
@@ -327,16 +325,9 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def calculate_heuristic(self, point, goal_point, png_image, cost_map, grid_size=50, weights=None):
+    def calculate_heuristic(self, point, goal_point, cost_map, weights=None):
         """
-        計算啟發值，結合多種因素。
-        :param point: 當前節點 (x, y)
-        :param goal_point: 目標節點 (x, y)
-        :param png_image: 地圖影像
-        :param cost_map: 成本地圖
-        :param grid_size: 格子大小
-        :param weights: 權重字典，包括距離、障礙物和平滑度
-        :return: 啟發值
+        計算啟發值，結合多種因素（距離、成本地圖）。
         """
         img_x, img_y = point
         goal_x, goal_y = goal_point
@@ -344,25 +335,12 @@ class GazeboEnv:
         # 默認權重
         if weights is None:
             weights = {
-                "distance": 1.0,       # 距離的權重
-                "obstacle": 2.0,       # 障礙物的權重
-                "smoothness": 0.5,     # 平滑度的權重
-                "costmap": 3.0         # 成本地圖的權重
+                "distance": 1.5,       # 距離的權重
+                "costmap": 3.0,        # 成本地圖的權重
             }
 
         # 距離的啟發值
         distance = np.sqrt((goal_x - img_x) ** 2 + (goal_y - img_y) ** 2)
-
-        # 障礙物的權重
-        unwalkable_count = np.sum(
-            png_image[max(0, img_y - grid_size // 2):min(img_y + grid_size // 2, png_image.shape[0]),
-                    max(0, img_x - grid_size // 2):min(img_x + grid_size // 2, png_image.shape[1])] < 180
-        )
-
-        # 路徑平滑度（假設平滑的路徑更接近直線）
-        delta_x = abs(goal_x - img_x)
-        delta_y = abs(goal_y - img_y)
-        smoothness_penalty = abs(delta_x - delta_y)
 
         # 成本地圖的代價
         costmap_penalty = cost_map[img_y, img_x] if 0 <= img_x < cost_map.shape[1] and 0 <= img_y < cost_map.shape[0] else float('inf')
@@ -370,23 +348,44 @@ class GazeboEnv:
         # 結合多種權重
         heuristic = (
             weights["distance"] * distance +
-            weights["obstacle"] * unwalkable_count +
-            weights["smoothness"] * smoothness_penalty +
             weights["costmap"] * costmap_penalty
         )
         return heuristic
 
+    def adjust_goal_point(self, goal_point, cost_map, adjustment_range=10):
+        """
+        調整目標點，避免靠近障礙物。
+        """
+        goal_x, goal_y = goal_point
+        safe_goal = None
+        min_cost = float('inf')
+
+        for dx in range(-adjustment_range, adjustment_range + 1):
+            for dy in range(-adjustment_range, adjustment_range + 1):
+                nx, ny = goal_x + dx, goal_y + dy
+                if 0 <= nx < cost_map.shape[1] and 0 <= ny < cost_map.shape[0]:
+                    cost = cost_map[ny, nx]
+                    if cost < min_cost:
+                        min_cost = cost
+                        safe_goal = (nx, ny)
+
+        return safe_goal if safe_goal else goal_point
+
     def a_star_optimize_waypoint(self, png_image, cost_map, start_point, goal_point, grid_size=50):
         """
-        使用 A* 算法進行全局遍歷搜索，考慮多種權重：最短路徑、障礙物數量、路徑平滑度、成本地圖。
+        使用 A* 算法進行局部路徑優化，動態調整目標點。
         """
         start_x, start_y = self.gazebo_to_image_coords(*start_point)
         goal_x, goal_y = self.gazebo_to_image_coords(*goal_point)
 
+        # 動態調整目標點，避免靠近障礙物
+        adjusted_goal = self.adjust_goal_point((goal_x, goal_y), cost_map)
+        adjusted_goal_x, adjusted_goal_y = adjusted_goal
+
         # A* 初始化
-        open_set = [(0, (start_x, start_y))]  # 優先隊列，儲存 (f_score, point)
-        came_from = {}  # 路徑追蹤
-        g_score = np.full(png_image.shape, float('inf'), dtype=np.float32)  # 將所有節點的 g_score 初始化為無窮大
+        open_set = [(0, (start_x, start_y))]  # 優先隊列
+        came_from = {}
+        g_score = np.full(png_image.shape, float('inf'), dtype=np.float32)
         g_score[start_y, start_x] = 0
 
         while open_set:
@@ -395,7 +394,7 @@ class GazeboEnv:
             open_set.remove((_, current_point))
             current_x, current_y = current_point
 
-            if current_point == (goal_x, goal_y):
+            if current_point == (adjusted_goal_x, adjusted_goal_y):
                 # 路徑重建
                 path = []
                 while current_point in came_from:
@@ -408,28 +407,32 @@ class GazeboEnv:
                 return optimized_path[-1]
 
             # 遍歷所有可能的鄰居點
-            for x in range(current_x - grid_size // 2, current_x + grid_size // 2):
-                for y in range(current_y - grid_size // 2, current_y + grid_size // 2):
-                    if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
-                        continue  # 確保節點在地圖範圍內
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
+                neighbor_x, neighbor_y = current_x + dx, current_y + dy
+                if not (0 <= neighbor_x < png_image.shape[1] and 0 <= neighbor_y < png_image.shape[0]):
+                    continue  # 確保節點在地圖範圍內
 
-                    tentative_g_score = g_score[current_y, current_x] + 1  # 假設移動到相鄰點的代價為1
+                tentative_g_score = g_score[current_y, current_x] + 1
 
-                    if tentative_g_score < g_score[y, x]:
-                        # 更新最優路徑
-                        came_from[(x, y)] = current_point
-                        g_score[y, x] = tentative_g_score
-                        f_score = tentative_g_score + self.calculate_heuristic((x, y), (goal_x, goal_y), png_image, cost_map, grid_size)
-                        if (x, y) not in [item[1] for item in open_set]:
-                            open_set.append((f_score, (x, y)))
+                if tentative_g_score < g_score[neighbor_y, neighbor_x]:
+                    # 更新最優路徑
+                    came_from[(neighbor_x, neighbor_y)] = current_point
+                    g_score[neighbor_y, neighbor_x] = tentative_g_score
+                    f_score = tentative_g_score + self.calculate_heuristic(
+                        (neighbor_x, neighbor_y),
+                        (adjusted_goal_x, adjusted_goal_y),
+                        cost_map
+                    )
+                    if (neighbor_x, neighbor_y) not in [item[1] for item in open_set]:
+                        open_set.append((f_score, (neighbor_x, neighbor_y)))
 
-        # 如果未找到路徑，返回初始目標點
+        # 如果未找到路徑，返回動態調整後的目標點
         rospy.logwarn("A* failed to find a path.")
-        return goal_point
+        return self.image_to_gazebo_coords(adjusted_goal_x, adjusted_goal_y)
 
     def optimize_waypoints_with_a_star(self):
         """
-        使用擴展的 A* 啟發函數優化路徑點。
+        使用改進的 A* 啟發函數優化路徑點。
         """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Using previously calculated optimized waypoints.")
@@ -438,16 +441,13 @@ class GazeboEnv:
 
         rospy.loginfo("Calculating optimized waypoints for the first time using extended A*.")
         optimized_waypoints = []
-        total_waypoints = len(self.waypoints) - 1  # 總共需要優化的段數
+        total_waypoints = len(self.waypoints) - 1
 
         for i in range(total_waypoints):
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
 
-            # 輸出當前進度
             rospy.loginfo(f"Optimizing segment {i + 1}/{total_waypoints}: Start {start_point} -> Goal {goal_point}")
-
-            # 優化當前段
             optimized_point = self.a_star_optimize_waypoint(self.slam_map, self.cost_map, start_point, goal_point)
             optimized_waypoints.append(optimized_point)
 
@@ -456,7 +456,6 @@ class GazeboEnv:
         self.waypoints = optimized_waypoints
         self.optimized_waypoints_calculated = True
 
-        # 最終優化路徑可視化
         save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
         self.visualize_complete_path(self.optimized_waypoints, save_path=save_path)
         rospy.loginfo(f"Global path optimization complete. Visualization saved to {save_path}.")
@@ -717,8 +716,6 @@ class GazeboEnv:
 
         rospy.sleep(0.1)
 
-        if self.state.dim() != 4:
-            self.state = self.state.unsqueeze(0)  # 增加 batch 维度
         reward, _ = self.calculate_reward(robot_x, robot_y, reward, self.state)
         print('reward = ',reward)
         return self.state, reward, self.done, {}
@@ -776,9 +773,6 @@ class GazeboEnv:
         self.no_progress_steps = 0
         self.previous_distance_to_goal = None
         self.collision_detected = False
-
-        if self.state.dim() != 4:
-            self.state = self.state.unsqueeze(0)
         return self.state
 
 
