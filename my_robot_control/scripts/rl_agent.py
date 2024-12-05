@@ -353,8 +353,11 @@ class GazeboEnv:
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
+        # 初始化
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
+        g_scores = {}  # 记录每个点的 g 值
+        g_scores[(img_start_x, img_start_y)] = 0
 
         for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
             for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
@@ -367,17 +370,21 @@ class GazeboEnv:
                     prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
                     if self.check_line_for_obstacles((prev_img_x, prev_img_y), (x, y)):
                         continue
-
+                
                 # 计算代价地图权重
                 costmap_cost = self.cost_map[y, x]
 
-                # 当前点的 g 值（距离起点的代价）
-                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
+                # 当前点的移动距离
+                step_distance = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
+
+                # 累积 g 值
+                g = g_scores.get((img_start_x, img_start_y), float('inf')) + step_distance
+                g_scores[(x, y)] = g
 
                 # 当前点到目标点的 h 值（启发式）
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 平滑性代价调整，使用差分公式
+                # 平滑性代价调整
                 if len(self.optimized_waypoints) >= 2:
                     prev_prev_point = self.optimized_waypoints[-2]
                     prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
@@ -388,6 +395,7 @@ class GazeboEnv:
                     delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
                     delta_xi1 = (x - prev_img_x, y - prev_img_y)
                     smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
+                    smoothness_cost = smoothness_cost * 10000
                 else:
                     smoothness_cost = 0
 
@@ -395,10 +403,10 @@ class GazeboEnv:
                 obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
 
                 # 距离越远越好，将最短距离作为代价的一部分
-                distance_penalty = -obstacle_distance # 负值表示距离越大代价越低
+                distance_penalty = -obstacle_distance
 
                 # 计算总的代价 f
-                f = g + h * 0.1 + costmap_cost * 0.5 + smoothness_cost + distance_penalty * 10 
+                f = g + h * 0.1 + costmap_cost * 1 + smoothness_cost * 10 + distance_penalty * 10
 
                 if f < best_f_score:
                     best_f_score = f
