@@ -110,7 +110,7 @@ class GazeboEnv:
         
         self.cost_map = np.zeros_like(self.slam_map)
         
-        inner_dilation = 7
+        inner_dilation = 5
         outer_dilation = 15
         
         inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
@@ -325,114 +325,81 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
 
-    def calculate_heuristic(self, point, goal_point, cost_map, weights=None):
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
         """
-        計算啟發值，結合距離和成本地圖。
+        使用 A* 算法优化路径，加入平滑性和基于障碍物距离的代价地图考量。
         """
-        img_x, img_y = point
-        goal_x, goal_y = goal_point
+        img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
+        img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        # 默認權重
-        if weights is None:
-            weights = {
-                "distance": 1.0,  # 距離的權重
-                "costmap": 5.0,   # 成本地圖的權重（更高以強調避開障礙）
-            }
+        best_f_score = float('inf')
+        best_point = (img_start_x, img_start_y)
 
-        # 距離啟發值
-        distance = np.sqrt((goal_x - img_x) ** 2 + (goal_y - img_y) ** 2)
+        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
+            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
+                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
+                    continue
 
-        # 成本地圖代價
-        costmap_penalty = cost_map[img_y, img_x] if 0 <= img_x < cost_map.shape[1] and 0 <= img_y < cost_map.shape[0] else float('inf')
+                # 计算代价地图权重
+                costmap_cost = self.cost_map[y, x]
 
-        # 綜合權重計算啟發值
-        heuristic = (
-            weights["distance"] * distance +
-            weights["costmap"] * costmap_penalty
-        )
-        return heuristic
+                # 当前点的 g 值（距离起点的代价）
+                g = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
 
-    def a_star_optimize_waypoint(self, png_image, cost_map, start_point, goal_point, grid_size=50):
-        """
-        使用靈活的 A* 算法進行路徑優化，偏向避開障礙物並允許偏離原始目標點。
-        """
-        start_x, start_y = self.gazebo_to_image_coords(*start_point)
-        goal_x, goal_y = self.gazebo_to_image_coords(*goal_point)
+                # 当前点到目标点的 h 值（启发式）
+                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-        # A* 初始化
-        open_set = [(0, (start_x, start_y))]  # 優先隊列 (f_score, point)
-        came_from = {}
-        g_score = np.full(png_image.shape, float('inf'), dtype=np.float32)
-        g_score[start_y, start_x] = 0
+                # 计算平滑性代价：与上一个点的角度变化
+                if self.optimized_waypoints:  # 如果有之前的路径点，计算角度变化
+                    prev_point = self.optimized_waypoints[-1]
+                    prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+                    angle_change = np.arctan2(y - prev_img_y, x - prev_img_x) - np.arctan2(prev_img_y - img_start_y, prev_img_x - img_start_x)
+                    angle_change = np.abs(np.arctan2(np.sin(angle_change), np.cos(angle_change)))  # 确保角度在[-π, π]
+                    smoothness_cost = angle_change * 10  # 平滑性权重
+                else:
+                    smoothness_cost = 0
 
-        while open_set:
-            # 選擇 f_score 最低的節點
-            _, current_point = min(open_set, key=lambda x: x[0])
-            open_set.remove((_, current_point))
-            current_x, current_y = current_point
+                # 基于距离的代价
+                obstacle_distance = self.distance_transform[y, x]
+                if obstacle_distance < 1.0:  # 如果距离障碍物小于1米，增加惩罚
+                    distance_cost = (1.0 / (obstacle_distance + 1e-5)) * 20  # 防止除零
+                else:
+                    distance_cost = 0
 
-            # 判斷是否已接近目標點
-            if np.sqrt((current_x - goal_x) ** 2 + (current_y - goal_y) ** 2) <= 10:
-                # 路徑重建
-                path = []
-                while current_point in came_from:
-                    path.append(current_point)
-                    current_point = came_from[current_point]
-                path.reverse()
+                # 计算总的代价 f
+                f = g + h + costmap_cost * 0.5 + smoothness_cost ** 2 + distance_cost
 
-                # 將路徑點轉換回 Gazebo 坐標
-                optimized_path = [self.image_to_gazebo_coords(x, y) for x, y in path]
-                return optimized_path[-1]
+                if f < best_f_score:
+                    best_f_score = f
+                    best_point = (x, y)
 
-            # 遍歷所有可能的鄰居點
-            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, 1), (-1, 1), (1, -1)]:
-                neighbor_x, neighbor_y = current_x + dx, current_y + dy
-                if not (0 <= neighbor_x < png_image.shape[1] and 0 <= neighbor_y < png_image.shape[0]):
-                    continue  # 確保節點在地圖範圍內
-
-                tentative_g_score = g_score[current_y, current_x] + 1
-
-                # 如果鄰居點的代價更低，更新路徑
-                if tentative_g_score < g_score[neighbor_y, neighbor_x]:
-                    came_from[(neighbor_x, neighbor_y)] = current_point
-                    g_score[neighbor_y, neighbor_x] = tentative_g_score
-                    f_score = tentative_g_score + self.calculate_heuristic(
-                        (neighbor_x, neighbor_y),
-                        (goal_x, goal_y),
-                        cost_map
-                    )
-                    if (neighbor_x, neighbor_y) not in [item[1] for item in open_set]:
-                        open_set.append((f_score, (neighbor_x, neighbor_y)))
-
-        # 如果未找到路徑，返回目標點
-        rospy.logwarn("A* failed to find a path.")
-        return self.image_to_gazebo_coords(goal_x, goal_y)
+        optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
+        return optimized_gazebo_x, optimized_gazebo_y
 
     def optimize_waypoints_with_a_star(self):
         """
-        使用改進的 A* 方法優化路徑點，允許靈活偏離目標點。
+        使用 A* 算法來優化路徑點，但僅在尚未計算過時執行
         """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Using previously calculated optimized waypoints.")
-            self.waypoints = self.optimized_waypoints
+            self.waypoints = self.optimized_waypoints  # 使用已計算的優化路徑
             return
 
-        rospy.loginfo("Calculating optimized waypoints for the first time using flexible A*.")
+        rospy.loginfo("Calculating optimized waypoints for the first time using A*.")
         optimized_waypoints = []
-        total_waypoints = len(self.waypoints) - 1
-
-        for i in range(total_waypoints):
+        for i in range(len(self.waypoints) - 1):
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-
-            rospy.loginfo(f"Optimizing segment {i + 1}/{total_waypoints}: Start {start_point} -> Goal {goal_point}")
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, self.cost_map, start_point, goal_point)
+            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
             optimized_waypoints.append(optimized_point)
 
+        # 最後一個終點加入到優化後的路徑點列表中
         optimized_waypoints.append(self.waypoints[-1])
+        
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
-        self.optimized_waypoints_calculated = True
+        print(self.waypoints)
+        self.optimized_waypoints_calculated = True  # 設定標記，表示已計算過
 
         save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
         self.visualize_complete_path(self.optimized_waypoints, save_path=save_path)
@@ -653,15 +620,6 @@ class GazeboEnv:
         # use_deep_rl_control = any(
             # self.waypoint_failures.get(i, 0) > 1 for i in failure_range
         # )
-
-        collision = detect_collision(robot_x, robot_y, robot_yaw, obstacles)
-        # if not use_deep_rl_control:
-        if collision:
-            self.waypoint_failures[self.current_waypoint_index] += 1
-            print('touch the obstacles')
-            reward -= 10.0
-            self.reset()
-            return self.state, reward, True, {}
         
         # 处理无进展的情况
         if distance_moved < 0.05:
@@ -999,17 +957,6 @@ def is_point_in_polygon(point, polygon):
         if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
             inside = not inside
     return inside
-
-def detect_collision(robot_x, robot_y, robot_yaw, obstacles):
-    # 计算边界框
-    bounding_box = calculate_bounding_box(robot_x, robot_y, robot_yaw,)
-
-    # 遍历障碍物
-    for obstacle in obstacles:
-        # 检查是否在边界内
-        if is_point_in_polygon(obstacle, bounding_box):
-            return True
-    return False
 
 def select_action_with_exploration(env, state, model, epsilon, dwa=None, obstacles=None):
     if random.random() < epsilon:
