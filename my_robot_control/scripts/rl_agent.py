@@ -667,9 +667,9 @@ class GazeboEnv:
             max(0, self.current_waypoint_index - 6),
             min(len(self.waypoints), self.current_waypoint_index + 2)
         )
-        # use_deep_rl_control = any(
-            # self.waypoint_failures.get(i, 0) > 1 for i in failure_range
-        # )
+        use_deep_rl_control = any(
+            self.waypoint_failures.get(i, 0) > 1 for i in failure_range
+        )
         
         # 处理无进展的情况
         if distance_moved < 0.05:
@@ -889,7 +889,7 @@ class DWA:
     def __init__(self, goal):
         self.max_speed = 2
         self.max_yaw_rate = 0.5
-        self.dt = 0.2
+        self.dt = 0.1
         self.predict_time = 3.0
         self.goal = goal
         self.robot_radius = 0.3
@@ -1002,23 +1002,19 @@ def is_point_in_polygon(point, polygon):
             inside = not inside
     return inside
 
-def select_action_with_exploration(env, state, model, epsilon, dwa=None, obstacles=None):
-    if random.random() < epsilon:
-        if dwa is None or obstacles is None:
-            raise ValueError("DWA controller or obstacles is not provided")
-        print("[Exploration] Using DWA for action generation.")
+def select_action_with_exploration(env, state, dwa=None, obstacles=None):
+    if dwa is None or obstacles is None:
+        raise ValueError("DWA controller or obstacles is not provided")
+    print("[Exploration] Using DWA for action generation.")
 
-        robot_x, robot_y, robot_yaw = env.get_robot_position()
-        current_speed = env.last_twist.linear.x
-        current_omega = env.last_twist.angular.z
+    robot_x, robot_y, robot_yaw = env.get_robot_position()
+    current_speed = env.last_twist.linear.x
+    current_omega = env.last_twist.angular.z
 
-        print('robot x = ', robot_x, 'robot_y = ', robot_y)
-        state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
-        action, _ = dwa.plan(state, obstacles)  
-        # action = torch.tensor(action, dtype=torch.float32).to(device)
-    else:
-        print('action by RL')
-        action = model.act(state)
+    print('robot x = ', robot_x, 'robot_y = ', robot_y)
+    state = [robot_x, robot_y, robot_yaw, current_speed, current_omega]
+    action, _ = dwa.plan(state, obstacles)  
+    # action = torch.tensor(action, dtype=torch.float32).to(device)
     return action
 
 def save_movement_log_to_csv(movement_log, filename= f"/home/chihsun/catkin_ws/src/my_robot_control/new_waypoint/move_log{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"):
@@ -1057,7 +1053,6 @@ def main():
 
         total_reward = 0
         start_time = time.time()
-        use_rl = False  # Flag to determine if RL is used in this episode
 
         for time_step in range(1500):
             robot_x, robot_y, robot_yaw = env.get_robot_position()
@@ -1083,8 +1078,16 @@ def main():
             )
             failure_counts = {i: env.waypoint_failures.get(i, 0) for i in failure_range}
 
-            action_np = env.calculate_action_pure_pursuit()
-            print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
+            use_deep_rl_control = any(
+                env.waypoint_failures.get(i, 0) > 1 for i in failure_range
+            )
+
+            if use_deep_rl_control:
+                action_np = select_action_with_exploration(env, state ,dwa=dwa,obstacles=obstacles)
+                print(f"DWA Action at waypoint {env.current_waypoint_index}: {action_np}")
+            else:
+                action_np = env.calculate_action_pure_pursuit()
+                print(f"A* Action at waypoint {env.current_waypoint_index}: {action_np}")
 
             next_state, reward, done, _ = env.step(action_np, obstacles=obstacles)
 
