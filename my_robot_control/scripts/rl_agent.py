@@ -15,8 +15,8 @@ import random
 import csv
 import cv2
 import datetime
-from scipy.ndimage import distance_transform_edt
 import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -62,7 +62,6 @@ class GazeboEnv:
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
-        self.collision_detected = False
         self.previous_robot_position = None  # 初始化 previous_robot_position 為 None
         self.previous_distance_to_goal = None  # 初始化 previous_distance_to_goal 為 None
 
@@ -89,12 +88,9 @@ class GazeboEnv:
             png_path = map_metadata['image'].replace(".pgm", ".png")  # 修改為png檔案路徑
             
             # 使用 PIL 讀取PNG檔
-            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1203.png').convert('L')
+            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map1205.png').convert('L')
             self.slam_map = np.array(png_image)  # 轉為NumPy陣列
 
-        # 计算距离变换：障碍物为0，其它区域为1
-        binary_map = (self.slam_map >= 250).astype(np.uint8)  # 可行区域设为1，障碍物设为0
-        self.distance_transform = distance_transform_edt(binary_map) * self.map_resolution
         self.generate_costmap()
     
     def generate_costmap(self):
@@ -110,8 +106,8 @@ class GazeboEnv:
         
         self.cost_map = np.zeros_like(self.slam_map)
         
-        inner_dilation = 5
-        outer_dilation = 15
+        inner_dilation = 2
+        outer_dilation = 5
         
         inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
         inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
@@ -324,11 +320,36 @@ class GazeboEnv:
         gazebo_x = (img_x - 2000) / 20.0
         gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
+    
+    def check_line_for_obstacles(self, start, end, num_points=20):
+        """
+        检查两点之间是否存在障碍物。
+        使用线性插值在 start 和 end 之间生成点，并检查这些点是否在障碍物区域。
+        """
+        x1, y1 = start
+        x2, y2 = end
 
-    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, grid_size=50):
+        # 生成线性插值点
+        x_vals = np.linspace(x1, x2, num_points)
+        y_vals = np.linspace(y1, y2, num_points)
+
+        for x, y in zip(x_vals, y_vals):
+            x, y = int(round(x)), int(round(y))
+            if not (0 <= x < self.cost_map.shape[1] and 0 <= y < self.cost_map.shape[0]):
+                continue
+            # 如果点在障碍物区域，返回 True
+            if self.cost_map[y, x] >= 254:  # 254 表示障碍物的高代价
+                return True
+        return False
+    
+    def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
         """
-        使用 A* 算法优化路径，加入平滑性和基于障碍物距离的代价地图考量。
+        使用 KDTree 计算点 (x, y) 到障碍物的最小距离。
         """
+        distance, _ = kd_tree.query((x, y))  # 查询最近邻距离
+        return distance
+
+    def a_star_optimize_waypoint(self, png_image, start_point, goal_point, kd_tree, grid_size=50):
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
@@ -340,6 +361,13 @@ class GazeboEnv:
                 if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
                     continue
 
+                # 如果当前点与上一个点之间存在障碍物，直接跳过
+                if self.optimized_waypoints:
+                    prev_point = self.optimized_waypoints[-1]
+                    prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+                    if self.check_line_for_obstacles((prev_img_x, prev_img_y), (x, y)):
+                        continue
+
                 # 计算代价地图权重
                 costmap_cost = self.cost_map[y, x]
 
@@ -349,25 +377,28 @@ class GazeboEnv:
                 # 当前点到目标点的 h 值（启发式）
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 计算平滑性代价：与上一个点的角度变化
-                if self.optimized_waypoints:  # 如果有之前的路径点，计算角度变化
+                # 平滑性代价调整，使用差分公式
+                if len(self.optimized_waypoints) >= 2:
+                    prev_prev_point = self.optimized_waypoints[-2]
+                    prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
                     prev_point = self.optimized_waypoints[-1]
                     prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
-                    angle_change = np.arctan2(y - prev_img_y, x - prev_img_x) - np.arctan2(prev_img_y - img_start_y, prev_img_x - img_start_x)
-                    angle_change = np.abs(np.arctan2(np.sin(angle_change), np.cos(angle_change)))  # 确保角度在[-π, π]
-                    smoothness_cost = angle_change * 10  # 平滑性权重
+
+                    # 差分计算
+                    delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
+                    delta_xi1 = (x - prev_img_x, y - prev_img_y)
+                    smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
                 else:
                     smoothness_cost = 0
 
-                # 基于距离的代价
-                obstacle_distance = self.distance_transform[y, x]
-                if obstacle_distance < 1.0:  # 如果距离障碍物小于1米，增加惩罚
-                    distance_cost = (1.0 / (obstacle_distance + 1e-5)) * 20  # 防止除零
-                else:
-                    distance_cost = 0
+                # 基于 KDTree 计算最小障碍物距离
+                obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+
+                # 距离越远越好，将最短距离作为代价的一部分
+                distance_penalty = -obstacle_distance # 负值表示距离越大代价越低
 
                 # 计算总的代价 f
-                f = g + h + costmap_cost * 0.5 + smoothness_cost ** 2 + distance_cost
+                f = g + h * 0.1 + costmap_cost * 0.5 + smoothness_cost + distance_penalty * 10 
 
                 if f < best_f_score:
                     best_f_score = f
@@ -386,16 +417,27 @@ class GazeboEnv:
             return
 
         rospy.loginfo("Calculating optimized waypoints for the first time using A*.")
+
+        # 使用 KDTree 构建障碍物点索引（仅构建一次）
+        obstacle_points = [
+            (x, y) for y in range(self.slam_map.shape[0]) for x in range(self.slam_map.shape[1])
+            if self.slam_map[y, x] < 250
+        ]
+        if not obstacle_points:
+            rospy.logwarn("No obstacles detected in map.")
+            obstacle_points = [(0, 0)]  # 默认无障碍物情况
+        kd_tree = KDTree(obstacle_points)
+
         optimized_waypoints = []
         for i in range(len(self.waypoints) - 1):
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
-            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point)
+            optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point, kd_tree)
             optimized_waypoints.append(optimized_point)
 
         # 最後一個終點加入到優化後的路徑點列表中
         optimized_waypoints.append(self.waypoints[-1])
-        
+
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
         print(self.waypoints)
@@ -635,11 +677,6 @@ class GazeboEnv:
         else:
             self.no_progress_steps = 0
         
-        if self.collision_detected:
-            rospy.loginfo('collision detectd! resetting')
-            reward -= 10.0
-            self.reset()
-            return self.state, reward, True, {}
         # 发布控制命令
         twist = Twist()
         twist.linear.x = linear_speed
@@ -708,7 +745,6 @@ class GazeboEnv:
         self.previous_yaw_error = 0
         self.no_progress_steps = 0
         self.previous_distance_to_goal = None
-        self.collision_detected = False
         return self.state
 
 
