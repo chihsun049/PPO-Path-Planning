@@ -4,14 +4,13 @@ import numpy as np
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Imu
 from gazebo_msgs.srv import SetModelState, GetModelState
-from gazebo_msgs.msg import ModelState, ContactsState
+from gazebo_msgs.msg import ModelState
 from collections import namedtuple
 import tf
 from tf.transformations import quaternion_from_euler
 import time
 import yaml
 from PIL import Image
-import random
 import csv
 import cv2
 import datetime
@@ -58,7 +57,7 @@ class GazeboEnv:
         self.target_x = -7.2213
         self.target_y = -1.7003  
         self.waypoints = self.generate_waypoints()
-        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器任要奏的大致距離
+        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器人要走的大致距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
@@ -370,7 +369,7 @@ class GazeboEnv:
                     prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
                     if self.check_line_for_obstacles((prev_img_x, prev_img_y), (x, y)):
                         continue
-
+                
                 # 计算代价地图权重
                 costmap_cost = self.cost_map[y, x]
 
@@ -385,7 +384,7 @@ class GazeboEnv:
                 # 当前点到目标点的 h 值（启发式）
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 平滑性代价调整（考慮彎道的連續性）
+                # 平滑性代价调整
                 if len(self.optimized_waypoints) >= 2:
                     prev_prev_point = self.optimized_waypoints[-2]
                     prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
@@ -396,24 +395,16 @@ class GazeboEnv:
                     delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
                     delta_xi1 = (x - prev_img_x, y - prev_img_y)
                     smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
-
-                    # 增加對彎道連續性的懲罰
-                    angle_change = np.arctan2(delta_xi1[1], delta_xi1[0]) - np.arctan2(delta_xi[1], delta_xi[0])
-                    angle_change = np.abs(np.arctan2(np.sin(angle_change), np.cos(angle_change)))
-                    continuity_cost = angle_change * 50  # 增加對彎道的懲罰
-                    smoothness_cost += continuity_cost
-                    smoothness_cost = smoothness_cost / 10
+                    smoothness_cost = smoothness_cost
+                    
                 else:
                     smoothness_cost = 0
 
                 # 基于 KDTree 计算最小障碍物距离
                 obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
 
-                # 距離越遠越好，但彎道放寬要求
-                if len(self.optimized_waypoints) >= 2:
-                    distance_penalty = -obstacle_distance * 8 if smoothness_cost < 500 else -obstacle_distance * 5
-                else:
-                    distance_penalty = -obstacle_distance * 10
+                # 距离越远越好，将最短距离作为代价的一部分
+                distance_penalty = -obstacle_distance * 100
 
                 # 计算总的代价 f
                 f = g + h * 0.1 + costmap_cost * 1 + smoothness_cost * 10 + distance_penalty * 10
