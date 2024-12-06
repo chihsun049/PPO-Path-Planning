@@ -803,7 +803,7 @@ class GazeboEnv:
         lookahead_distance = 1.2 + 0.5 * linear_speed  # 根據速度調整前視距離
 
         # 定義角度範圍，以當前車輛的yaw為中心
-        angle_range = np.deg2rad(30)  # ±40度的範圍
+        angle_range = np.deg2rad(30)  # ±30度的範圍
         closest_index = None
         min_distance = float('inf')
 
