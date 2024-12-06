@@ -357,7 +357,7 @@ class GazeboEnv:
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
         g_scores = {}  # 记录每个点的 g 值
-        g_scores[(img_start_x, img_start_y)] = 0
+        g_scores[(img_start_x, img_start_y)] = 0  # 起点的 g 值为 0
 
         for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
             for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
@@ -370,21 +370,22 @@ class GazeboEnv:
                     prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
                     if self.check_line_for_obstacles((prev_img_x, prev_img_y), (x, y)):
                         continue
-                
+
                 # 计算代价地图权重
                 costmap_cost = self.cost_map[y, x]
 
                 # 当前点的移动距离
+                prev_g = g_scores.get((img_start_x, img_start_y), float('inf'))  # 获取上一步的 g 值
                 step_distance = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
 
                 # 累积 g 值
-                g = g_scores.get((img_start_x, img_start_y), float('inf')) + step_distance
+                g = prev_g + step_distance
                 g_scores[(x, y)] = g
 
                 # 当前点到目标点的 h 值（启发式）
                 h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 平滑性代价调整
+                # 平滑性代价调整（考慮彎道的連續性）
                 if len(self.optimized_waypoints) >= 2:
                     prev_prev_point = self.optimized_waypoints[-2]
                     prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
@@ -395,15 +396,24 @@ class GazeboEnv:
                     delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
                     delta_xi1 = (x - prev_img_x, y - prev_img_y)
                     smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
-                    smoothness_cost = smoothness_cost * 10000
+
+                    # 增加對彎道連續性的懲罰
+                    angle_change = np.arctan2(delta_xi1[1], delta_xi1[0]) - np.arctan2(delta_xi[1], delta_xi[0])
+                    angle_change = np.abs(np.arctan2(np.sin(angle_change), np.cos(angle_change)))
+                    continuity_cost = angle_change * 50  # 增加對彎道的懲罰
+                    smoothness_cost += continuity_cost
+                    smoothness_cost = smoothness_cost / 10
                 else:
                     smoothness_cost = 0
 
                 # 基于 KDTree 计算最小障碍物距离
                 obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
 
-                # 距离越远越好，将最短距离作为代价的一部分
-                distance_penalty = -obstacle_distance
+                # 距離越遠越好，但彎道放寬要求
+                if len(self.optimized_waypoints) >= 2:
+                    distance_penalty = -obstacle_distance * 8 if smoothness_cost < 500 else -obstacle_distance * 5
+                else:
+                    distance_penalty = -obstacle_distance * 10
 
                 # 计算总的代价 f
                 f = g + h * 0.1 + costmap_cost * 1 + smoothness_cost * 10 + distance_penalty * 10
@@ -442,6 +452,7 @@ class GazeboEnv:
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
             optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point, kd_tree)
             optimized_waypoints.append(optimized_point)
+            self.optimized_waypoints = optimized_waypoints
 
         # 最後一個終點加入到優化後的路徑點列表中
         optimized_waypoints.append(self.waypoints[-1])
