@@ -16,6 +16,7 @@ import cv2
 import datetime
 import matplotlib.pyplot as plt
 from scipy.spatial import KDTree
+from skimage.draw import line
 
 # 超參數
 REFERENCE_DISTANCE_TOLERANCE = 0.65
@@ -320,26 +321,35 @@ class GazeboEnv:
         gazebo_y = (2000 - img_y) / 20.0
         return gazebo_x, gazebo_y
     
-    def check_line_for_obstacles(self, start, end, num_points=20):
+    def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
         """
-        检查两点之间是否存在障碍物。
-        使用线性插值在 start 和 end 之间生成点，并检查这些点是否在障碍物区域。
+        檢查從 current 到 neighbor 的線段是否無障礙物。
+        
+        參數：
+        - png_image: 2D 地圖數組，障礙物區域值小於 safe_threshold。
+        - current: 當前點坐標 (x, y)。
+        - neighbor: 鄰居點坐標 (x, y)。
+        - safe_threshold: 無障礙的安全值閾值，默認為 230。
+        
+        返回：
+        - True: 無障礙。
+        - False: 存在障礙物。
         """
-        x1, y1 = start
-        x2, y2 = end
+        current = np.array(current, dtype=np.int32)
+        neighbor = np.array(neighbor, dtype=np.int32)
 
-        # 生成线性插值点
-        x_vals = np.linspace(x1, x2, num_points)
-        y_vals = np.linspace(y1, y2, num_points)
+        # 使用 Bresenham 算法生成線段
+        rr, cc = line(current[1], current[0], neighbor[1], neighbor[0])
 
-        for x, y in zip(x_vals, y_vals):
-            x, y = int(round(x)), int(round(y))
-            if not (0 <= x < self.cost_map.shape[1] and 0 <= y < self.cost_map.shape[0]):
-                continue
-            # 如果点在障碍物区域，返回 True
-            if self.cost_map[y, x] >= 254:  # 254 表示障碍物的高代价
-                return True
-        return False
+        # 檢查是否越界
+        if np.any((rr < 0) | (rr >= png_image.shape[0]) | (cc < 0) | (cc >= png_image.shape[1])):
+            return False
+
+        # 檢查線段上的像素是否有障礙物
+        if np.any(png_image[rr, cc] < safe_threshold):
+            return False
+
+        return True
     
     def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
         """
@@ -363,13 +373,13 @@ class GazeboEnv:
                 if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
                     continue
 
-                # 如果当前点与上一个点之间存在障碍物，直接跳过
+                # 检查从上一个路径点到当前候选点是否通畅
                 if self.optimized_waypoints:
                     prev_point = self.optimized_waypoints[-1]
                     prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
-                    if self.check_line_for_obstacles((prev_img_x, prev_img_y), (x, y)):
-                        continue
-                
+                    if not self.is_line_free(png_image, (prev_img_x, prev_img_y), (x, y)):
+                        continue  # 如果有障碍物，跳过该点
+
                 # 计算代价地图权重
                 costmap_cost = self.cost_map[y, x]
 
@@ -395,8 +405,7 @@ class GazeboEnv:
                     delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
                     delta_xi1 = (x - prev_img_x, y - prev_img_y)
                     smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
-                    smoothness_cost = smoothness_cost
-                    
+                    smoothness_cost = smoothness_cost * 0.01
                 else:
                     smoothness_cost = 0
 
@@ -404,10 +413,10 @@ class GazeboEnv:
                 obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
 
                 # 距离越远越好，将最短距离作为代价的一部分
-                distance_penalty = -obstacle_distance * 100
+                distance_penalty = -obstacle_distance
 
                 # 计算总的代价 f
-                f = g + h * 0.1 + costmap_cost * 1 + smoothness_cost * 10 + distance_penalty * 10
+                f = g + h + costmap_cost * 100 + smoothness_cost * 9 + distance_penalty * 4
 
                 if f < best_f_score:
                     best_f_score = f
@@ -800,7 +809,7 @@ class GazeboEnv:
 
         # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 1.2 + 0.5 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 1.2 + 0.1 * linear_speed  # 根據速度調整前視距離
 
         # 定義角度範圍，以當前車輛的yaw為中心
         angle_range = np.deg2rad(30)  # ±30度的範圍
