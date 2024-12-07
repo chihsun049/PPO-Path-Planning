@@ -296,8 +296,7 @@ class GazeboEnv:
             (-10.1229, -1.3051),
             (-9.1283, -1.4767),
             (-8.1332, -1.2563),
-            (self.target_x, self.target_y)
-]
+            (self.target_x, self.target_y)]
         return waypoints
     
     def calculate_waypoint_distances(self):
