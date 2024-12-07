@@ -32,16 +32,6 @@ CONTROL_HORIZON = 10
 # device = torch.device("cpu")
 Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
 
-def grid_filter(obstacles, grid_size=0.5):
-    obstacles = np.array(obstacles)
-    # 按照 grid_size 取整
-    grid_indices = (obstacles // grid_size).astype(int)
-    # 找到唯一的网格
-    unique_indices = np.unique(grid_indices, axis=0)
-    # 返回网格中心点
-    filtered_points = unique_indices * grid_size + grid_size / 2
-    return filtered_points
-
 class GazeboEnv:
     def __init__(self, model):
         rospy.init_node('gazebo_rl_agent', anonymous=True)
@@ -1077,6 +1067,16 @@ def save_movement_log_to_csv(movement_log, filename= f"/home/chihsun/catkin_ws/s
         for log in movement_log:
             writer.writerow(log)
     print(f"Movement log saved to {filename}")
+
+def grid_filter(obstacles, grid_size=0.5):
+    obstacles = np.array(obstacles)
+    # 按照 grid_size 取整
+    grid_indices = (obstacles // grid_size).astype(int)
+    # 找到唯一的网格
+    unique_indices = np.unique(grid_indices, axis=0)
+    # 返回网格中心点
+    filtered_points = unique_indices * grid_size + grid_size / 2
+    return filtered_points
 
 def main():
     env = GazeboEnv(None)
