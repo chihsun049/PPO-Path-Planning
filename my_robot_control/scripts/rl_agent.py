@@ -59,6 +59,7 @@ class GazeboEnv:
         self.target_y = -1.7003  
         self.waypoints = self.generate_waypoints()
         self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器人要走的大致距離
+        self.total_path_distance = sum(self.waypoint_distances)  # 計算總路徑距離
         self.current_waypoint_index = 0
         self.last_twist = Twist()
         self.epsilon = 0.05
@@ -106,8 +107,8 @@ class GazeboEnv:
         
         self.cost_map = np.zeros_like(self.slam_map)
         
-        inner_dilation = 2
-        outer_dilation = 5
+        inner_dilation = 3
+        outer_dilation = 6
         
         inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
         inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
@@ -359,68 +360,110 @@ class GazeboEnv:
         return distance
 
     def a_star_optimize_waypoint(self, png_image, start_point, goal_point, kd_tree, grid_size=50):
+        if not hasattr(self, 'g_scores'):
+            self.g_scores = {}  # 初始化 g_scores 属性，用于保存跨路径点的累积距离
+
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
+
+        # 初始化起点 g 值，如果不存在则设为 0
+        if (img_start_x, img_start_y) not in self.g_scores:
+            self.g_scores[(img_start_x, img_start_y)] = 0
+
+        # 获取当前参考点的索引
+        current_wp_index = self.current_waypoint_index
+
+        # 确保索引范围有效
+        if current_wp_index >= len(self.waypoint_distances):
+            rospy.logerr("Waypoint index out of range for h normalization.")
+            return start_point  # 如果发生错误，返回起点
+
+        # 分母从 self.waypoint_distances 获取当前参考点到目标参考点的距离
+        h_normalization_denominator = self.waypoint_distances[current_wp_index]
 
         # 初始化
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
-        g_scores = {}  # 记录每个点的 g 值
-        g_scores[(img_start_x, img_start_y)] = 0  # 起点的 g 值为 0
 
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < png_image.shape[1] and 0 <= y < png_image.shape[0]):
-                    continue
+        # 獲取範圍內所有候選點
+        candidate_points = [
+            (xi, yi)
+            for xi in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2)
+            for yi in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2)
+            if 0 <= xi < png_image.shape[1] and 0 <= yi < png_image.shape[0]
+        ]
 
-                # 检查从上一个路径点到当前候选点是否通畅
-                if self.optimized_waypoints:
-                    prev_point = self.optimized_waypoints[-1]
-                    prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
-                    if not self.is_line_free(png_image, (prev_img_x, prev_img_y), (x, y)):
-                        continue  # 如果有障碍物，跳过该点
+        # 查詢所有候選點到障礙物的距離
+        if candidate_points:
+            distances = kd_tree.query(candidate_points)[0]  # 距離列表
+            max_obstacle_distance = np.max(distances)  # 最大距離
+        else:
+            max_obstacle_distance = 1  # 避免分母為 0
 
-                # 计算代价地图权重
-                costmap_cost = self.cost_map[y, x]
+        for x, y in candidate_points:
+            # 检查从上一个路径点到当前候选点是否通畅
+            if self.optimized_waypoints:
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+                if not self.is_line_free(png_image, (prev_img_x, prev_img_y), (x, y)):
+                    continue  # 如果有障碍物，跳过该点
 
-                # 当前点的移动距离
-                prev_g = g_scores.get((img_start_x, img_start_y), float('inf'))  # 获取上一步的 g 值
-                step_distance = np.sqrt((x - img_start_x) ** 2 + (y - img_start_y) ** 2)
+            # 计算代价地图权重
+            costmap_cost = self.cost_map[y, x]
 
-                # 累积 g 值
-                g = prev_g + step_distance
-                g_scores[(x, y)] = g
+            # 当前点的移动距离计算基于车辆的实际路径点
+            if len(self.optimized_waypoints) > 0:
+                last_waypoint = self.optimized_waypoints[-1]
+                last_img_x, last_img_y = self.gazebo_to_image_coords(*last_waypoint)
+                step_distance = np.sqrt((x - last_img_x) ** 2 + (y - last_img_y) ** 2)
+                g = self.g_scores.get((last_img_x, last_img_y), 0) + step_distance
+            else:
+                step_distance = 0
+                g = self.g_scores[(img_start_x, img_start_y)]
 
-                # 当前点到目标点的 h 值（启发式）
-                h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
+            self.g_scores[(x, y)] = g
 
-                # 平滑性代价调整
-                if len(self.optimized_waypoints) >= 2:
-                    prev_prev_point = self.optimized_waypoints[-2]
-                    prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
-                    prev_point = self.optimized_waypoints[-1]
-                    prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+            # 正規化 g 值
+            g_normalized = (g * 0.05) / self.total_path_distance
 
-                    # 差分计算
-                    delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
-                    delta_xi1 = (x - prev_img_x, y - prev_img_y)
-                    smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
-                    smoothness_cost = smoothness_cost * 0.01
-                else:
-                    smoothness_cost = 0
+            # 当前点到目标点的 h 值（启发式）
+            h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
 
-                # 基于 KDTree 计算最小障碍物距离
-                obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+            # 正規化 h 值，使用當前點到參考點的距離作為分母
+            h_normalized = (h * 0.05) / h_normalization_denominator if h_normalization_denominator > 0 else h
 
-                # 距离越远越好，将最短距离作为代价的一部分
-                distance_penalty = -obstacle_distance
+            # 平滑性代价调整
+            if len(self.optimized_waypoints) >= 2:
+                prev_prev_point = self.optimized_waypoints[-2]
+                prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
 
-                # 计算总的代价 f
-                f = g + h + costmap_cost * 1000 + smoothness_cost * 9 + distance_penalty * 4
+                # 差分计算
+                delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
+                delta_xi1 = (x - prev_img_x, y - prev_img_y)
+                smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
 
-                if f < best_f_score:
-                    best_f_score = f
-                    best_point = (x, y)
+                # 正規化平滑性代價
+                max_smoothness_cost = grid_size ** 2  # 假设最大位移为 grid_size 的平方和
+                smoothness_cost_normalized = smoothness_cost / max_smoothness_cost if max_smoothness_cost > 0 else 0
+            else:
+                smoothness_cost_normalized = 0
+            
+            print(smoothness_cost_normalized)
+
+            # 基于 KDTree 计算最小障碍物距离
+            obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+
+            # 正規化距离代价
+            distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
+
+            # 计算总的代价 f
+            f = ( g_normalized * 1 + h_normalized * 0.1 ) * 0.33 + ( smoothness_cost_normalized * 9 + distance_penalty_normalized * 4 ) * 0.67 + costmap_cost
+
+            if f < best_f_score:
+                best_f_score = f
+                best_point = (x, y)
 
         optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
         return optimized_gazebo_x, optimized_gazebo_y
@@ -809,7 +852,7 @@ class GazeboEnv:
 
         # 動態調整前視距離（lookahead distance）
         linear_speed = np.linalg.norm([self.last_twist.linear.x, self.last_twist.linear.y])
-        lookahead_distance = 1.2 + 0.1 * linear_speed  # 根據速度調整前視距離
+        lookahead_distance = 1.2 + 0.5 * linear_speed  # 根據速度調整前視距離
 
         # 定義角度範圍，以當前車輛的yaw為中心
         angle_range = np.deg2rad(30)  # ±30度的範圍
@@ -856,11 +899,11 @@ class GazeboEnv:
 
         # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
-            linear_speed = 0.5
+            linear_speed = 1.6
         elif np.abs(yaw_error) > 0.1:
-            linear_speed = 1.0
+            linear_speed = 1.8
         else:
-            linear_speed = 3
+            linear_speed = 2.0
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
