@@ -30,6 +30,19 @@ class PathOptimizer:
         self.result_folder = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path_img/'
         os.makedirs(self.result_folder, exist_ok=True)
         self.result_metrics_file = os.path.join(self.result_folder, 'path_metrics.csv')
+    
+    def reset_state(self):
+        """
+        重置路徑規劃的狀態變數，每次規劃新路徑前需要調用。
+        """
+        self.target_x = -7.2213
+        self.target_y = -1.7003
+        self.waypoints = self.generate_waypoints()
+        self.optimized_waypoints = []
+        self.waypoint_distances = self.calculate_waypoint_distances()  # 計算路徑點之間的距離
+        self.total_path_distance = sum(self.waypoint_distances)       # 總路徑距離
+        self.current_waypoint_index = 0                               # 當前路徑點索引
+        self.g_scores = {}                                            # g 值累積記錄
 
     def load_slam_map(self, yaml_path):
         with open(yaml_path, 'r') as file:
@@ -290,7 +303,7 @@ class PathOptimizer:
 
     def a_star_optimize_waypoint(
         self, png_image, start_point, goal_point, kd_tree, 
-        g_weight=1, h_weight=0.1, smoothness_weight=9, distance_penalty_weight=4, grid_size=50):
+        g_weight=1, h_weight=1, smoothness_weight=1, distance_penalty_weight=1, grid_size=50):
         if not hasattr(self, 'g_scores'):
             self.g_scores = {}  # 初始化 g_scores 属性，用于保存跨路径点的累积距离
 
@@ -389,8 +402,8 @@ class PathOptimizer:
 
             # 计算总的代价 f
             f = (
-                (g_normalized * g_weight + h_normalized * h_weight) * 0.33 +
-                (smoothness_cost_normalized * smoothness_weight + distance_penalty_normalized * distance_penalty_weight) * 0.67 +
+                (g_normalized * g_weight + h_normalized * h_weight) * 0.34 +
+                smoothness_cost_normalized * smoothness_weight * 0.33 + distance_penalty_normalized * distance_penalty_weight * 0.33 +
                 costmap_cost
             )
 
@@ -402,16 +415,17 @@ class PathOptimizer:
         return optimized_gazebo_x, optimized_gazebo_y
 
     def optimize_waypoints_with_a_star(self, g_weight, smoothness_weight, distance_penalty_weight):
+        # 每次規劃新路徑前重置狀態
+        self.reset_state()
+        
         obstacle_points = [
             (x, y) for y in range(self.slam_map.shape[0]) for x in range(self.slam_map.shape[1])
             if self.slam_map[y, x] < 250
         ]
         kd_tree = KDTree(obstacle_points)
 
-        optimized_waypoints = []
         for i in range(len(self.waypoints) - 1):
-            # 更新 current_waypoint_index
-            self.current_waypoint_index = i
+            self.current_waypoint_index = i  # 更新當前路徑點索引
 
             start_point = self.waypoints[i]
             goal_point = self.waypoints[i + 1]
@@ -419,14 +433,13 @@ class PathOptimizer:
             optimized_point = self.a_star_optimize_waypoint(
                 self.slam_map, start_point, goal_point, kd_tree,
                 g_weight=g_weight,
-                h_weight=1,  # 可调整
+                h_weight=1,
                 smoothness_weight=smoothness_weight,
                 distance_penalty_weight=distance_penalty_weight
             )
-            optimized_waypoints.append(optimized_point)
+            self.optimized_waypoints.append(optimized_point)
 
-        optimized_waypoints.append(self.waypoints[-1])
-        self.optimized_waypoints = optimized_waypoints
+        self.optimized_waypoints.append(self.waypoints[-1])  # 添加終點
     
     def visualize_complete_path(self, waypoints, save_path):
         """

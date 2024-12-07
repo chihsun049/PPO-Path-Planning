@@ -438,8 +438,6 @@ class GazeboEnv:
                 smoothness_cost_normalized = smoothness_cost / max_smoothness_cost if max_smoothness_cost > 0 else 0
             else:
                 smoothness_cost_normalized = 0
-            
-            print(smoothness_cost_normalized)
 
             # 基于 KDTree 计算最小障碍物距离
             obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
@@ -448,7 +446,7 @@ class GazeboEnv:
             distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
 
             # 计算总的代价 f
-            f = ( g_normalized * 1 + h_normalized * 0.1 ) * 0.33 + ( smoothness_cost_normalized * 9 + distance_penalty_normalized * 4 ) * 0.67 + costmap_cost
+            f = ( g_normalized * 1 + h_normalized * 1) * 0.34 + smoothness_cost_normalized * 1 * 0.33 + distance_penalty_normalized * 1 * 0.33 + costmap_cost
 
             if f < best_f_score:
                 best_f_score = f
@@ -458,9 +456,6 @@ class GazeboEnv:
         return optimized_gazebo_x, optimized_gazebo_y
 
     def optimize_waypoints_with_a_star(self):
-        """
-        使用 A* 算法來優化路徑點，但僅在尚未計算過時執行
-        """
         if self.optimized_waypoints_calculated:
             rospy.loginfo("Using previously calculated optimized waypoints.")
             self.waypoints = self.optimized_waypoints  # 使用已計算的優化路徑
@@ -480,18 +475,18 @@ class GazeboEnv:
 
         optimized_waypoints = []
         for i in range(len(self.waypoints) - 1):
+            # 使用局部變量 `i`，不影響 `self.current_waypoint_index`
             start_point = (self.waypoints[i][0], self.waypoints[i][1])
             goal_point = (self.waypoints[i + 1][0], self.waypoints[i + 1][1])
             optimized_point = self.a_star_optimize_waypoint(self.slam_map, start_point, goal_point, kd_tree)
             optimized_waypoints.append(optimized_point)
-            self.optimized_waypoints = optimized_waypoints
 
         # 最後一個終點加入到優化後的路徑點列表中
         optimized_waypoints.append(self.waypoints[-1])
 
+        # 更新優化後的路徑點
         self.optimized_waypoints = optimized_waypoints
         self.waypoints = optimized_waypoints
-        print(self.waypoints)
         self.optimized_waypoints_calculated = True  # 設定標記，表示已計算過
 
         save_path = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path.png'
