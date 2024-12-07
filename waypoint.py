@@ -43,6 +43,7 @@ class PathOptimizer:
         self.total_path_distance = sum(self.waypoint_distances)       # 總路徑距離
         self.current_waypoint_index = 0                               # 當前路徑點索引
         self.g_scores = {}                                            # g 值累積記錄
+        self.obstacle_distances = []  # 儲存所有路徑點到障礙物的距離
 
     def load_slam_map(self, yaml_path):
         with open(yaml_path, 'r') as file:
@@ -298,7 +299,14 @@ class PathOptimizer:
         return True
 
     def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
-        distance, _ = kd_tree.query((x, y))  # 查询最近邻距离
+        """
+        計算給定點 (x, y) 到最近障礙物的距離。
+        """
+        if kd_tree.data.size == 0:  # 確保 KDTree 中有障礙物數據
+            rospy.logwarn("KDTree is empty. Cannot calculate obstacle distances.")
+            return float('inf')  # 返回無窮大表示無障礙物
+
+        distance, _ = kd_tree.query((x, y))
         return distance
 
     def a_star_optimize_waypoint(
@@ -394,8 +402,11 @@ class PathOptimizer:
             else:
                 smoothness_cost_normalized = 0
 
-            # 基于 KDTree 计算最小障碍物距离
             obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+
+            # 如果障礙物距離為有效值，加入累積列表
+            if obstacle_distance != float('inf'):
+                self.obstacle_distances.append(obstacle_distance)
 
             # 正規化距离代价
             distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
@@ -496,7 +507,6 @@ class PathOptimizer:
 
     def evaluate_path_metrics(self):
         total_length = 0.0
-        obstacle_distances = []
         smoothness = 0.0
 
         for i in range(len(self.optimized_waypoints) - 1):
@@ -508,64 +518,81 @@ class PathOptimizer:
                 x3, y3 = self.optimized_waypoints[i + 2]
                 v1 = np.array([x2 - x1, y2 - y1])
                 v2 = np.array([x3 - x2, y3 - y2])
-                
-                # 修正角度計算，避免除以 0 的情況
-                if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
-                    angle = 0
-                else:
-                    angle = np.arccos(
-                        np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1.0, 1.0)
-                    )
-                smoothness += angle ** 2
 
-        avg_obstacle_distance = np.mean(obstacle_distances) if obstacle_distances else 0
+                # 確保向量長度非零，避免數學錯誤
+                norm_v1 = np.linalg.norm(v1)
+                norm_v2 = np.linalg.norm(v2)
+                if norm_v1 > 0 and norm_v2 > 0:
+                    angle = np.arccos(
+                        np.clip(np.dot(v1, v2) / (norm_v1 * norm_v2), -1.0, 1.0)
+                    )
+                    smoothness += angle ** 2
+                else:
+                    rospy.logwarn(f"Zero-length vector encountered at index {i}. Skipping smoothness calculation for this segment.")
+
+        # 計算平均障礙物距離
+        avg_obstacle_distance = (
+            np.mean(self.obstacle_distances) if self.obstacle_distances else float('inf')
+        )
+
         return total_length, avg_obstacle_distance, smoothness
 
 def main():
     optimizer = PathOptimizer()
 
-    # 生成權重組合
-    weights = range(1, 11)
-    weight_combinations = list(itertools.product(weights, repeat=3))[:1000]
+    # 定义权重范围
+    g_weights = range(1, 11)  # g_weight 从 1 到 10
+    smoothness_weights = range(1, 11)  # smoothness_weight 从 1 到 10
+    distance_penalty_weights = range(1, 11)  # distance_penalty_weight 从 1 到 10
 
     results = []
-    for index, (g_weight, smoothness_weight, distance_penalty_weight) in enumerate(weight_combinations):
-        # 優化路徑
-        optimizer.optimize_waypoints_with_a_star(g_weight, smoothness_weight, distance_penalty_weight)
-        
-        # 計算路徑指標
-        total_length, avg_obstacle_distance, smoothness = optimizer.evaluate_path_metrics()
-        results.append({
-            "index": index,
-            "g_weight": g_weight,
-            "smoothness_weight": smoothness_weight,
-            "distance_penalty_weight": distance_penalty_weight,
-            "total_length": total_length,
-            "avg_obstacle_distance": avg_obstacle_distance,
-            "smoothness": smoothness
-        })
+    for g_weight in g_weights:
+        for smoothness_weight in smoothness_weights:
+            for distance_penalty_weight in distance_penalty_weights:
+                # 优化路径
+                optimizer.optimize_waypoints_with_a_star(
+                    g_weight=g_weight,
+                    smoothness_weight=smoothness_weight,
+                    distance_penalty_weight=distance_penalty_weight
+                )
+                
+                # 计算路径指标
+                total_length, avg_obstacle_distance, smoothness = optimizer.evaluate_path_metrics()
+                results.append({
+                    "g_weight": g_weight,
+                    "smoothness_weight": smoothness_weight,
+                    "distance_penalty_weight": distance_penalty_weight,
+                    "total_length": total_length,
+                    "avg_obstacle_distance": avg_obstacle_distance,
+                    "smoothness": smoothness
+                })
 
-        # 保存每條優化路徑的可視化圖片
-        save_path = os.path.join(
-            optimizer.result_folder,
-            f"optimized_path_g{g_weight}_s{smoothness_weight}_d{distance_penalty_weight}.png"
-        )
-        optimizer.visualize_complete_path(optimizer.optimized_waypoints, save_path=save_path)
+                # 保存每条优化路径的可视化图片
+                save_path = os.path.join(
+                    optimizer.result_folder,
+                    f"optimized_path_g{g_weight}_s{smoothness_weight}_d{distance_penalty_weight}.png"
+                )
+                optimizer.visualize_complete_path(optimizer.optimized_waypoints, save_path=save_path)
 
-    # 保存分析結果
+    # 保存分析结果
     df = pd.DataFrame(results)
     df.to_csv(optimizer.result_metrics_file, index=False)
 
-    # 可視化分析結果（僅分析指標，不再保存路徑圖片）
-    plt.figure(figsize=(15, 5))
+    # 可视化分析结果（根据需求选择展示的指标）
     for metric in ["total_length", "avg_obstacle_distance", "smoothness"]:
-        plt.plot(df["index"], df[metric], label=metric)
-    plt.xlabel("Weight Combination Index")
-    plt.ylabel("Metrics")
-    plt.legend()
-    plt.title("Path Metrics vs. Weight Combinations")
-    plt.savefig(os.path.join(optimizer.result_folder, "metrics_vs_weights.png"))
-    plt.close()
+        plt.figure(figsize=(12, 6))
+        for g_weight in g_weights:
+            subset = df[df["g_weight"] == g_weight]
+            plt.plot(
+                subset["distance_penalty_weight"] + subset["smoothness_weight"] * 10, 
+                subset[metric], label=f"g_weight={g_weight}"
+            )
+        plt.xlabel("Combined Weight Index (distance_penalty + smoothness * 10)")
+        plt.ylabel(metric.replace("_", " ").title())
+        plt.legend()
+        plt.title(f"Path {metric.replace('_', ' ').title()} vs. Weight Combinations")
+        plt.savefig(os.path.join(optimizer.result_folder, f"{metric}_vs_weights.png"))
+        plt.close()
 
 if __name__ == "__main__":
     main()
