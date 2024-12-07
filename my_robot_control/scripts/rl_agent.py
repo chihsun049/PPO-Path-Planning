@@ -416,7 +416,7 @@ class GazeboEnv:
                 distance_penalty = -obstacle_distance
 
                 # 计算总的代价 f
-                f = g + h + costmap_cost * 100 + smoothness_cost * 9 + distance_penalty * 4
+                f = g + h + costmap_cost * 1000 + smoothness_cost * 9 + distance_penalty * 4
 
                 if f < best_f_score:
                     best_f_score = f
