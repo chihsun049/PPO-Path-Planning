@@ -1,48 +1,50 @@
 #!/usr/bin/env python3
 import rospy
 import numpy as np
-from scipy.spatial import KDTree
-import yaml
-from PIL import Image
-import cv2
+import os
+import itertools
+import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
+import cv2
+from scipy.spatial import KDTree
+from PIL import Image
+import yaml
 import time
-from datetime import datetime
+from skimage.draw import line
 
 class PathOptimizer:
     def __init__(self):
-        # 初始化ROS節點
-        rospy.init_node('path_optimizer', anonymous=True)
-        
-        # 加載地圖
+        self.target_x = -7.2213
+        self.target_y = -1.7003
+        self.waypoints = self.generate_waypoints()
+        self.optimized_waypoints = []
+        self.waypoint_distances = self.calculate_waypoint_distances()   # 計算一整圈機器人要走的大致距離
+        self.total_path_distance = sum(self.waypoint_distances)  # 計算總路徑距離
+        self.current_waypoint_index = 0
+
+        # 加载 SLAM 地图
         self.load_slam_map('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924.yaml')
-        
-        # 生成原始路徑點
-        self.original_waypoints = self.generate_waypoints()
-        
-        # 創建KD樹
-        self.kd_tree = self.build_obstacle_kdtree()
-        
-        # 初始化結果保存路徑
+
+        # 初始化结果保存路径
         self.result_folder = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/optimized_path_img/'
-        self.result_file_txt = '/home/chihsun/catkin_ws/src/my_robot_control/scripts/weight_test_results.txt'
+        os.makedirs(self.result_folder, exist_ok=True)
+        self.result_metrics_file = os.path.join(self.result_folder, 'path_metrics.csv')
 
     def load_slam_map(self, yaml_path):
-        """加載SLAM地圖"""
         with open(yaml_path, 'r') as file:
             map_metadata = yaml.safe_load(file)
-            self.map_origin = map_metadata['origin']
-            self.map_resolution = map_metadata['resolution']
-            
-            # 讀取PNG地圖
-            png_image = Image.open('/home/chihsun/catkin_ws/src/my_robot_control/scripts/my_map0924_4.png').convert('L')
+            png_path = map_metadata['image'].replace(".pgm", ".png")
+            png_image = Image.open(png_path).convert('L')
             self.slam_map = np.array(png_image)
 
         self.generate_costmap()
-        print("Map loaded successfully")
 
     def generate_costmap(self):
-        """生成代價地圖"""
+        if self.slam_map is None:
+            rospy.logerr("SLAM map not loaded. Cannot generate costmap.")
+            return False
+
         wall_color = np.array([100, 100, 100])
         wall_color2 = np.array([120, 120, 120])
         
@@ -51,8 +53,8 @@ class PathOptimizer:
         
         self.cost_map = np.zeros_like(self.slam_map)
         
-        inner_dilation = 2
-        outer_dilation = 5
+        inner_dilation = 3
+        outer_dilation = 6
         
         inner_kernel = np.ones((inner_dilation * 2 + 1, inner_dilation * 2 + 1), np.uint8)
         inner_dilated = cv2.dilate(wall_mask, inner_kernel, iterations=1)
@@ -62,80 +64,14 @@ class PathOptimizer:
         
         outer_only = cv2.subtract(outer_dilated, inner_dilated)
         
-        self.cost_map[wall_mask > 0] = 254
-        self.cost_map[inner_dilated > 0] = 190
-        self.cost_map[outer_only > 0] = 100
-
-    def build_obstacle_kdtree(self):
-        """構建障礙物KD樹"""
-        obstacle_points = [
-            (x, y) for y in range(self.slam_map.shape[0]) 
-            for x in range(self.slam_map.shape[1])
-            if self.slam_map[y, x] < 250
-        ]
-        if not obstacle_points:
-            print("Warning: No obstacles detected in map.")
-            obstacle_points = [(0, 0)]
-        return KDTree(obstacle_points)
-
-    def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
-        """轉換Gazebo座標到圖像座標"""
-        img_x = 2000 + gazebo_x * 20
-        img_y = 2000 - gazebo_y * 20
-        return int(img_x), int(img_y)
-
-    def image_to_gazebo_coords(self, img_x, img_y):
-        """轉換圖像座標到Gazebo座標"""
-        gazebo_x = (img_x - 2000) / 20.0
-        gazebo_y = (2000 - img_y) / 20.0
-        return gazebo_x, gazebo_y
-
-    def calculate_smoothness_cost(self, prev_prev_point, prev_point, current_point):
-        """計算路徑平滑度代價"""
-        delta_xi = np.array([prev_point[0] - prev_prev_point[0], 
-                            prev_point[1] - prev_prev_point[1]])
-        delta_xi1 = np.array([current_point[0] - prev_point[0], 
-                            current_point[1] - prev_point[1]])
+        self.cost_map[wall_mask > 0] = 254        # 障礙物設為最高代價
+        self.cost_map[inner_dilated > 0] = 190    # 內層膨脹區設為中高代價
+        self.cost_map[outer_only > 0] = 100        # 外層膨脹區設為中低代價
         
-        norm_delta_xi = np.linalg.norm(delta_xi)
-        norm_delta_xi1 = np.linalg.norm(delta_xi1)
-        
-        if norm_delta_xi < 1e-6 or norm_delta_xi1 < 1e-6:
-            return 0.0
-                
-        delta_xi_normalized = delta_xi / norm_delta_xi
-        delta_xi1_normalized = delta_xi1 / norm_delta_xi1
-        
-        angle = np.arctan2(
-            np.cross(delta_xi_normalized, delta_xi1_normalized), 
-            np.dot(delta_xi_normalized, delta_xi1_normalized)
-        )
-        
-        angle = np.abs(angle)
-        angle_degrees = np.degrees(angle)
-        normalized_cost = angle_degrees / 30.0
-        
-        return normalized_cost
-
-    def check_line_for_obstacles(self, start, end, num_points=20):
-        """檢查兩點之間是否有障礙物"""
-        x1, y1 = start
-        x2, y2 = end
-
-        x_vals = np.linspace(x1, x2, num_points)
-        y_vals = np.linspace(y1, y2, num_points)
-
-        for x, y in zip(x_vals, y_vals):
-            x, y = int(round(x)), int(round(y))
-            if not (0 <= x < self.cost_map.shape[1] and 0 <= y < self.cost_map.shape[0]):
-                continue
-            if self.cost_map[y, x] >= 254:
-                return True
-        return False
+        rospy.loginfo("Costmap generated successfully.")
+        return True
 
     def generate_waypoints(self):
-        """生成原始路徑點"""
-        # 這裡放入你的原始路徑點
         waypoints = [(-6.4981, -1.0627),
             (-5.4541, -1.0117),
             (-4.4041, -0.862),
@@ -306,140 +242,317 @@ class PathOptimizer:
             (-10.1229, -1.3051),
             (-9.1283, -1.4767),
             (-8.1332, -1.2563),
-            (-7.2213, -1.7003)
-]
+            (self.target_x, self.target_y)]
         return waypoints
+    
+    def calculate_waypoint_distances(self):
+        """
+        計算每對相鄰 waypoint 之間的距離，並返回一個距離列表。
+        """
+        distances = []
+        for i in range(len(self.waypoints) - 1):
+            start_wp = self.waypoints[i]
+            next_wp = self.waypoints[i + 1]
+            distance = np.linalg.norm([next_wp[0] - start_wp[0], next_wp[1] - start_wp[1]])
+            distances.append(distance)
+        return distances
 
-    def optimize_path(self, obs_weight, fps_weight, grid_size=35):
-        """使用給定權重優化路徑"""
-        optimized_waypoints = []
-        
-        for i in range(len(self.original_waypoints) - 1):
-            start_point = self.original_waypoints[i]
-            goal_point = self.original_waypoints[i + 1]
-            
-            optimized_point = self.optimize_single_point(
-                start_point, goal_point, 
-                obs_weight, fps_weight, 
-                optimized_waypoints,
-                grid_size
-            )
-            optimized_waypoints.append(optimized_point)
-        
-        # 添加終點
-        optimized_waypoints.append(self.original_waypoints[-1])
-        return optimized_waypoints
+    def gazebo_to_image_coords(self, gazebo_x, gazebo_y):
+        img_x = 2000 + gazebo_x * 20
+        img_y = 2000 - gazebo_y * 20
+        return int(img_x), int(img_y)
 
-    def optimize_single_point(self, start_point, goal_point, obs_weight, fps_weight, 
-                            current_optimized_points, grid_size):
-        """優化單個路徑點"""
+    def image_to_gazebo_coords(self, img_x, img_y):
+        gazebo_x = (img_x - 2000) / 20.0
+        gazebo_y = (2000 - img_y) / 20.0
+        return gazebo_x, gazebo_y
+
+    def is_line_free(self, png_image, current, neighbor, safe_threshold=230):
+        current = np.array(current, dtype=np.int32)
+        neighbor = np.array(neighbor, dtype=np.int32)
+
+        # 使用 Bresenham 算法生成線段
+        rr, cc = line(current[1], current[0], neighbor[1], neighbor[0])
+
+        # 檢查是否越界
+        if np.any((rr < 0) | (rr >= png_image.shape[0]) | (cc < 0) | (cc >= png_image.shape[1])):
+            return False
+
+        # 檢查線段上的像素是否有障礙物
+        if np.any(png_image[rr, cc] < safe_threshold):
+            return False
+
+        return True
+
+    def calculate_min_distance_to_obstacles(self, x, y, kd_tree):
+        distance, _ = kd_tree.query((x, y))  # 查询最近邻距离
+        return distance
+
+    def a_star_optimize_waypoint(
+        self, png_image, start_point, goal_point, kd_tree, 
+        g_weight=1, h_weight=0.1, smoothness_weight=9, distance_penalty_weight=4, grid_size=50):
+        if not hasattr(self, 'g_scores'):
+            self.g_scores = {}  # 初始化 g_scores 属性，用于保存跨路径点的累积距离
+
         img_start_x, img_start_y = self.gazebo_to_image_coords(*start_point)
         img_goal_x, img_goal_y = self.gazebo_to_image_coords(*goal_point)
 
-        # 計算搜索範圍內的最大障礙物距離
-        max_obstacle_distance = 0
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < self.slam_map.shape[1] and 0 <= y < self.slam_map.shape[0]):
-                    continue
-                distance, _ = self.kd_tree.query((x, y))
-                max_obstacle_distance = max(max_obstacle_distance, distance)
+        # 初始化起点 g 值，如果不存在则设为 0
+        if (img_start_x, img_start_y) not in self.g_scores:
+            self.g_scores[(img_start_x, img_start_y)] = 0
 
-        # 初始化最佳點
+        # 获取当前参考点的索引
+        current_wp_index = self.current_waypoint_index
+
+        # 确保索引范围有效
+        if current_wp_index >= len(self.waypoint_distances):
+            rospy.logerr("Waypoint index out of range for h normalization.")
+            return start_point  # 如果发生错误，返回起点
+
+        # 分母从 self.waypoint_distances 获取当前参考点到目标参考点的距离
+        h_normalization_denominator = self.waypoint_distances[current_wp_index]
+
+        # 初始化
         best_f_score = float('inf')
         best_point = (img_start_x, img_start_y)
 
-        # 在網格中搜索最佳點
-        for x in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2):
-            for y in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2):
-                if not (0 <= x < self.slam_map.shape[1] and 0 <= y < self.slam_map.shape[0]):
-                    continue
+        # 獲取範圍內所有候選點
+        candidate_points = [
+            (xi, yi)
+            for xi in range(img_start_x - grid_size // 2, img_start_x + grid_size // 2)
+            for yi in range(img_start_y - grid_size // 2, img_start_y + grid_size // 2)
+            if 0 <= xi < png_image.shape[1] and 0 <= yi < png_image.shape[0]
+        ]
 
-                # 計算各種代價
-                distance_to_goal = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
-                obstacle_distance, _ = self.kd_tree.query((x, y))
-                normalized_obstacle_distance = obstacle_distance / max_obstacle_distance
-                
-                # 計算平滑度代價
-                smoothness_cost = 0
-                if len(current_optimized_points) >= 2:
-                    prev_prev_point = current_optimized_points[-2]
-                    prev_point = current_optimized_points[-1]
-                    current_point = self.image_to_gazebo_coords(x, y)
-                    smoothness_cost = self.calculate_smoothness_cost(
-                        prev_prev_point, prev_point, current_point
-                    )
+        # 查詢所有候選點到障礙物的距離
+        if candidate_points:
+            distances = kd_tree.query(candidate_points)[0]  # 距離列表
+            max_obstacle_distance = np.max(distances)  # 最大距離
+        else:
+            max_obstacle_distance = 1  # 避免分母為 0
 
-                # 計算總代價
-                f_score = distance_to_goal * 0.1 + \
-                         (-normalized_obstacle_distance * obs_weight) + \
-                         (smoothness_cost * fps_weight)
+        for x, y in candidate_points:
+            # 检查从上一个路径点到当前候选点是否通畅
+            if self.optimized_waypoints:
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+                if not self.is_line_free(png_image, (prev_img_x, prev_img_y), (x, y)):
+                    continue  # 如果有障碍物，跳过该点
 
-                if f_score < best_f_score:
-                    best_f_score = f_score
-                    best_point = (x, y)
+            # 计算代价地图权重
+            costmap_cost = self.cost_map[y, x]
 
-        # 轉換回Gazebo座標
-        optimized_x, optimized_y = self.image_to_gazebo_coords(*best_point)
-        return (optimized_x, optimized_y)
+            # 当前点的移动距离计算基于车辆的实际路径点
+            if len(self.optimized_waypoints) > 0:
+                last_waypoint = self.optimized_waypoints[-1]
+                last_img_x, last_img_y = self.gazebo_to_image_coords(*last_waypoint)
+                step_distance = np.sqrt((x - last_img_x) ** 2 + (y - last_img_y) ** 2)
+                g = self.g_scores.get((last_img_x, last_img_y), 0) + step_distance
+            else:
+                step_distance = 0
+                g = self.g_scores[(img_start_x, img_start_y)]
 
-    def visualize_path(self, waypoints, obs_weight, fps_weight):
-        """視覺化路徑"""
-        # 創建RGB圖像
+            self.g_scores[(x, y)] = g
+
+            # 正規化 g 值
+            g_normalized = (g * 0.05) / self.total_path_distance
+
+            # 当前点到目标点的 h 值（启发式）
+            h = np.sqrt((x - img_goal_x) ** 2 + (y - img_goal_y) ** 2)
+
+            # 正規化 h 值，使用當前點到參考點的距離作為分母
+            h_normalized = (h * 0.05) / h_normalization_denominator if h_normalization_denominator > 0 else h
+
+            # 平滑性代价调整
+            if len(self.optimized_waypoints) >= 2:
+                prev_prev_point = self.optimized_waypoints[-2]
+                prev_prev_img_x, prev_prev_img_y = self.gazebo_to_image_coords(*prev_prev_point)
+                prev_point = self.optimized_waypoints[-1]
+                prev_img_x, prev_img_y = self.gazebo_to_image_coords(*prev_point)
+
+                # 差分计算
+                delta_xi = (prev_img_x - prev_prev_img_x, prev_img_y - prev_prev_img_y)
+                delta_xi1 = (x - prev_img_x, y - prev_img_y)
+                smoothness_cost = (delta_xi1[0] - delta_xi[0]) ** 2 + (delta_xi1[1] - delta_xi[1]) ** 2
+
+                # 正規化平滑性代價
+                max_smoothness_cost = grid_size ** 2  # 假设最大位移为 grid_size 的平方和
+                smoothness_cost_normalized = smoothness_cost / max_smoothness_cost if max_smoothness_cost > 0 else 0
+            else:
+                smoothness_cost_normalized = 0
+
+            # 基于 KDTree 计算最小障碍物距离
+            obstacle_distance = self.calculate_min_distance_to_obstacles(x, y, kd_tree)
+
+            # 正規化距离代价
+            distance_penalty_normalized = -obstacle_distance / max_obstacle_distance if max_obstacle_distance > 0 else 0
+
+            # 计算总的代价 f
+            f = (
+                (g_normalized * g_weight + h_normalized * h_weight) * 0.33 +
+                (smoothness_cost_normalized * smoothness_weight + distance_penalty_normalized * distance_penalty_weight) * 0.67 +
+                costmap_cost
+            )
+
+            if f < best_f_score:
+                best_f_score = f
+                best_point = (x, y)
+
+        optimized_gazebo_x, optimized_gazebo_y = self.image_to_gazebo_coords(*best_point)
+        return optimized_gazebo_x, optimized_gazebo_y
+
+    def optimize_waypoints_with_a_star(self, g_weight, smoothness_weight, distance_penalty_weight):
+        obstacle_points = [
+            (x, y) for y in range(self.slam_map.shape[0]) for x in range(self.slam_map.shape[1])
+            if self.slam_map[y, x] < 250
+        ]
+        kd_tree = KDTree(obstacle_points)
+
+        optimized_waypoints = []
+        for i in range(len(self.waypoints) - 1):
+            # 更新 current_waypoint_index
+            self.current_waypoint_index = i
+
+            start_point = self.waypoints[i]
+            goal_point = self.waypoints[i + 1]
+
+            optimized_point = self.a_star_optimize_waypoint(
+                self.slam_map, start_point, goal_point, kd_tree,
+                g_weight=g_weight,
+                h_weight=1,  # 可调整
+                smoothness_weight=smoothness_weight,
+                distance_penalty_weight=distance_penalty_weight
+            )
+            optimized_waypoints.append(optimized_point)
+
+        optimized_waypoints.append(self.waypoints[-1])
+        self.optimized_waypoints = optimized_waypoints
+    
+    def visualize_complete_path(self, waypoints, save_path):
+        """
+        可视化路径点和当前位置，并在 costmap 上显示
+        """
+        if not hasattr(self, 'slam_map') or not hasattr(self, 'cost_map'):
+            raise ValueError("SLAM map or cost map not loaded.")
+
+        # 創建一個 RGB 圖像來顯示 cost map
         cost_map_rgb = np.zeros((self.cost_map.shape[0], self.cost_map.shape[1], 3), dtype=np.uint8)
-        cost_map_rgb[self.cost_map == 0] = [255, 255, 255]
-        cost_map_rgb[self.cost_map == 100] = [200, 200, 255]
-        cost_map_rgb[self.cost_map == 190] = [150, 150, 255]
-        cost_map_rgb[self.cost_map == 254] = [100, 100, 100]
+        
+        # 將不同代價值映射到不同顏色
+        cost_map_rgb[self.cost_map == 0] = [255, 255, 255]      # 空白區域為白色
+        cost_map_rgb[self.cost_map == 100] = [200, 200, 255]    # 外層膨脹區為淺藍色
+        cost_map_rgb[self.cost_map == 190] = [150, 150, 255]    # 內層膨脹區為中藍色
+        cost_map_rgb[self.cost_map == 254] = [100, 100, 100]    # 障礙物為灰色
 
-        # 轉換路徑點到圖像座標
+        # 轉換路徑點到圖像坐標
         img_points = [self.gazebo_to_image_coords(p[0], p[1]) for p in waypoints]
 
+        # 創建圖像
         plt.figure(figsize=(12, 12))
         plt.imshow(cost_map_rgb)
 
-        # 繪製路徑點
-        for point in img_points:
-            plt.scatter(point[0], point[1], color='green', s=3)
+        # 繪製所有路徑點
+        for i, point in enumerate(img_points):
+            if 0 <= point[0] < cost_map_rgb.shape[1] and 0 <= point[1] < cost_map_rgb.shape[0]:
+                if i == self.current_waypoint_index:
+                    # 當前目標點用黃色標記
+                    plt.scatter(point[0], point[1], color='yellow', s=100, marker='*', label='Current Target')
+                else:
+                    # 其他路徑點用綠色標記
+                    plt.scatter(point[0], point[1], color='green', s=20)
 
         # 標記起點和終點
-        plt.scatter(img_points[0][0], img_points[0][1], color='blue', s=100, marker='^', label='Start')
-        plt.scatter(img_points[-1][0], img_points[-1][1], color='red', s=100, marker='v', label='Goal')
+        img_start = self.gazebo_to_image_coords(*waypoints[0])
+        img_goal = self.gazebo_to_image_coords(*waypoints[-1])
+        plt.scatter(img_start[0], img_start[1], color='blue', s=100, marker='^', label='Start')
+        plt.scatter(img_goal[0], img_goal[1], color='red', s=100, marker='v', label='Goal')
 
-        plt.legend()
-        plt.title(f'Path with obs_weight={obs_weight}, fps_weight={fps_weight}')
+        # 添加圖例和標題
+        plt.legend(fontsize=12)
+        plt.title('Path Visualization with Cost Map', fontsize=14)
         
+        # 設置軸的範圍
+        plt.xlim(0, cost_map_rgb.shape[1])
+        plt.ylim(cost_map_rgb.shape[0], 0)  # 注意：圖像坐標 y 軸是倒置的
+
         # 保存圖片
-        save_path = f'{self.result_folder}path_obs{obs_weight}_fps{fps_weight}.png'
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
+        
+        rospy.loginfo(f"Path visualization with cost map saved to {save_path}")
 
-    def run_weight_tests(self):
-        """運行權重測試"""
-        # 清空結果文件
-        with open(self.result_file_txt, 'w') as f:
-            f.write("Path Points with Different Weights\n")
+    def evaluate_path_metrics(self):
+        total_length = 0.0
+        obstacle_distances = []
+        smoothness = 0.0
 
-        # 測試不同權重組合
-        for obs_weight in range(1, 11):
-            for fps_weight in range(1, 11):
-                print(f"Testing weights: obs={obs_weight}, fps={fps_weight}")
+        for i in range(len(self.optimized_waypoints) - 1):
+            x1, y1 = self.optimized_waypoints[i]
+            x2, y2 = self.optimized_waypoints[i + 1]
+            total_length += np.linalg.norm([x2 - x1, y2 - y1])
+
+            if i < len(self.optimized_waypoints) - 2:
+                x3, y3 = self.optimized_waypoints[i + 2]
+                v1 = np.array([x2 - x1, y2 - y1])
+                v2 = np.array([x3 - x2, y3 - y2])
                 
-                # 優化路徑
-                optimized_path = self.optimize_path(obs_weight, fps_weight)
-                
-                # 保存路徑點
-                with open(self.result_file_txt, 'a') as f:
-                    f.write(f"\nweight_obs: {obs_weight} * weight_fps: {fps_weight}\n")
-                    path_points = [f"({x:.4f},{y:.4f})" for x, y in optimized_path]
-                    f.write(", ".join(path_points) + "\n")
-                
-                # 視覺化並保存圖片
-                self.visualize_path(optimized_path, obs_weight, fps_weight)
+                # 修正角度計算，避免除以 0 的情況
+                if np.linalg.norm(v1) == 0 or np.linalg.norm(v2) == 0:
+                    angle = 0
+                else:
+                    angle = np.arccos(
+                        np.clip(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)), -1.0, 1.0)
+                    )
+                smoothness += angle ** 2
+
+        avg_obstacle_distance = np.mean(obstacle_distances) if obstacle_distances else 0
+        return total_length, avg_obstacle_distance, smoothness
 
 def main():
     optimizer = PathOptimizer()
-    optimizer.run_weight_tests()
 
-if __name__ == '__main__':
+    # 生成權重組合
+    weights = range(1, 11)
+    weight_combinations = list(itertools.product(weights, repeat=3))[:1000]
+
+    results = []
+    for index, (g_weight, smoothness_weight, distance_penalty_weight) in enumerate(weight_combinations):
+        # 優化路徑
+        optimizer.optimize_waypoints_with_a_star(g_weight, smoothness_weight, distance_penalty_weight)
+        
+        # 計算路徑指標
+        total_length, avg_obstacle_distance, smoothness = optimizer.evaluate_path_metrics()
+        results.append({
+            "index": index,
+            "g_weight": g_weight,
+            "smoothness_weight": smoothness_weight,
+            "distance_penalty_weight": distance_penalty_weight,
+            "total_length": total_length,
+            "avg_obstacle_distance": avg_obstacle_distance,
+            "smoothness": smoothness
+        })
+
+        # 保存每條優化路徑的可視化圖片
+        save_path = os.path.join(
+            optimizer.result_folder,
+            f"optimized_path_g{g_weight}_s{smoothness_weight}_d{distance_penalty_weight}.png"
+        )
+        optimizer.visualize_complete_path(optimizer.optimized_waypoints, save_path=save_path)
+
+    # 保存分析結果
+    df = pd.DataFrame(results)
+    df.to_csv(optimizer.result_metrics_file, index=False)
+
+    # 可視化分析結果（僅分析指標，不再保存路徑圖片）
+    plt.figure(figsize=(15, 5))
+    for metric in ["total_length", "avg_obstacle_distance", "smoothness"]:
+        plt.plot(df["index"], df[metric], label=metric)
+    plt.xlabel("Weight Combination Index")
+    plt.ylabel("Metrics")
+    plt.legend()
+    plt.title("Path Metrics vs. Weight Combinations")
+    plt.savefig(os.path.join(optimizer.result_folder, "metrics_vs_weights.png"))
+    plt.close()
+
+if __name__ == "__main__":
     main()
