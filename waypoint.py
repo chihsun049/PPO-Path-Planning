@@ -537,6 +537,33 @@ class PathOptimizer:
 
         return total_length, avg_obstacle_distance, smoothness
 
+def generate_report(results, result_folder, csv_filename, prefix):
+    """
+    生成报告和可视化图表
+    """
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(result_folder, csv_filename)
+    df.to_csv(csv_path, index=False)
+    rospy.loginfo(f"Report saved to {csv_path}")
+
+    # 绘制并保存图表
+    for metric in ["total_length", "avg_obstacle_distance", "smoothness"]:
+        plt.figure(figsize=(12, 6))
+        for g_weight in df["g_weight"].unique():
+            subset = df[df["g_weight"] == g_weight]
+            plt.plot(
+                subset["distance_penalty_weight"] + subset["smoothness_weight"] * 10, 
+                subset[metric], label=f"g_weight={g_weight}"
+            )
+        plt.xlabel("Combined Weight Index (distance_penalty + smoothness * 10)")
+        plt.ylabel(metric.replace("_", " ").title())
+        plt.legend()
+        plt.title(f"{metric.replace('_', ' ').title()} vs. Weight Combinations ({prefix})")
+        metric_path = os.path.join(result_folder, f"{prefix}_{metric}_vs_weights.png")
+        plt.savefig(metric_path)
+        plt.close()
+        rospy.loginfo(f"Graph saved to {metric_path}")
+        
 def main():
     optimizer = PathOptimizer()
 
@@ -546,9 +573,13 @@ def main():
     distance_penalty_weights = range(1, 11)  # distance_penalty_weight 从 1 到 10
 
     results = []
+    total_count = 0
+
     for g_weight in g_weights:
         for smoothness_weight in smoothness_weights:
             for distance_penalty_weight in distance_penalty_weights:
+                total_count += 1
+
                 # 优化路径
                 optimizer.optimize_waypoints_with_a_star(
                     g_weight=g_weight,
@@ -574,25 +605,16 @@ def main():
                 )
                 optimizer.visualize_complete_path(optimizer.optimized_waypoints, save_path=save_path)
 
-    # 保存分析结果
-    df = pd.DataFrame(results)
-    df.to_csv(optimizer.result_metrics_file, index=False)
+                # 每 10 次输出一个部分报告
+                if total_count % 10 == 0:
+                    generate_report(results, optimizer.result_folder, f"partial_report_{total_count}.csv", f"partial_{total_count}")
 
-    # 可视化分析结果（根据需求选择展示的指标）
-    for metric in ["total_length", "avg_obstacle_distance", "smoothness"]:
-        plt.figure(figsize=(12, 6))
-        for g_weight in g_weights:
-            subset = df[df["g_weight"] == g_weight]
-            plt.plot(
-                subset["distance_penalty_weight"] + subset["smoothness_weight"] * 10, 
-                subset[metric], label=f"g_weight={g_weight}"
-            )
-        plt.xlabel("Combined Weight Index (distance_penalty + smoothness * 10)")
-        plt.ylabel(metric.replace("_", " ").title())
-        plt.legend()
-        plt.title(f"Path {metric.replace('_', ' ').title()} vs. Weight Combinations")
-        plt.savefig(os.path.join(optimizer.result_folder, f"{metric}_vs_weights.png"))
-        plt.close()
+                # 每 100 次输出一个阶段报告
+                if total_count % 100 == 0:
+                    generate_report(results, optimizer.result_folder, f"stage_report_{total_count}.csv", f"stage_{total_count}")
+
+    # 保存最终结果
+    generate_report(results, optimizer.result_folder, f"final_report.csv", "final")
 
 if __name__ == "__main__":
     main()
