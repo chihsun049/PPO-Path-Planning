@@ -886,11 +886,11 @@ class GazeboEnv:
 
         # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
-            linear_speed = 1.5
+            linear_speed = 1.0
         elif np.abs(yaw_error) > 0.1:
             linear_speed = 2.0
         else:
-            linear_speed = 3.0
+            linear_speed = 2.5
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
@@ -915,10 +915,10 @@ class GazeboEnv:
         return closest_index
     
     def adjust_control_params(self, linear_speed):
-        if linear_speed <= 1.8:
+        if linear_speed <= 1.0:
             kp = 0.5
             kd = 0.2
-        elif linear_speed <= 2.5:
+        elif linear_speed <= 2.0:
             kp = 0.4
             kd = 0.3
         else:
