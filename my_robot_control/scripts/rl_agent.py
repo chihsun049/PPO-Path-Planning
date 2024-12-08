@@ -622,7 +622,7 @@ class GazeboEnv:
     def generate_occupancy_grid(self, robot_x, robot_y, linear_speed, steer_angle, grid_size=0.05, map_size=100):
         # 将机器人的坐标转换为地图上的像素坐标
 
-        linear_speed = np.clip(linear_speed, -2.0, 2.0)
+        linear_speed = np.clip(linear_speed, -3.0, 3.0)
         steer_angle = np.clip(steer_angle, -0.5, 0.5)
 
         img_x, img_y = self.gazebo_to_image_coords(robot_x, robot_y)
@@ -663,7 +663,7 @@ class GazeboEnv:
 
         # 确保 action 是一维数组
         action = np.squeeze(action)
-        linear_speed = np.clip(action[0], -2.0, 2.0)
+        linear_speed = np.clip(action[0], -3.0, 3.0)
         steer_angle = np.clip(action[1], -0.5, 0.5)
         print("linear speed = ", linear_speed, " steer angle = ", steer_angle)
 
@@ -886,11 +886,11 @@ class GazeboEnv:
 
         # 根據角度誤差調整速度
         if np.abs(yaw_error) > 0.3:
-            linear_speed = 1.6
+            linear_speed = 1.5
         elif np.abs(yaw_error) > 0.1:
-            linear_speed = 1.8
-        else:
             linear_speed = 2.0
+        else:
+            linear_speed = 3.0
 
         # 使用PD控制器調整轉向角度
         kp, kd = self.adjust_control_params(linear_speed)
@@ -915,10 +915,10 @@ class GazeboEnv:
         return closest_index
     
     def adjust_control_params(self, linear_speed):
-        if linear_speed <= 0.5:
+        if linear_speed <= 1.8:
             kp = 0.5
             kd = 0.2
-        elif linear_speed <= 1.0:
+        elif linear_speed <= 2.5:
             kp = 0.4
             kd = 0.3
         else:
